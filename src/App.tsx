@@ -1,15 +1,22 @@
 import './App.css'
-import { Hero } from './components/Hero'
-import { About } from './components/About'
-import { ProjectPreview } from './components/ProjectPreview'
+import { HashRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { Layout } from './components/Layout'
+import { BlogIndexPage } from './pages/BlogIndexPage'
+import { BlogPostPage } from './pages/BlogPostPage'
+import { HomePage } from './pages/HomePage'
 
 function App() {
     return (
-        <main className="app">
-            <Hero />
-            <About />
-            <ProjectPreview />
-        </main>
+        <HashRouter>
+            <Routes>
+                <Route element={<Layout />}>
+                    <Route index element={<HomePage />} />
+                    <Route path="blog" element={<BlogIndexPage />} />
+                    <Route path="blog/:slug" element={<BlogPostPage />} />
+                    <Route path="*" element={<Navigate to="/" replace />} />
+                </Route>
+            </Routes>
+        </HashRouter>
     )
 }
 

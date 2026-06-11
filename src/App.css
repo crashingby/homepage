@@ -3,7 +3,7 @@
         Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
         sans-serif;
     color: #e5e7eb;
-    background: #020617;
+    background: #0b1020;
 }
 
 * {
@@ -15,9 +15,9 @@ body {
     min-width: 320px;
     min-height: 100vh;
     background:
-        radial-gradient(circle at top left, rgba(59, 130, 246, 0.25), transparent 32rem),
-        radial-gradient(circle at top right, rgba(14, 165, 233, 0.16), transparent 28rem),
-        #020617;
+        radial-gradient(circle at top left, rgba(45, 212, 191, 0.18), transparent 30rem),
+        radial-gradient(circle at top right, rgba(248, 113, 113, 0.12), transparent 26rem),
+        #0b1020;
 }
 
 a {
@@ -25,10 +25,54 @@ a {
     text-decoration: none;
 }
 
+.site-header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.18);
+    background: rgba(11, 16, 32, 0.82);
+    backdrop-filter: blur(18px);
+}
+
+.site-nav {
+    width: min(1080px, calc(100% - 48px));
+    min-height: 64px;
+    margin: 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+}
+
+.site-mark {
+    color: #f8fafc;
+    font-weight: 800;
+}
+
+.nav-links {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.nav-links a {
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: #cbd5e1;
+    font-size: 0.94rem;
+    font-weight: 700;
+}
+
+.nav-links a:hover,
+.nav-links a.active {
+    color: #f8fafc;
+    background: rgba(45, 212, 191, 0.12);
+}
+
 .app {
     width: min(1080px, calc(100% - 48px));
     margin: 0 auto;
-    padding: 72px 0;
+    padding: 56px 0 72px;
 }
 
 .hero {
@@ -43,7 +87,7 @@ a {
     color: #38bdf8;
     font-size: 0.95rem;
     font-weight: 700;
-    letter-spacing: 0.12em;
+    letter-spacing: 0;
     text-transform: uppercase;
 }
 
@@ -52,7 +96,7 @@ a {
     max-width: 900px;
     font-size: clamp(3.2rem, 9vw, 7.5rem);
     line-height: 0.95;
-    letter-spacing: -0.08em;
+    letter-spacing: 0;
 }
 
 .hero-subtitle {
@@ -73,7 +117,7 @@ a {
 .primary-button,
 .secondary-button {
     padding: 12px 18px;
-    border-radius: 999px;
+    border-radius: 8px;
     font-weight: 700;
     transition:
         transform 0.2s ease,
@@ -109,7 +153,7 @@ a {
 .section h2 {
     margin: 0 0 24px;
     font-size: clamp(2rem, 4vw, 3.4rem);
-    letter-spacing: -0.05em;
+    letter-spacing: 0;
 }
 
 .section p {
@@ -128,7 +172,7 @@ a {
 .project-card {
     padding: 24px;
     border: 1px solid rgba(148, 163, 184, 0.22);
-    border-radius: 24px;
+    border-radius: 8px;
     background: rgba(15, 23, 42, 0.72);
     backdrop-filter: blur(16px);
     transition:
@@ -153,7 +197,207 @@ a {
     font-size: 0.98rem;
 }
 
+.page {
+    padding: 64px 0 24px;
+}
+
+.page h1 {
+    margin: 0;
+    max-width: 880px;
+    color: #f8fafc;
+    font-size: clamp(2.6rem, 7vw, 5.8rem);
+    line-height: 1;
+    letter-spacing: 0;
+}
+
+.page-intro {
+    max-width: 720px;
+    margin: 22px 0 0;
+    color: #cbd5e1;
+    font-size: 1.15rem;
+    line-height: 1.75;
+}
+
+.post-list {
+    display: grid;
+    gap: 16px;
+    margin-top: 40px;
+}
+
+.post-card {
+    padding: 24px;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 8px;
+    background: rgba(15, 23, 42, 0.72);
+    transition:
+        transform 0.2s ease,
+        border-color 0.2s ease,
+        background 0.2s ease;
+}
+
+.post-card:hover {
+    transform: translateY(-3px);
+    border-color: rgba(45, 212, 191, 0.58);
+    background: rgba(15, 23, 42, 0.94);
+}
+
+.post-card h2 {
+    margin: 12px 0 10px;
+    color: #f8fafc;
+    font-size: clamp(1.35rem, 3vw, 2rem);
+    line-height: 1.2;
+    letter-spacing: 0;
+}
+
+.post-card p {
+    max-width: 760px;
+    margin: 0;
+    color: #cbd5e1;
+    line-height: 1.75;
+}
+
+.post-meta {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    color: #94a3b8;
+    font-size: 0.92rem;
+    font-weight: 700;
+}
+
+.tag-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 18px;
+}
+
+.tag-list span {
+    padding: 5px 8px;
+    border: 1px solid rgba(45, 212, 191, 0.35);
+    border-radius: 8px;
+    color: #99f6e4;
+    background: rgba(45, 212, 191, 0.08);
+    font-size: 0.86rem;
+    font-weight: 700;
+}
+
+.back-link {
+    display: inline-flex;
+    margin-bottom: 32px;
+    color: #99f6e4;
+    font-weight: 800;
+}
+
+.post-header {
+    max-width: 880px;
+    padding-bottom: 32px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.post-header h1 {
+    margin-top: 16px;
+}
+
+.post-header p {
+    margin: 22px 0 0;
+    color: #cbd5e1;
+    font-size: 1.15rem;
+    line-height: 1.75;
+}
+
+.markdown-body {
+    max-width: 820px;
+    padding-top: 34px;
+    color: #dbe3ef;
+    font-size: 1.04rem;
+    line-height: 1.85;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+    color: #f8fafc;
+    line-height: 1.2;
+    letter-spacing: 0;
+}
+
+.markdown-body h1 {
+    margin: 0 0 18px;
+    font-size: 2.4rem;
+}
+
+.markdown-body h2 {
+    margin: 36px 0 14px;
+    font-size: 1.7rem;
+}
+
+.markdown-body h3 {
+    margin: 28px 0 10px;
+    font-size: 1.3rem;
+}
+
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body pre,
+.markdown-body blockquote {
+    margin: 0 0 18px;
+}
+
+.markdown-body a {
+    color: #7dd3fc;
+    border-bottom: 1px solid rgba(125, 211, 252, 0.45);
+}
+
+.markdown-body code {
+    border-radius: 6px;
+    padding: 2px 5px;
+    color: #fde68a;
+    background: rgba(2, 6, 23, 0.8);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.92em;
+}
+
+.markdown-body pre {
+    overflow-x: auto;
+    padding: 16px;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    border-radius: 8px;
+    background: rgba(2, 6, 23, 0.82);
+}
+
+.markdown-body pre code {
+    padding: 0;
+    color: #e5e7eb;
+    background: transparent;
+}
+
+.markdown-body blockquote {
+    padding-left: 16px;
+    border-left: 3px solid #2dd4bf;
+    color: #cbd5e1;
+}
+
 @media (max-width: 720px) {
+    .site-nav {
+        width: min(100% - 32px, 1080px);
+        min-height: 58px;
+    }
+
+    .site-mark {
+        font-size: 0.95rem;
+    }
+
+    .nav-links {
+        gap: 4px;
+    }
+
+    .nav-links a {
+        padding: 7px 8px;
+        font-size: 0.88rem;
+    }
+
     .app {
         width: min(100% - 32px, 1080px);
         padding: 48px 0;
@@ -165,5 +409,13 @@ a {
 
     .project-grid {
         grid-template-columns: 1fr;
+    }
+
+    .page {
+        padding-top: 36px;
+    }
+
+    .post-card {
+        padding: 18px;
     }
 }
