@@ -8,12 +8,8 @@ const projects = [
         desc: 'CUDA, CuTe, Triton, and TileLang implementations for reduction kernels with performance-oriented benchmarking.',
     },
     {
-        title: 'BFS Fault Tolerance',
-        desc: 'GPU BFS with DMR, top-k critical vertex selection, threshold-based redundancy, and multi-GPU NCCL exploration.',
-    },
-    {
-        title: 'LLM Inference Systems',
-        desc: 'Exploration of incremental prefill, KV cache scheduling, streaming RAG, and inference serving architecture.',
+        title: 'AI Inference Server',
+        desc: 'A high-performance C++ inference serving framework.',
     },
 ]
 
