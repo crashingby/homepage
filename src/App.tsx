@@ -12,6 +12,8 @@ function App() {
                 <Route element={<Layout />}>
                     <Route index element={<HomePage />} />
                     <Route path="blog" element={<BlogIndexPage />} />
+                    <Route path="blog/topic/:topicSlug" element={<BlogIndexPage />} />
+                    <Route path="blog/:topicSlug/:slug" element={<BlogPostPage />} />
                     <Route path="blog/:slug" element={<BlogPostPage />} />
                     <Route path="*" element={<Navigate to="/" replace />} />
                 </Route>

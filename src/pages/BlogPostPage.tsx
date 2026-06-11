@@ -3,8 +3,8 @@ import { MarkdownPost } from '../components/MarkdownPost'
 import { getBlogPost } from '../lib/blog'
 
 export function BlogPostPage() {
-    const { slug } = useParams()
-    const post = slug ? getBlogPost(slug) : undefined
+    const { slug, topicSlug } = useParams()
+    const post = slug ? getBlogPost(topicSlug, slug) : undefined
 
     if (!post) {
         return <Navigate to="/blog" replace />
@@ -12,14 +12,15 @@ export function BlogPostPage() {
 
     return (
         <article className="page blog-post">
-            <Link to="/blog" className="back-link">
-                Back to blog
+            <Link to={`/blog/topic/${post.topic.slug}`} className="back-link">
+                Back to {post.topic.label}
             </Link>
 
             <header className="post-header">
                 <div className="post-meta">
                     <time dateTime={post.date}>{post.date}</time>
                     {post.readingTime}
+                    <Link to={`/blog/topic/${post.topic.slug}`}>{post.topic.label}</Link>
                 </div>
 
                 <h1>{post.title}</h1>
