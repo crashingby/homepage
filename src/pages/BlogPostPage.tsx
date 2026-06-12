@@ -1,6 +1,14 @@
 import { Link, Navigate, useParams } from 'react-router-dom'
 import { MarkdownPost } from '../components/MarkdownPost'
 import { getBlogPost } from '../lib/blog'
+import { getMarkdownHeadings } from '../lib/markdown'
+
+function scrollToHeading(id: string) {
+    document.getElementById(id)?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
+    })
+}
 
 export function BlogPostPage() {
     const { slug, topicSlug } = useParams()
@@ -9,6 +17,11 @@ export function BlogPostPage() {
     if (!post) {
         return <Navigate to="/blog" replace />
     }
+
+    const headings = getMarkdownHeadings(post.content, {
+        maxLevel: 4,
+        minLevel: 2,
+    })
 
     return (
         <article className="page blog-post">
@@ -33,7 +46,30 @@ export function BlogPostPage() {
                 </div>
             </header>
 
-            <MarkdownPost content={post.content} />
+            <div className="blog-post-layout">
+                <MarkdownPost content={post.content} />
+
+                {headings.length > 0 && (
+                    <aside className="post-toc" aria-label="Table of contents">
+                        <p>目录</p>
+                        <nav>
+                            {headings.map((heading) => (
+                                <a
+                                    className={`toc-level-${heading.level}`}
+                                    href={`#${heading.id}`}
+                                    key={heading.id}
+                                    onClick={(event) => {
+                                        event.preventDefault()
+                                        scrollToHeading(heading.id)
+                                    }}
+                                >
+                                    {heading.title}
+                                </a>
+                            ))}
+                        </nav>
+                    </aside>
+                )}
+            </div>
         </article>
     )
 }

@@ -9,6 +9,7 @@ import {
 } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import { getMarkdownHeadings } from '../lib/markdown'
 
 type MarkdownPostProps = {
     content: string
@@ -17,6 +18,20 @@ type MarkdownPostProps = {
 type CodeElementProps = {
     className?: string
     children?: ReactNode
+}
+
+type MarkdownAstNode = {
+    position?: {
+        start?: {
+            line?: number
+        }
+    }
+}
+
+type HeadingProps<Level extends 1 | 2 | 3 | 4 | 5 | 6> = ComponentPropsWithoutRef<
+    `h${Level}`
+> & {
+    node?: MarkdownAstNode
 }
 
 function MermaidDiagram({ chart }: { chart: string }) {
@@ -110,12 +125,53 @@ function TableBlock({ children, ...props }: ComponentPropsWithoutRef<'table'>) {
     )
 }
 
+function getNodeText(children: ReactNode): string {
+    if (typeof children === 'string' || typeof children === 'number') {
+        return String(children)
+    }
+
+    if (Array.isArray(children)) {
+        return children.map(getNodeText).join('')
+    }
+
+    if (isValidElement(children)) {
+        return getNodeText((children as ReactElement<{ children?: ReactNode }>).props.children)
+    }
+
+    return ''
+}
+
+function createHeading(level: 1 | 2 | 3 | 4 | 5 | 6, headingIdsByLine: Map<number, string>) {
+    const Heading = `h${level}` as const
+
+    return function HeadingBlock({ children, node, ...props }: HeadingProps<typeof level>) {
+        const line = node?.position?.start?.line
+        const id = line ? headingIdsByLine.get(line) : undefined
+
+        return (
+            <Heading id={id ?? getNodeText(children)} {...props}>
+                {children}
+            </Heading>
+        )
+    }
+}
+
 export function MarkdownPost({ content }: MarkdownPostProps) {
+    const headingIdsByLine = new Map(
+        getMarkdownHeadings(content).map((heading) => [heading.line, heading.id]),
+    )
+
     return (
         <div className="markdown-body">
             <ReactMarkdown
                 components={{
                     code: CodeBlock,
+                    h1: createHeading(1, headingIdsByLine),
+                    h2: createHeading(2, headingIdsByLine),
+                    h3: createHeading(3, headingIdsByLine),
+                    h4: createHeading(4, headingIdsByLine),
+                    h5: createHeading(5, headingIdsByLine),
+                    h6: createHeading(6, headingIdsByLine),
                     pre: PreBlock,
                     table: TableBlock,
                 }}

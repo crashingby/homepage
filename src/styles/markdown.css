@@ -8,7 +8,11 @@
 
 .markdown-body h1,
 .markdown-body h2,
-.markdown-body h3 {
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+    scroll-margin-top: 92px;
     color: #f8fafc;
     line-height: 1.2;
     letter-spacing: 0;
@@ -27,6 +31,17 @@
 .markdown-body h3 {
     margin: 28px 0 10px;
     font-size: 1.3rem;
+}
+
+.markdown-body h4 {
+    margin: 24px 0 8px;
+    font-size: 1.12rem;
+}
+
+.markdown-body h5,
+.markdown-body h6 {
+    margin: 20px 0 8px;
+    font-size: 1rem;
 }
 
 .markdown-body p,
