@@ -4,14 +4,15 @@ export function About() {
             <h2>About Me</h2>
 
             <p>
-                I received the B.S. degree in Computer Science from Jilin University
-                in 2025, and I am currently a M.S. student at the College of Computer
-                Science and Technology, Jilin University.
+                25年本科毕业。硕士一年级在读
             </p>
 
             <p>
-                My current interests include GPU performance optimization, CUDA kernel
-                development, Triton programming, CuTe/CUTLASS, and LLM inference systems.
+                主要技术栈为CPP后端（真的有这个方向吗），CUDA编程，各种GPU编程DSL。略微了解推理系统。
+            </p>
+
+            <p>
+                目前最喜欢水上由崎。
             </p>
         </section>
     )

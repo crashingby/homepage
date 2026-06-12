@@ -1,15 +1,18 @@
 const projects = [
     {
-        title: 'GEMM Optimization',
-        desc: 'Iterative CUDA GEMM optimization from naive kernels to shared memory tiling, register tiling, CuTe, Triton, and Tensor Core paths.',
+        title: 'GEMM 迭代优化（进行中）',
+        desc: '逐版本迭代GEMM。使用主流的优化路径：共享内存，异步拷贝，Tensor Core。',
+        href: 'https://gitee.com/hxy21211319/gemm-reseach',
     },
     {
-        title: 'Reduce Research',
-        desc: 'CUDA, CuTe, Triton, and TileLang implementations for reduction kernels with performance-oriented benchmarking.',
+        title: 'Reduce 迭代优化（已完成）',
+        desc: '逐版本迭代Reduce算子。已达到显卡最大吞吐90%以上。提供CUTE和Triton版本的最终版。',
+        href: 'https://gitee.com/hxy21211319/reduce-research',
     },
     {
-        title: 'AI Inference Server',
-        desc: 'A high-performance C++ inference serving framework.',
+        title: 'AI推理服务系统（进行中）',
+        desc: 'CPP后端+AI部署的结合。正在进行中。',
+        href: 'https://gitee.com/hxy21211319/InferenceServers',
     },
 ]
 
@@ -23,6 +26,14 @@ export function ProjectPreview() {
                     <article className="project-card" key={project.title}>
                         <h3>{project.title}</h3>
                         <p>{project.desc}</p>
+                        <a
+                            className="project-link"
+                            href={project.href}
+                            target="_blank"
+                            rel="noreferrer"
+                        >
+                            查看 Gitee
+                        </a>
                     </article>
                 ))}
             </div>
