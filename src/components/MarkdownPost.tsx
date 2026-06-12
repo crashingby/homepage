@@ -7,6 +7,13 @@ import {
     type ReactElement,
     type ReactNode,
 } from 'react'
+import hljs from 'highlight.js/lib/core'
+import cpp from 'highlight.js/lib/languages/cpp'
+import javascript from 'highlight.js/lib/languages/javascript'
+import json from 'highlight.js/lib/languages/json'
+import python from 'highlight.js/lib/languages/python'
+import shell from 'highlight.js/lib/languages/shell'
+import typescript from 'highlight.js/lib/languages/typescript'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { getMarkdownHeadings } from '../lib/markdown'
@@ -19,6 +26,18 @@ type CodeElementProps = {
     className?: string
     children?: ReactNode
 }
+
+hljs.registerLanguage('bash', shell)
+hljs.registerLanguage('cpp', cpp)
+hljs.registerLanguage('c++', cpp)
+hljs.registerLanguage('javascript', javascript)
+hljs.registerLanguage('js', javascript)
+hljs.registerLanguage('json', json)
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('sh', shell)
+hljs.registerLanguage('shell', shell)
+hljs.registerLanguage('typescript', typescript)
+hljs.registerLanguage('ts', typescript)
 
 type MarkdownAstNode = {
     position?: {
@@ -100,9 +119,25 @@ function PreBlock({ children, ...props }: ComponentPropsWithoutRef<'pre'>) {
     if (isValidElement(children)) {
         const code = children as ReactElement<CodeElementProps>
         const language = code.props.className?.replace('language-', '')
+        const codeText = String(code.props.children).replace(/\n$/, '')
 
         if (language === 'mermaid') {
-            return <MermaidDiagram chart={String(code.props.children).replace(/\n$/, '')} />
+            return <MermaidDiagram chart={codeText} />
+        }
+
+        if (language && hljs.getLanguage(language)) {
+            const highlighted = hljs.highlight(codeText, {
+                language,
+            }).value
+
+            return (
+                <pre {...props}>
+                    <code
+                        className={`hljs language-${language}`}
+                        dangerouslySetInnerHTML={{ __html: highlighted }}
+                    />
+                </pre>
+            )
         }
     }
 
