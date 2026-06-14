@@ -1,3 +1,5 @@
+import { getMarkdownHeadings } from './markdown'
+
 type BlogFrontMatter = {
     title?: string
     date?: string
@@ -39,6 +41,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
     leetcode: {
         label: '力扣题',
         description: 'LeetCode problems, algorithm notes, and solution write-ups.',
+    },
+    'Fault-Tolerance-system': {
+        label: '容错系统复习',
+        description: '有关容错系统的知识和题目',
     },
 }
 
@@ -199,4 +205,72 @@ export function getBlogPost(topicSlug: string | undefined, slug: string) {
 
         return post.slug === slug
     })
+}
+
+function findWikiTargetPost(sourcePost: BlogPost, pageName: string) {
+    const normalizedPageName = pageName.trim()
+
+    return (
+        posts.find(
+            (post) =>
+                post.topic.slug === sourcePost.topic.slug &&
+                (post.slug === normalizedPageName || post.title === normalizedPageName),
+        ) ??
+        posts.find((post) => post.slug === normalizedPageName || post.title === normalizedPageName)
+    )
+}
+
+function findWikiHeadingId(post: BlogPost, headingTitle: string) {
+    const normalizedHeadingTitle = headingTitle.trim()
+    const heading = getMarkdownHeadings(post.content).find(
+        (item) => item.title === normalizedHeadingTitle,
+    )
+
+    return heading?.id
+}
+
+function escapeMarkdownLinkText(value: string) {
+    return value.replace(/]/g, '\\]')
+}
+
+function wikiLinkToMarkdown(sourcePost: BlogPost, rawTarget: string) {
+    const [targetPart, aliasPart] = rawTarget.split('|')
+    const [rawPageName, rawHeadingTitle] = targetPart.split('#')
+    const pageName = rawPageName.trim() || sourcePost.slug
+    const headingTitle = rawHeadingTitle?.trim()
+    const targetPost = findWikiTargetPost(sourcePost, pageName)
+
+    if (!targetPost) {
+        return `[[${rawTarget}]]`
+    }
+
+    const headingId = headingTitle ? findWikiHeadingId(targetPost, headingTitle) : undefined
+    const label =
+        aliasPart?.trim() ||
+        (headingTitle ? `${targetPost.title} > ${headingTitle}` : targetPost.title)
+    const href = `#${targetPost.path}${headingId ? `#${headingId}` : ''}`
+
+    return `[${escapeMarkdownLinkText(label)}](${href})`
+}
+
+export function resolveWikiLinks(content: string, sourcePost: BlogPost) {
+    let inCodeBlock = false
+
+    return content
+        .split('\n')
+        .map((line) => {
+            if (line.trim().startsWith('```')) {
+                inCodeBlock = !inCodeBlock
+                return line
+            }
+
+            if (inCodeBlock) {
+                return line
+            }
+
+            return line.replace(/\[\[([^\]\n]+)]]/g, (_, rawTarget: string) =>
+                wikiLinkToMarkdown(sourcePost, rawTarget),
+            )
+        })
+        .join('\n')
 }

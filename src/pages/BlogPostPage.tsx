@@ -1,6 +1,7 @@
-import { Link, Navigate, useParams } from 'react-router-dom'
+import { useEffect } from 'react'
+import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
 import { MarkdownPost } from '../components/MarkdownPost'
-import { getBlogPost } from '../lib/blog'
+import { getBlogPost, resolveWikiLinks } from '../lib/blog'
 import { getMarkdownHeadings } from '../lib/markdown'
 
 function scrollToHeading(id: string) {
@@ -11,16 +12,27 @@ function scrollToHeading(id: string) {
 }
 
 export function BlogPostPage() {
+    const location = useLocation()
     const { slug, topicSlug } = useParams()
     const post = slug ? getBlogPost(topicSlug, slug) : undefined
+
+    useEffect(() => {
+        if (!location.hash) {
+            return
+        }
+
+        const id = decodeURIComponent(location.hash.slice(1))
+        window.setTimeout(() => scrollToHeading(id), 0)
+    }, [location.hash, post?.path])
 
     if (!post) {
         return <Navigate to="/blog" replace />
     }
 
+    const content = resolveWikiLinks(post.content, post)
     const headings = getMarkdownHeadings(post.content, {
         maxLevel: 4,
-        minLevel: 2,
+        minLevel: 1,
     })
 
     return (
@@ -47,7 +59,7 @@ export function BlogPostPage() {
             </header>
 
             <div className="blog-post-layout">
-                <MarkdownPost content={post.content} />
+                <MarkdownPost content={content} />
 
                 {headings.length > 0 && (
                     <aside className="post-toc" aria-label="Table of contents">

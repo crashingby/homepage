@@ -210,13 +210,22 @@
     background: rgba(45, 212, 191, 0.1);
 }
 
+.post-toc .toc-level-1 {
+    color: #f8fafc;
+    font-weight: 800;
+}
+
+.post-toc .toc-level-2 {
+    padding-left: 14px;
+}
+
 .post-toc .toc-level-3 {
-    padding-left: 20px;
+    padding-left: 26px;
     color: #94a3b8;
 }
 
 .post-toc .toc-level-4 {
-    padding-left: 32px;
+    padding-left: 38px;
     color: #7f8ea3;
     font-size: 0.82rem;
 }
