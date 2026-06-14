@@ -36,6 +36,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: 'LLM 推理',
         description: 'Inference serving, KV cache, batching, scheduling, and system design.',
     },
+    leetcode: {
+        label: '力扣题',
+        description: 'LeetCode problems, algorithm notes, and solution write-ups.',
+    },
 }
 
 const fallbackTopic: BlogTopic = {

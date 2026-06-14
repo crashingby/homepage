@@ -7,15 +7,11 @@ import {
     type ReactElement,
     type ReactNode,
 } from 'react'
-import hljs from 'highlight.js/lib/core'
-import cpp from 'highlight.js/lib/languages/cpp'
-import javascript from 'highlight.js/lib/languages/javascript'
-import json from 'highlight.js/lib/languages/json'
-import python from 'highlight.js/lib/languages/python'
-import shell from 'highlight.js/lib/languages/shell'
-import typescript from 'highlight.js/lib/languages/typescript'
+import rehypeKatex from 'rehype-katex'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import remarkMath from 'remark-math'
+import 'katex/dist/katex.min.css'
 import { getMarkdownHeadings } from '../lib/markdown'
 
 type MarkdownPostProps = {
@@ -26,18 +22,6 @@ type CodeElementProps = {
     className?: string
     children?: ReactNode
 }
-
-hljs.registerLanguage('bash', shell)
-hljs.registerLanguage('cpp', cpp)
-hljs.registerLanguage('c++', cpp)
-hljs.registerLanguage('javascript', javascript)
-hljs.registerLanguage('js', javascript)
-hljs.registerLanguage('json', json)
-hljs.registerLanguage('python', python)
-hljs.registerLanguage('sh', shell)
-hljs.registerLanguage('shell', shell)
-hljs.registerLanguage('typescript', typescript)
-hljs.registerLanguage('ts', typescript)
 
 type MarkdownAstNode = {
     position?: {
@@ -51,6 +35,190 @@ type HeadingProps<Level extends 1 | 2 | 3 | 4 | 5 | 6> = ComponentPropsWithoutRe
     `h${Level}`
 > & {
     node?: MarkdownAstNode
+}
+
+const languageLabels: Record<string, string> = {
+    bash: 'Bash',
+    cpp: 'C++',
+    'c++': 'C++',
+    javascript: 'JavaScript',
+    js: 'JavaScript',
+    json: 'JSON',
+    python: 'Python',
+    sh: 'Shell',
+    shell: 'Shell',
+    ts: 'TypeScript',
+    typescript: 'TypeScript',
+}
+
+const shikiLanguageAliases: Record<string, string> = {
+    bash: 'bash',
+    c: 'cpp',
+    cpp: 'cpp',
+    'c++': 'cpp',
+    javascript: 'javascript',
+    js: 'javascript',
+    json: 'json',
+    python: 'python',
+    py: 'python',
+    sh: 'shellscript',
+    shell: 'shellscript',
+    shellscript: 'shellscript',
+    ts: 'typescript',
+    typescript: 'typescript',
+}
+
+type ShikiHighlighter = {
+    codeToHtml: (code: string, options: { lang: string; theme: string }) => string
+    loadLanguage: unknown
+}
+
+let shikiHighlighterPromise: Promise<ShikiHighlighter> | null = null
+const loadedShikiLanguages = new Set<string>()
+
+const shikiLanguageLoaders: Record<string, () => Promise<{ default: unknown }>> = {
+    bash: () => import('@shikijs/langs/bash'),
+    cpp: () => import('@shikijs/langs/cpp'),
+    javascript: () => import('@shikijs/langs/javascript'),
+    json: () => import('@shikijs/langs/json'),
+    python: () => import('@shikijs/langs/python'),
+    shellscript: () => import('@shikijs/langs/shellscript'),
+    typescript: () => import('@shikijs/langs/typescript'),
+}
+
+function getLanguageLabel(language?: string) {
+    if (!language) {
+        return 'Code'
+    }
+
+    return languageLabels[language] ?? language.toUpperCase()
+}
+
+function getShikiLanguage(language?: string) {
+    if (!language) {
+        return undefined
+    }
+
+    return shikiLanguageAliases[language.toLowerCase()]
+}
+
+async function getShikiHighlighter() {
+    shikiHighlighterPromise ??= Promise.all([
+        import('shiki/core'),
+        import('shiki/engine/javascript'),
+        import('@shikijs/themes/dark-plus'),
+    ]).then(
+        ([
+            { createHighlighterCore },
+            { createJavaScriptRegexEngine },
+            { default: darkPlus },
+        ]) =>
+            createHighlighterCore({
+                engine: createJavaScriptRegexEngine(),
+                langs: [],
+                themes: [darkPlus],
+            }).then((highlighter) => highlighter as ShikiHighlighter),
+    )
+
+    const highlighter = await shikiHighlighterPromise
+    return highlighter
+}
+
+async function loadShikiLanguage(highlighter: ShikiHighlighter, language: string) {
+    if (loadedShikiLanguages.has(language)) {
+        return
+    }
+
+    const loader = shikiLanguageLoaders[language]
+
+    if (!loader) {
+        return
+    }
+
+    const { default: grammar } = await loader()
+    await (highlighter.loadLanguage as (language: unknown) => Promise<void>)(grammar)
+    loadedShikiLanguages.add(language)
+}
+
+function PlainCodeBlock({
+    code,
+    language,
+    preProps,
+}: {
+    code: string
+    language?: string
+    preProps?: ComponentPropsWithoutRef<'pre'>
+}) {
+    return (
+        <figure className="code-block">
+            <figcaption className="code-block-header">
+                <span>{getLanguageLabel(language)}</span>
+            </figcaption>
+            <pre {...preProps} tabIndex={0}>
+                <code>{code}</code>
+            </pre>
+        </figure>
+    )
+}
+
+function ShikiCodeBlock({
+    code,
+    language,
+    preProps,
+}: {
+    code: string
+    language?: string
+    preProps?: ComponentPropsWithoutRef<'pre'>
+}) {
+    const [html, setHtml] = useState('')
+    const shikiLanguage = getShikiLanguage(language)
+
+    useEffect(() => {
+        let cancelled = false
+
+        async function highlightCode() {
+            if (!shikiLanguage) {
+                setHtml('')
+                return
+            }
+
+            try {
+                const highlighter = await getShikiHighlighter()
+                await loadShikiLanguage(highlighter, shikiLanguage)
+                const highlighted = highlighter.codeToHtml(code, {
+                    lang: shikiLanguage,
+                    theme: 'dark-plus',
+                })
+
+                if (!cancelled) {
+                    setHtml(highlighted)
+                }
+            } catch {
+                if (!cancelled) {
+                    setHtml('')
+                }
+            }
+        }
+
+        void highlightCode()
+
+        return () => {
+            cancelled = true
+        }
+    }, [code, shikiLanguage])
+
+    if (!html) {
+        return <PlainCodeBlock code={code} language={language} preProps={preProps} />
+    }
+
+    return (
+        <figure className="code-block">
+            <figcaption className="code-block-header">
+                <span>{getLanguageLabel(language)}</span>
+            </figcaption>
+            <div className="shiki-code" dangerouslySetInnerHTML={{ __html: html }} />
+        </figure>
+    )
 }
 
 function MermaidDiagram({ chart }: { chart: string }) {
@@ -125,23 +293,10 @@ function PreBlock({ children, ...props }: ComponentPropsWithoutRef<'pre'>) {
             return <MermaidDiagram chart={codeText} />
         }
 
-        if (language && hljs.getLanguage(language)) {
-            const highlighted = hljs.highlight(codeText, {
-                language,
-            }).value
-
-            return (
-                <pre {...props}>
-                    <code
-                        className={`hljs language-${language}`}
-                        dangerouslySetInnerHTML={{ __html: highlighted }}
-                    />
-                </pre>
-            )
-        }
+        return <ShikiCodeBlock code={codeText} language={language} preProps={props} />
     }
 
-    return <pre {...props}>{children}</pre>
+    return <PlainCodeBlock code={String(children)} preProps={props} />
 }
 
 function CodeBlock({ className, children, ...props }: ComponentPropsWithoutRef<'code'>) {
@@ -210,7 +365,8 @@ export function MarkdownPost({ content }: MarkdownPostProps) {
                     pre: PreBlock,
                     table: TableBlock,
                 }}
-                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeKatex]}
+                remarkPlugins={[remarkGfm, remarkMath]}
             >
                 {content}
             </ReactMarkdown>
