@@ -46,6 +46,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: '容错系统复习',
         description: '有关容错系统的知识和题目',
     },
+    'Software-Construction': {
+        label: '软件构造复习',
+        description: '有关软件构造的知识笔记',
+    },
 }
 
 const fallbackTopic: BlogTopic = {

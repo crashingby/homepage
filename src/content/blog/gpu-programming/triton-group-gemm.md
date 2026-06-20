@@ -189,11 +189,10 @@ def grouped_matmul_kernel(
 
         num_m_tiles = tl.cdiv(gm, BLOCK_SIZE_M)  # M 维度需要多少个 tile，cdiv 表示向上取整除法。
         num_n_tiles = tl.cdiv(gn, BLOCK_SIZE_N)  # N 维度需要多少个 tile。
+        num_k_tiles = tl.cdiv(gk, BLOCK_SIZE_K)  # K 维度需要多少个 tile。
         num_tiles = num_m_tiles * num_n_tiles  # 第 g 个 GEMM 的总 tile 数。
 
         while tile_idx >= last_problem_end and tile_idx < last_problem_end + num_tiles:
-            k = gk  # 当前 GEMM 的 K 大小，后面的 K 循环会沿这个维度做累加。
-
             lda = tl.load(g_lds + g * 3)  # A 的 leading dimension，表示 A 相邻两行之间的元素跨度。
             ldb = tl.load(g_lds + g * 3 + 1)  # B 的 leading dimension，表示 B 相邻两行之间的元素跨度。
             ldc = tl.load(g_lds + g * 3 + 2)  # C 的 leading dimension，表示 C 相邻两行之间的元素跨度。
@@ -208,30 +207,34 @@ def grouped_matmul_kernel(
 
             offs_am = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)  # 当前 tile 覆盖的 A/C 行索引。
             offs_bn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # 当前 tile 覆盖的 B/C 列索引。
-            offs_k = tl.arange(0, BLOCK_SIZE_K)  # 当前 K 分块内部的 K 偏移。
-
-            a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]  # A tile 指针矩阵，形状为 [BM, BK]。
-            b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]  # B tile 指针矩阵，形状为 [BK, BN]。
             accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)  # C tile 的 FP32 累加器。
 
-            for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):  # 沿 K 维度分块循环，每次处理 BLOCK_SIZE_K 个元素。
+            for kk in tl.range(0, num_k_tiles):  # 沿 K 维度分块循环，每次处理 BLOCK_SIZE_K 个元素。
+                offs_k = kk * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)  # 当前 K tile 覆盖的全局 K 索引。
+                a_offsets = offs_am[:, None] * lda + offs_k[None, :]  # A tile 的元素偏移，形状为 [BM, BK]。
+                b_offsets = offs_k[:, None] * ldb + offs_bn[None, :]  # B tile 的元素偏移，形状为 [BK, BN]。
+
+                a_mask = (offs_am[:, None] < gm) & (offs_k[None, :] < gk)  # A 只能读取有效的 M 行和 K 列。
+                b_mask = (offs_k[:, None] < gk) & (offs_bn[None, :] < gn)  # B 只能读取有效的 K 行和 N 列。
+
+                a_ptrs = a_ptr + a_offsets  # A tile 指针矩阵，形状为 [BM, BK]。
+                b_ptrs = b_ptr + b_offsets  # B tile 指针矩阵，形状为 [BK, BN]。
                 tl.multiple_of(a_ptrs, [16, 16])  # 告诉编译器 A 指针矩阵在两个维度上满足 16 对齐，有助于优化访存。
                 tl.multiple_of(b_ptrs, [16, 16])  # 告诉编译器 B 指针矩阵在两个维度上满足 16 对齐。
 
-                a = tl.load(a_ptrs)  # 从 global memory 加载 A 的 [BM, BK] tile。
-                b = tl.load(b_ptrs)  # 从 global memory 加载 B 的 [BK, BN] tile。
+                a = tl.load(a_ptrs, mask=a_mask, other=0.0)  # 越界位置填 0，避免无效元素参与 dot。
+                b = tl.load(b_ptrs, mask=b_mask, other=0.0)  # 越界位置填 0，避免无效元素参与 dot。
                 accumulator += tl.dot(a, b)  # 执行矩阵乘累加，把 [BM, BK] x [BK, BN] 累加到 [BM, BN]。
-
-                a_ptrs += BLOCK_SIZE_K  # A 指针沿 K 方向向右移动一个 K tile。
-                b_ptrs += BLOCK_SIZE_K * ldb  # B 指针沿 K 方向向下移动一个 K tile。
 
             c = accumulator.to(tl.float16)  # 把 FP32 累加结果转换成 FP16，匹配输出 C 的 dtype。
 
             offs_cm = tile_m_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)  # 当前 C tile 的行索引。
             offs_cn = tile_n_idx * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)  # 当前 C tile 的列索引。
-            c_ptrs = c_ptr + ldc * offs_cm[:, None] + offs_cn[None, :]  # C tile 指针矩阵，形状为 [BM, BN]。
+            c_offsets = offs_cm[:, None] * ldc + offs_cn[None, :]  # C tile 的元素偏移，形状为 [BM, BN]。
+            c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)  # C 只能写回有效的 M 行和 N 列。
+            c_ptrs = c_ptr + c_offsets  # C tile 指针矩阵，形状为 [BM, BN]。
 
-            tl.store(c_ptrs, c)  # 把当前 C tile 写回 global memory。
+            tl.store(c_ptrs, c, mask=c_mask)  # 把当前 C tile 写回 global memory，越界位置不写。
 
             tile_idx += NUM_SM  # 当前 program 跳到下一个由自己负责的全局 tile。
 
@@ -474,10 +477,12 @@ tile_n_idx = tile_idx_in_gemm % num_n_tiles
 
 当前 program 负责一个 $BLOCK\_SIZE\_M \times BLOCK\_SIZE\_N$ 的 C tile。
 
-它会构造 A tile 的指针矩阵：
+它会先确定当前输出 tile 对应的 M/N 方向索引，然后在 K 循环里为每个 K tile 构造 A/B 的指针矩阵。
+
+A tile 的偏移矩阵是：
 
 ```python
-a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]
+a_offsets = offs_am[:, None] * lda + offs_k[None, :]
 ```
 
 其中：
@@ -486,10 +491,10 @@ a_ptrs = a_ptr + offs_am[:, None] * lda + offs_k[None, :]
 - `offs_k[None, :]` 是 A 的列偏移，形状为 `[1, BK]`。
 - 二者广播后得到 `[BM, BK]` 的 A tile 地址矩阵。
 
-B tile 的指针矩阵是：
+B tile 的偏移矩阵是：
 
 ```python
-b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
+b_offsets = offs_k[:, None] * ldb + offs_bn[None, :]
 ```
 
 其中：
@@ -498,15 +503,20 @@ b_ptrs = b_ptr + offs_k[:, None] * ldb + offs_bn[None, :]
 - `offs_bn[None, :]` 是 B 的列偏移，形状为 `[1, BN]`。
 - 二者广播后得到 `[BK, BN]` 的 B tile 地址矩阵。
 
+然后再把偏移加到矩阵起始地址上：
+
+```python
+a_ptrs = a_ptr + a_offsets
+b_ptrs = b_ptr + b_offsets
+```
+
 之后沿 K 维度循环：
 
 ```python
-for kk in range(0, tl.cdiv(k, BLOCK_SIZE_K)):
-    a = tl.load(a_ptrs)
-    b = tl.load(b_ptrs)
+for kk in tl.range(0, num_k_tiles):
+    a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+    b = tl.load(b_ptrs, mask=b_mask, other=0.0)
     accumulator += tl.dot(a, b)
-    a_ptrs += BLOCK_SIZE_K
-    b_ptrs += BLOCK_SIZE_K * ldb
 ```
 
 每次循环做一次：
@@ -516,6 +526,43 @@ $$
 $$
 
 最终 `accumulator` 中就是当前 C tile 的结果。
+
+## 边界 mask 如何处理
+
+这个版本已经支持非整除尺寸。虽然 tile 数量通过 `tl.cdiv` 向上取整，但最后一个 M tile、N tile 或 K tile 可能不是完整 tile。
+
+因此加载 A 时需要同时判断两件事：
+
+- `offs_am < gm`：当前 A 行必须落在有效 M 范围内。
+- `offs_k < gk`：当前 A 列必须落在有效 K 范围内。
+
+对应代码是：
+
+```python
+a_mask = (offs_am[:, None] < gm) & (offs_k[None, :] < gk)
+```
+
+加载 B 时也需要判断两件事：
+
+- `offs_k < gk`：当前 B 行必须落在有效 K 范围内。
+- `offs_bn < gn`：当前 B 列必须落在有效 N 范围内。
+
+对应代码是：
+
+```python
+b_mask = (offs_k[:, None] < gk) & (offs_bn[None, :] < gn)
+```
+
+写回 C 时只需要判断输出 tile 的二维范围：
+
+```python
+c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)
+```
+
+这里有两个容易踩坑的点：
+
+- **mask 表达式必须加括号**。`(offs_am[:, None] < gm) & (offs_k[None, :] < gk)` 不能写成 `offs_am[:, None] < gm & offs_k[None, :] < gk`，否则会被 Python 按错误的运算优先级解析。
+- **masked load 要给 `other=0.0`**。越界位置不应该参与矩阵乘，填 0 后不会影响 `tl.dot` 的累加结果。
 
 ## 为什么 tile_idx 要加 NUM_SM
 
@@ -542,39 +589,7 @@ tile_idx += NUM_SM
 
 - 每个 program 要线性扫描 group，才能判断 tile 属于哪个 GEMM。
 - 如果 group 很大，扫描开销会增加。
-- 当前源码假设 full tile，没有处理边界 mask。
-
-## 当前实现的边界假设
-
-源码里有一个重要简化：**假设每个 tile 都是完整 tile**。
-
-也就是默认 `M` 能被 `BLOCK_SIZE_M` 整除，`N` 能被 `BLOCK_SIZE_N` 整除，`K` 能被 `BLOCK_SIZE_K` 整除。
-
-但代码里虽然用 `tl.cdiv` 计算 tile 数，真正 `tl.load` 和 `tl.store` 时没有 mask：
-
-```python
-a = tl.load(a_ptrs)
-b = tl.load(b_ptrs)
-tl.store(c_ptrs, c)
-```
-
-如果矩阵尺寸不能整除 tile size，最后一个 tile 会越界读写。因此真实工程版本需要加 mask：
-
-```python
-a_mask = (offs_am[:, None] < gm) & (current_k_offsets[None, :] < gk)
-b_mask = (current_k_offsets[:, None] < gk) & (offs_bn[None, :] < gn)
-c_mask = (offs_cm[:, None] < gm) & (offs_cn[None, :] < gn)
-```
-
-然后使用：
-
-```python
-tl.load(a_ptrs, mask=a_mask, other=0.0)
-tl.load(b_ptrs, mask=b_mask, other=0.0)
-tl.store(c_ptrs, c, mask=c_mask)
-```
-
-这个版本为了突出分组调度，没有展开边界处理。
+- 边界 mask 会让代码比 full tile 版本多一些谓词判断，但换来的是支持任意 $M,N,K$。
 
 ## host 端为什么要传指针数组
 
@@ -667,7 +682,7 @@ triton_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size)
 
 ## 后续可以继续优化的方向
 
-- **边界 mask**：支持任意 $M,N,K$，避免 full tile 假设。
+- **mask 开销优化**：如果某些 shape 总是整除 tile size，可以为 full tile 路径保留更轻的 load/store。
 - **分组扫描优化**：当 `group_size` 很大时，可以用 prefix sum 或更直接的 tile-to-group 映射减少扫描成本。
 - **更细的 autotune 参数**：加入 `num_warps`、`num_stages`、不同 `BLOCK_SIZE_K`。
 - **支持更多 dtype**：例如 BF16、FP8 或带 scale 的 mixed precision。
