@@ -46,9 +46,7 @@ flowchart TD
 
 ### 为什么先讲存储架构
 
-PPT 特别提醒了一个常见误区：**不要脱离存储架构直接谈分布式事务**。
-
-原因是：
+分布式事务不能脱离存储架构讨论。核心原因是：
 
 - 如果系统只有一个数据库，一个本地事务就能解决很多一致性问题。
 - 一旦系统变成主从、分片、微服务、多数据库、多缓存、多消息队列，数据就会分布在多个地方。
@@ -116,11 +114,12 @@ mindmap
 
 ```mermaid
 flowchart LR
-  A["业务系统"] --> B["Master 主库"]
-  B --> C["Slave 从库 A"]
-  B --> D["Slave 从库 B"]
-  C --> E["读请求"]
-  D --> E
+  Client["业务系统 / 用户"] -->|"写请求"| M[("MySQL Master")]
+  M -->|"主从复制"| S1[("MySQL Slave 1")]
+  M -->|"主从复制"| S2[("MySQL Slave 2")]
+  Client -->|"读请求"| S1
+  Client -->|"读请求"| S2
+  S1 -. "Master 故障时可提升为新主库" .-> M
 ```
 
 ### MySQL 主从复制过程
@@ -151,6 +150,27 @@ sequenceDiagram
   SQL->>S: 重放变更
 ```
 
+```mermaid
+flowchart LR
+  subgraph Master["Master 主库"]
+    MD[("数据")]
+    MB["binlog"]
+    MD -->|"1. 数据变更"| MB
+  end
+
+  subgraph Slave["Slave 从库"]
+    IO["I/O 线程"]
+    R["relay log"]
+    SQL["SQL 线程"]
+    SD[("数据")]
+    IO -->|"3. 追加写入"| R
+    R -->|"4. 读取日志"| SQL
+    SQL -->|"5. 回放写入"| SD
+  end
+
+  MB -->|"2. 读取 binlog"| IO
+```
+
 ### 异步复制与半同步复制
 
 MySQL 默认常见的是**异步复制**：
@@ -175,6 +195,49 @@ MySQL 5.5 之后支持**半同步复制**：
 |---|---:|---|---|---|
 | **异步复制** | 不等待 | 较弱 | 高 | 从库可能落后，主库故障时可能丢数据 |
 | **半同步复制** | 等至少一个从库 ACK | 较强 | 较低 | 延迟增加，但数据丢失风险降低 |
+
+异步复制的时间线可以理解为：主库完成 `execute -> binlog -> commit` 后就返回，Slave 的 `relay log -> apply` 在后面异步追赶。
+
+```mermaid
+flowchart LR
+  subgraph M["Master 时间线"]
+    ME["execute"] --> MB["binlog"] --> MC["commit"]
+  end
+
+  subgraph S1["Slave 1 时间线"]
+    S1R["relay log"] --> S1A["apply"] --> S1N["..."]
+  end
+
+  subgraph S2["Slave 2 时间线"]
+    S2R["relay log"] --> S2A["apply"] --> S2N["..."]
+  end
+
+  MB -. "复制数据" .-> S1R
+  MB -. "复制数据" .-> S2R
+  MC --> Done["主库提交完成，不等待从库"]
+```
+
+半同步复制则会在提交前等待至少一个 Slave 返回 ACK。它不一定要求从库已经完成重放，但至少要求日志已经到达某个从库并写入 relay log。
+
+```mermaid
+flowchart LR
+  subgraph M["Master 时间线"]
+    ME["execute"] --> MB["binlog"] --> Wait["等待至少一个 ACK"] --> MC["commit"]
+  end
+
+  subgraph S1["Slave 1 时间线"]
+    S1R["relay log"] --> S1ACK["ACK"] --> S1A["apply"]
+  end
+
+  subgraph S2["Slave 2 时间线"]
+    S2R["relay log"] --> S2ACK["ACK"] --> S2A["apply"]
+  end
+
+  MB -. "复制数据" .-> S1R
+  MB -. "复制数据" .-> S2R
+  S1ACK -. "至少一个 ACK" .-> Wait
+  S2ACK -. "至少一个 ACK" .-> Wait
+```
 
 ### 复制风暴
 
@@ -218,10 +281,11 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-  A["业务请求"] --> B{"请求类型"}
-  B -->|"写"| C["Master 主库"]
-  B -->|"读"| D["Slave 从库集群"]
-  C --> D
+  App["业务服务器 / 数据访问层"] -->|"写请求"| M[("Master 主库")]
+  App -->|"读请求"| S1[("Slave 从库 1")]
+  App -->|"读请求"| S2[("Slave 从库 2")]
+  M -->|"主从复制"| S1
+  M -->|"主从复制"| S2
 ```
 
 ### 路由方式
@@ -275,15 +339,17 @@ flowchart LR
 - **Query 查询**负责读取系统状态，也就是读。
 - 写模型和读模型可以使用不同的数据结构、数据库或存储系统。
 
-PPT 强调：数据库读写分离和缓存，都可以看作 CQRS 的特殊形式。
+数据库读写分离和缓存，都可以看作 CQRS 的特殊形式。
 
 ```mermaid
 flowchart LR
-  A["写请求 Command"] --> B["写模型 / 主数据库"]
-  B --> C["数据变更事件"]
-  C --> D["消息队列 / 定时任务 / Binlog 监听"]
-  D --> E["读模型 / Redis / ES / 宽表"]
-  F["读请求 Query"] --> E
+  Client["客户端"] -->|"command"| Service["业务服务"]
+  Client -->|"query"| Service
+  Service -->|"写入"| WriteStore[("写数据存储")]
+  WriteStore -->|"发送数据"| Channel["数据传输通道"]
+  Channel -->|"读取并写入数据"| ReadStore[("读数据存储")]
+  Service -->|"读取数据"| ReadStore
+  ReadStore -->|"返回结果"| Service
 ```
 
 ### CQRS 的组成
@@ -338,6 +404,18 @@ CQRS 的做法是：
 - 提前聚合生成**宽表**。
 - 查询请求直接读宽表，避免在线复杂 join。
 
+```mermaid
+flowchart LR
+  Client["客户端"] -->|"command"| Biz["业务服务"]
+  Biz -->|"写入"| DB[("在线数据库")]
+  DB -->|"binlog"| MQ(("消息队列"))
+  MQ --> Worker["worker 聚合计算"]
+  Worker --> Wide[("宽表 / 查询库")]
+  User["用户 / 运营后台"] -->|"query"| Query["查询服务"]
+  Query -->|"读取数据"| Wide
+  Wide -->|"返回结果"| Query
+```
+
 ### CQRS 的特点
 
 - **读写存储可以差异化**
@@ -354,7 +432,7 @@ CQRS 的做法是：
 
 ### 基本概念
 
-**数据分片（sharding）**的本质是：  
+**数据分片（sharding）** 的本质是：  
 把数据和请求拆到多个节点上并行处理。
 
 在数据库场景中，分库分表主要解决两个问题：
@@ -392,11 +470,24 @@ CQRS 的做法是：
 
 ```mermaid
 flowchart TD
-  A["电商数据库"] --> B["商品库"]
-  A --> C["订单库"]
-  A --> D["用户库"]
-  B --> E["商品基本信息表"]
-  B --> F["商品详情表"]
+  Ecom[("电商库")]
+
+  Ecom --> Product[("商品库")]
+  Ecom --> Merchant[("商家库")]
+  Ecom --> Order[("订单库")]
+  Ecom --> Logistics[("物流库")]
+
+  Product --> ProductTable["商品表"]
+  Merchant --> MerchantTable["商家表"]
+  Order --> OrderTable["订单表"]
+  Logistics --> LogisticsTable["物流表"]
+```
+
+```mermaid
+flowchart TD
+  Product["商品表"]
+  Product --> Basic["商品基本信息表<br/>名称 / 商品图片 / 价格"]
+  Product --> Detail["商品详情表<br/>限购数量 / 商品描述 / 售后说明"]
 ```
 
 **注意**：  
@@ -428,12 +519,34 @@ flowchart TD
 - 但路由、扩容、跨分片查询会更复杂。
 
 ```mermaid
-flowchart LR
-  A["订单数据"] --> B{"order_id % 4"}
-  B --> C["order_0"]
-  B --> D["order_1"]
-  B --> E["order_2"]
-  B --> F["order_3"]
+flowchart TD
+  U[("用户库 / 用户表")] --> R{"uid % 3"}
+  R -->|"0"| DB1[("用户库-1<br/>用户表")]
+  R -->|"1"| DB2[("用户库-2<br/>用户表")]
+  R -->|"2"| DB3[("用户库-3<br/>用户表")]
+```
+
+水平分库分表可以组合使用：先决定落到哪个库，再决定落到库内哪张表。
+
+```mermaid
+flowchart TD
+  U["用户数据"] --> Hash{"路由规则"}
+
+  Hash --> D1["用户库-1"]
+  Hash --> D2["用户库-2"]
+  Hash --> D3["用户库-3"]
+
+  D1 --> D1T1["用户表-1"]
+  D1 --> D1T2["用户表-2"]
+  D1 --> D1T3["用户表-3"]
+
+  D2 --> D2T1["用户表-1"]
+  D2 --> D2T2["用户表-2"]
+  D2 --> D2T3["用户表-3"]
+
+  D3 --> D3T1["用户表-1"]
+  D3 --> D3T2["用户表-2"]
+  D3 --> D3T3["用户表-3"]
 ```
 
 ### 范围分片
@@ -458,6 +571,13 @@ flowchart LR
 - 新数据可能集中写入最新分片。
 - 数据分布可能不均匀。
 
+```mermaid
+flowchart LR
+  Rule["按时间或 ID 范围划分"] --> DB1[("DB1<br/>2024.7-2024.12")]
+  Rule --> DB2[("DB2<br/>2025.1-2025.6")]
+  Rule --> DB3[("DB3<br/>2025.7-2025.12")]
+```
+
 ### 哈希分片
 
 **哈希分片**用哈希或取模把数据打散。
@@ -472,6 +592,27 @@ flowchart LR
 - 范围查询不友好。
 - 扩容时可能需要大量数据迁移。
 - 改变分片数量会影响路由结果。
+
+```mermaid
+flowchart LR
+  Field["所选字段"] --> Hash["hash()"]
+  Hash --> Mod["hash() % N"]
+  Mod --> P0["分区 0"]
+  Mod --> P1["分区 1"]
+  Mod --> PN["分区 N-1"]
+```
+
+也可以先把字段哈希成一个连续哈希值，再把哈希值落到某个范围分区中。
+
+```mermaid
+flowchart LR
+  F1["字段值 1"] --> H1["哈希值 1"]
+  F2["字段值 2"] --> H2["哈希值 2"]
+  F3["字段值 3"] --> H3["哈希值 3"]
+  H1 --> R0["范围分区 0"]
+  H2 --> R1["范围分区 1"]
+  H3 --> R2["范围分区 2"]
+```
 
 | 分片方式 | 优点 | 缺点 | 适合场景 |
 |---|---|---|---|
@@ -490,11 +631,15 @@ flowchart LR
 - 新增或删除节点时，只影响相邻区间的数据。
 
 ```mermaid
-flowchart TD
-  A["数据 Key 计算 Hash"] --> B["落到 Hash 环上"]
-  B --> C["顺时针寻找第一个分片节点"]
-  C --> D["路由到该分片"]
-  E["新增分片"] --> F["只迁移局部区间数据"]
+flowchart LR
+  P4["分区 4"] --> P1["分区 1"]
+  P1 --> P2["分区 2"]
+  P2 --> P3["分区 3"]
+  P3 --> P4
+
+  D1["data1 hash"] -->|"顺时针归属"| P1
+  D2["data2 hash"] -->|"顺时针归属"| P2
+  D3["data3 hash"] -->|"顺时针归属"| P4
 ```
 
 ### 虚拟节点
@@ -508,6 +653,31 @@ flowchart TD
 - 数据更均匀地落到不同真实节点上。
 - 扩容时迁移也更平滑。
 
+```mermaid
+flowchart LR
+  Data["data1 ... data6"] --> Hash["哈希计算"]
+
+  Hash --> V11["分区 1-1"]
+  Hash --> V12["分区 1-2"]
+  Hash --> V13["分区 1-3"]
+  Hash --> V21["分区 2-1"]
+  Hash --> V22["分区 2-2"]
+  Hash --> V23["分区 2-3"]
+  Hash --> V31["分区 3-1"]
+  Hash --> V32["分区 3-2"]
+  Hash --> V33["分区 3-3"]
+
+  V11 --> P1["真实分区 1"]
+  V12 --> P1
+  V13 --> P1
+  V21 --> P2["真实分区 2"]
+  V22 --> P2
+  V23 --> P2
+  V31 --> P3["真实分区 3"]
+  V32 --> P3
+  V33 --> P3
+```
+
 ### 分库分表扩容
 
 系统需要扩容通常有两个原因：
@@ -515,7 +685,7 @@ flowchart TD
 - 某些分片的数据量或访问量明显高于其他分片。
 - 当前分片容量接近瓶颈。
 
-PPT 提到一种扩容方式：**从库升级法**。
+一种常见扩容方式是**从库升级法**。
 
 大致流程：
 
@@ -527,12 +697,13 @@ PPT 提到一种扩容方式：**从库升级法**。
 
 ```mermaid
 flowchart TD
-  A["原分片压力过大"] --> B["增加从库并同步数据"]
-  B --> C["短暂阻塞写入"]
-  C --> D["校验主从一致"]
-  D --> E["调整路由与数据范围"]
-  E --> F["放开业务写入"]
-  F --> G["清理冗余数据"]
+  A["原分片压力过大<br/>数据量或请求量接近瓶颈"] --> B["为目标库增加从库"]
+  B --> C["等待主从数据同步完成"]
+  C --> D["短暂封禁主库写请求"]
+  D --> E["确认主从数据一致"]
+  E --> F["主库与从库分别承接新范围"]
+  F --> G["放开写请求"]
+  G --> H["删除冗余数据，完成平滑扩容"]
 ```
 
 **复习提示**：  
@@ -547,12 +718,8 @@ flowchart TD
 - 前台快速接收请求。
 - 后台再慢慢执行真实写入。
 
-用户看到的是：
-
 - 请求已提交。
 - 处理结果稍后可查。
-
-系统内部则是：
 
 - 请求先进入数据池或消息队列。
 - 后台消费者按数据库承载能力处理。
@@ -567,9 +734,21 @@ flowchart LR
   E --> F["结果查询 / 通知"]
 ```
 
+这张图的重点是：用户请求和数据库真实写入被消息队列隔开，前台只保证请求已经进入系统，后台再按自己的节奏落库。
+
+跨公网调用时，异步写可以把第三方接口调用从主链路中挪出去，避免用户请求一直阻塞在外部网络延迟上。
+
+```mermaid
+flowchart LR
+  User["用户"] -->|"支付请求"| Pay["支付服务"]
+  Pay -->|"排队"| MQ(("消息中间件"))
+  MQ -->|"消费"| Consumer["消息消费者"]
+  Consumer -->|"跨公网调用"| Third["第三方支付平台"]
+```
+
 ### 异步写适用场景
 
-PPT 给出的典型场景包括：
+典型场景包括：
 
 - **跨公网调用**
   - 第三方接口慢、不稳定。
@@ -580,6 +759,18 @@ PPT 给出的典型场景包括：
   - 消费者按数据库能力扣减库存。
   - 处理结果写入 Redis。
   - 用户查询 Redis 得知成功或失败。
+
+```mermaid
+flowchart LR
+  User["用户"] -->|"发起抢购"| Sec["秒杀服务"]
+  Sec -->|"抢购请求入队"| MQ(("消息队列"))
+  Sec -->|"查询结果"| Redis[("Redis")]
+  MQ --> Consumer["消息消费者"]
+  Consumer -->|"按数据库能力处理"| DB[("数据库")]
+  Consumer -->|"写入抢购状态"| Redis
+```
+
+秒杀链路中，消息队列负责削峰，Redis 负责承载结果查询，数据库只按自己能承受的速度处理最终写入。
 
 ### 写聚合
 
@@ -622,7 +813,7 @@ PPT 给出的典型场景包括：
 
 在真实分布式系统里，网络分区无法彻底避免，因此通常要在一致性和可用性之间做取舍。
 
-本章的核心结论是：
+核心结论是：
 
 - 存储架构为了高可用和高性能，会引入多副本、多节点、异步同步。
 - 这些设计会让一致性变复杂。
@@ -761,19 +952,21 @@ flowchart LR
 ```mermaid
 sequenceDiagram
   participant C as 协调者
-  participant A as 参与者 A
-  participant B as 参与者 B
-  participant D as 参与者 C
+  participant A as 订单服务
+  participant B as 库存服务
 
-  C->>A: Prepare?
-  C->>B: Prepare?
-  C->>D: Prepare?
-  A-->>C: Ready
-  B-->>C: Ready
-  D-->>C: Ready
-  C->>A: Commit
-  C->>B: Commit
-  C->>D: Commit
+  C->>A: prepare_req
+  C->>B: prepare_req
+  A->>A: 锁定资源，执行操作但不提交
+  B->>B: 锁定资源，执行操作但不提交
+  A-->>C: prepare_ok
+  B-->>C: prepare_ok
+  C->>A: commit_req
+  C->>B: commit_req
+  A->>A: 提交操作，释放资源
+  B->>B: 提交操作，释放资源
+  A-->>C: commit_ok
+  B-->>C: commit_ok
 ```
 
 ### 优缺点
@@ -825,6 +1018,21 @@ flowchart TD
   B --> C{"所有 Try 是否成功"}
   C -->|"是"| D["Confirm：正式提交"]
   C -->|"否"| E["Cancel：释放资源"]
+```
+
+```mermaid
+sequenceDiagram
+  participant Client as 客户端
+  participant Coord as 协调者
+  participant Order as 订单服务
+  participant Stock as 库存服务
+
+  Client->>Coord: 1. 启动事务
+  Client->>Order: 2. 调用 Try 接口
+  Client->>Stock: 2. 调用 Try 接口
+  Client->>Coord: 3. 提交或回滚事务
+  Coord->>Order: 4. Confirm 或 Cancel
+  Coord->>Stock: 4. Confirm 或 Cancel
 ```
 
 ### 下单库存示例
@@ -932,6 +1140,16 @@ sequenceDiagram
   O->>A: 取消订单
 ```
 
+```mermaid
+flowchart LR
+  Coord["协调者"] -->|"正向：创建订单<br/>补偿：取消订单"| Order["订单服务"]
+  Coord -->|"正向：扣减库存<br/>补偿：恢复库存"| Stock["库存服务"]
+  Coord -->|"正向：增加积分<br/>补偿：扣减积分"| Point["积分服务"]
+  Order -. "失败时回滚，执行补偿" .-> Coord
+  Stock -. "失败时回滚，执行补偿" .-> Coord
+  Point -. "失败时回滚，执行补偿" .-> Coord
+```
+
 优点：
 
 - 流程清晰。
@@ -957,13 +1175,14 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-  A["订单服务完成"] --> B["发布订单事件"]
-  B --> C["库存服务处理"]
-  C --> D["发布库存事件"]
-  D --> E["物流服务处理"]
-  E --> F{"失败?"}
-  F -->|"是"| G["发布补偿事件"]
-  F -->|"否"| H["流程完成"]
+  subgraph Order["订单服务"]
+    Saga["创建订单 Saga 编排器"]
+  end
+
+  Saga -->|"1. 积分服务请求通道"| Point["积分服务"]
+  Point -->|"4. 创建订单 Saga 回复通道"| Saga
+  Saga -->|"5. 库存服务请求通道"| Stock["库存服务"]
+  Stock -->|"8. 创建订单 Saga 回复通道"| Saga
 ```
 
 优点：
@@ -1010,7 +1229,7 @@ Saga 适合：
 
 ### 基本流程
 
-PPT 中给出的流程可以整理为：
+基本流程可以整理为：
 
 - 生产者发送 **prepare 消息**到 MQ。
 - 生产者执行本地事务。
@@ -1026,14 +1245,18 @@ sequenceDiagram
   participant MQ as 消息队列
   participant DB as 订单数据库
   participant C as 消费者 / 库存服务
+  participant SDB as 库存数据库
 
-  P->>MQ: 发送 prepare 消息
-  P->>DB: 执行本地事务
+  P->>MQ: 1. 发送 prepare 消息
+  P->>DB: 2. 执行本地事务
   DB-->>P: 本地事务成功
-  P->>MQ: confirm 消息可投递
-  MQ->>C: 投递消息
-  C->>C: 执行业务处理
+  P->>MQ: 3. 发送 confirm 消息
+  MQ->>C: 4. 投递消息
+  C->>SDB: 5. 写入库存数据库
+  C-->>MQ: 6. ACK
 ```
+
+这里的关键边界是：事务消息解决的是“订单本地事务”和“消息是否可投递”的一致性，不直接保证库存服务一定成功。
 
 ### MQ 回查机制
 
@@ -1056,7 +1279,6 @@ flowchart TD
 
 ### 重要限制
 
-PPT 特别强调：  
 **下游业务失败不会触发上游业务回滚。**
 
 也就是说：
@@ -1074,7 +1296,6 @@ PPT 特别强调：
 - 此时订单服务不会自动 rollback。
 - 系统可能需要取消订单、退款、通知用户或进入人工处理。
 
-这也是为什么 PPT 说：  
 **消息最终一致性最快，但一致性保证范围也最有限。**
 
 ### 适用场景
@@ -1244,5 +1465,3 @@ TCC 的 Cancel 是业务写出来的反向逻辑。
 - **TCC**适合短事务和资源预留场景。
 - **Saga**适合长流程事务，通过正向操作和补偿操作保证最终一致。
 - **消息最终一致性**性能高，但下游失败不会自动回滚上游。
-
-
