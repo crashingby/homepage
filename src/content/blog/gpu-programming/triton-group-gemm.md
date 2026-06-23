@@ -665,6 +665,10 @@ triton_perf_fn(a_ptrs, b_ptrs, c_ptrs, sizes, lds, group_size)
 
 当每个 GEMM 比较小、group size 又比较大时，grouped GEMM 通常更容易占优，因为它减少了 launch overhead，并让多个小任务共享一次 GPU 调度。
 
+![Triton grouped GEMM benchmark](/blog-assets/gpu-programming/triton-group-gemm/Figure1.svg)
+
+*图 1：`group_size = 4` 时，逐个调用 cuBLAS GEMM 与一次 Triton grouped GEMM 的运行时间对比。图中的 Triton 曲线对应 `triton_perf_fn`，主要反映 grouped GEMM kernel 的执行与 launch 开销，不包含 host 端重新构造元数据的时间。*
+
 ## 这份实现的核心思想
 
 这份 Triton grouped GEMM 的核心不是单个 GEMM tile 的数学计算，因为那部分和普通 matmul kernel 很像。真正值得关注的是：
