@@ -184,58 +184,108 @@ sequenceDiagram
 
 ## Scheduler Connector 和 Worker Connector
 
-vLLM 的每个相关进程都会有对应的 connector。原文把它们分为两类：
 
-- **Scheduler connector**：位于 scheduler 进程中，负责调度 KV cache transfer 操作。
-- **Worker connector**：位于 worker 进程中，负责实际执行 KV cache transfer 操作。
+这里最容易混的是：**Scheduler / Worker** 和 **Prefill / Decode** 不是同一层概念。
+
+- **Scheduler / Worker 是 vLLM 实例内部的进程分工**：一个普通 vLLM 实例内部就有 scheduler 和 worker。scheduler 负责调度请求、分配 KV block、生成 `SchedulerOutput`；worker 负责真正跑模型 forward、执行 attention、读写 paged KV buffer。
+- **Prefill / Decode 是 PD 分离部署时的实例角色**：PD 分离不是把 scheduler 改成 PrefillScheduler / DecodeScheduler，而是启动多个普通 vLLM 实例，让其中一些实例主要承担 Prefill 角色，另一些实例主要承担 Decode 角色。
+- **所以 P 侧和 D 侧都会有 scheduler 和 worker**：Prefill 实例内部有自己的普通 scheduler 和 worker；Decode 实例内部也有自己的普通 scheduler 和 worker。
+
+先看一个普通 vLLM 实例：
 
 ```mermaid
 flowchart TB
-    subgraph One[单个 vLLM 实例内部]
-        subgraph SProc[Scheduler 进程<br/>负责调度]
-            SConn[Scheduler 里的 Connector]
-        end
-
-        Meta[SchedulerOutput<br/>新增可选字段 connector_metadata<br/>传递 KV 传输元数据]
-
-        subgraph WProc1[Worker 进程]
-            WConn1[Worker 里的 Connector]
-            PKV1[Paged KV buffer<br/>分页 KV 缓冲区]
-        end
-
-        subgraph WProc2[Worker 进程]
-            WConn2[Worker 里的 Connector]
-            PKV2[Paged KV buffer<br/>分页 KV 缓冲区]
-        end
+    subgraph V["普通 vLLM 实例"]
+        S["Scheduler 进程：调度请求、分配 KV block"]
+        W1["Worker 进程：执行模型 forward"]
+        W2["Worker 进程：执行模型 forward"]
+        KV1["Paged KV buffer"]
+        KV2["Paged KV buffer"]
     end
 
-    subgraph Other[其他 vLLM 实例]
-        OS[Scheduler 进程]
-        OW1[Worker 进程]
-        OW2[Worker 进程]
-        OS --> OW1
-        OS --> OW2
-    end
-
-    Layer[数据传输层<br/>跨实例搬运 KV cache]
-
-    SConn --> Meta
-    SConn --> WProc1
-    SConn --> WProc2
-    Meta -.-> WConn1
-    Meta -.-> WConn2
-
-    WConn1 <--> Layer
-    WConn2 <--> Layer
-    OW1 <--> Layer
-    OW2 <--> Layer
+    S --> W1
+    S --> W2
+    W1 --> KV1
+    W2 --> KV2
 ```
 
-这张图是在解释 connector 在 vLLM 进程结构里的位置。一个 vLLM 实例里有 scheduler 进程和多个 worker 进程：**scheduler connector 负责编排传输任务**，例如告诉 worker 哪些请求需要存 KV 或取 KV；**worker connector 负责真正接触 Paged KV buffer 并执行传输**。
+在普通 vLLM 里，scheduler 本身并不叫“prefill scheduler”或“decode scheduler”。它只是根据请求状态决定本轮要调度哪些 token：可能是 prompt prefill，也可能是 decode token，也可能是 chunked prefill 的一部分。
 
-`connector_metadata` 是这张图的重点之一。它表示 scheduler 可以把 KV 传输所需的元数据塞进 `SchedulerOutput`，再传给 worker。这样 worker 不需要自己重新推断传输计划，只需要按 scheduler 给出的元数据执行。
+PD 分离之后，结构变成“多个普通 vLLM 实例协作”：
 
-底部的“数据传输层”表示跨实例通信能力，例如 NIXL、Mooncake 或其他 connector 后端。Prefill 实例和 Decode 实例最终都通过这一层交换 KV cache。
+```mermaid
+flowchart TB
+    subgraph PInst["Prefill vLLM 实例：生产 KV cache"]
+        PS["普通 Scheduler 进程"]
+        PW["Worker 进程：执行 prefill"]
+        PWC["Worker Connector：保存或发送 KV"]
+        PKV["Paged KV buffer"]
+        PS --> PW
+        PW --> PKV
+        PW --> PWC
+    end
+
+    subgraph DInst["Decode vLLM 实例：消费 KV cache"]
+        DS["普通 Scheduler 进程"]
+        DW["Worker 进程：执行 decode"]
+        DWC["Worker Connector：加载或接收 KV"]
+        DKV["Paged KV buffer"]
+        DS --> DW
+        DW --> DKV
+        DW --> DWC
+    end
+
+    PWC --> Transfer["KV 传输层：NIXL / Mooncake / 共享存储等"]
+    Transfer --> DWC
+```
+
+这张图里的 `PS` 和 `DS` 都是普通 vLLM scheduler。它们不是两套不同的 scheduler 类，而是运行在两个不同 vLLM 实例里的两个 scheduler 进程。区别来自实例承担的部署角色：Prefill 实例主要生产 KV cache，Decode 实例主要消费 KV cache。
+
+Connector 也有类似的“实例内部角色”划分：
+
+- **Scheduler Connector**：运行在某个 vLLM 实例的 scheduler 侧，负责决定本轮 KV transfer 该怎么做。它会参与 scheduler 决策，例如外部 KV cache 命中多少 token、哪些请求需要 load、哪些请求需要 store，然后生成 `connector_metadata`。
+- **Worker Connector**：运行在某个 vLLM 实例的 worker 侧，负责真正执行 KV cache 的读写。它会接触 paged KV buffer，在 forward 前加载 KV，在 attention 层执行时保存 KV，或者等待异步传输完成。
+
+```mermaid
+flowchart TB
+    subgraph PInst["Prefill vLLM 实例"]
+        PSC["Scheduler Connector：决定哪些请求要保存 KV"]
+        PSO["SchedulerOutput.connector_metadata"]
+        PWC["Worker Connector：按 metadata 保存 KV"]
+        PKV["Paged KV buffer"]
+        PSC --> PSO
+        PSO --> PWC
+        PWC --> PKV
+    end
+
+    subgraph DInst["Decode vLLM 实例"]
+        DSC["Scheduler Connector：决定哪些请求要加载外部 KV"]
+        DSO["SchedulerOutput.connector_metadata"]
+        DWC["Worker Connector：按 metadata 加载 KV"]
+        DKV["Paged KV buffer"]
+        DSC --> DSO
+        DSO --> DWC
+        DWC --> DKV
+    end
+
+    PWC --> Layer["数据传输层"]
+    Layer --> DWC
+```
+
+这张图把 connector 的两种角色放到了 P/D 两个实例里看：
+
+- 在 **Prefill 实例** 中，scheduler connector 通常会告诉 worker connector：“这个请求的 KV 需要保存或发送出去。”worker connector 会在 attention 层产生 KV 后，把 KV 从 paged KV buffer 取出并交给数据传输层。
+- 在 **Decode 实例** 中，scheduler connector 通常会告诉 worker connector：“这个请求有外部 KV 可用，需要加载回来。”worker connector 会把外部 KV 注入本地 paged KV buffer，让 decode worker 可以跳过重复 prefill。
+
+`connector_metadata` 是连接 scheduler 和 worker 的桥。scheduler 侧负责生成计划，worker 侧负责执行计划。worker 不需要自己判断“我是 P 还是 D”，它只看 metadata：本轮要 store 就保存 KV，本轮要 load 就加载 KV。
+
+更准确的心智模型是：
+
+- **普通 vLLM 架构层**：每个 vLLM 实例都有 scheduler 和 worker。
+- **PD 分离部署层**：有 Prefill 实例和 Decode 实例，它们都是普通 vLLM 实例。
+- **KV transfer 扩展层**：每个相关 scheduler / worker 旁边挂一个 connector；scheduler connector 生成元数据，worker connector 读写 KV cache。
+
+所以不要把“Decode 实例里的 scheduler”理解成一种特殊调度器。它仍然是普通 vLLM scheduler，只是启用了 KV connector，并且 connector 会告诉它：某些 prompt token 的 KV cache 已经由外部 Prefill 实例算好了，可以作为 `num_external_computed_tokens` 计入调度，从而减少或跳过本地 prefill。
 
 ## Worker Connector 和 Attention 的关系
 
