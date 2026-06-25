@@ -48,7 +48,7 @@ function createBurstParticle(x: number, y: number): BurstParticle {
         alpha: 1,
         life: maxLife,
         maxLife,
-        hue: randomBetween(176, 204),
+        hue: Math.random() > 0.5 ? randomBetween(206, 222) : randomBetween(320, 334),
     }
 }
 
@@ -102,7 +102,7 @@ export function ParticleBackground() {
                 if (particle.y > height + 20) particle.y = -20
 
                 context.beginPath()
-                context.fillStyle = `rgba(125, 211, 252, ${particle.alpha})`
+                context.fillStyle = `rgba(96, 165, 250, ${particle.alpha * 0.72})`
                 context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2)
                 context.fill()
             }
@@ -121,9 +121,9 @@ export function ParticleBackground() {
                         continue
                     }
 
-                    const alpha = (1 - distance / LINK_DISTANCE) * 0.12
+                    const alpha = (1 - distance / LINK_DISTANCE) * 0.09
                     context.beginPath()
-                    context.strokeStyle = `rgba(125, 211, 252, ${alpha})`
+                    context.strokeStyle = `rgba(236, 72, 153, ${alpha})`
                     context.lineWidth = 1
                     context.moveTo(a.x, a.y)
                     context.lineTo(b.x, b.y)
@@ -144,7 +144,7 @@ export function ParticleBackground() {
                 particle.life -= 1
 
                 context.beginPath()
-                context.fillStyle = `hsla(${particle.hue}, 90%, 68%, ${progress})`
+                context.fillStyle = `hsla(${particle.hue}, 86%, 62%, ${progress * 0.82})`
                 context.arc(particle.x, particle.y, particle.radius, 0, Math.PI * 2)
                 context.fill()
 

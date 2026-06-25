@@ -1,7 +1,7 @@
 .markdown-body {
     max-width: 820px;
     padding-top: 34px;
-    color: #dbe3ef;
+    color: var(--text-main);
     font-size: 1.04rem;
     line-height: 1.85;
 }
@@ -13,7 +13,7 @@
 .markdown-body h5,
 .markdown-body h6 {
     scroll-margin-top: 92px;
-    color: #f8fafc;
+    color: var(--text-main);
     line-height: 1.2;
     letter-spacing: 0;
 }
@@ -54,21 +54,21 @@
 }
 
 .markdown-body a {
-    color: #7dd3fc;
-    border-bottom: 1px solid rgba(125, 211, 252, 0.45);
+    color: var(--accent-blue);
+    border-bottom: 1px solid rgba(37, 99, 235, 0.3);
 }
 
 .markdown-body code {
     border-radius: 6px;
     padding: 2px 5px;
-    color: #fde68a;
-    background: rgba(2, 6, 23, 0.8);
+    color: #be185d;
+    background: rgba(252, 231, 243, 0.74);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     font-size: 0.92em;
 }
 
 .markdown-body .katex {
-    color: #f8fafc;
+    color: var(--text-main);
     font-size: 1.02em;
 }
 
@@ -92,7 +92,7 @@
     border: 1px solid rgba(86, 156, 214, 0.35);
     border-radius: 8px;
     background: #1e1e1e;
-    box-shadow: 0 18px 48px rgba(2, 6, 23, 0.28);
+    box-shadow: 0 18px 48px rgba(30, 64, 175, 0.14);
 }
 
 .code-block-header {
@@ -143,9 +143,9 @@
     width: 100%;
     overflow-x: auto;
     border-collapse: collapse;
-    border: 1px solid rgba(148, 163, 184, 0.32);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(15, 23, 42, 0.48);
+    background: rgba(255, 255, 255, 0.72);
 }
 
 .markdown-body table {
@@ -157,42 +157,42 @@
 }
 
 .markdown-body thead {
-    background: rgba(45, 212, 191, 0.1);
+    background: rgba(219, 234, 254, 0.82);
 }
 
 .markdown-body th,
 .markdown-body td {
     min-width: 160px;
     padding: 10px 12px;
-    border: 1px solid rgba(148, 163, 184, 0.26);
+    border: 1px solid rgba(148, 163, 184, 0.28);
     vertical-align: top;
     text-align: left;
 }
 
 .markdown-body th {
-    color: #f8fafc;
+    color: var(--text-main);
     font-weight: 800;
 }
 
 .markdown-body td {
-    color: #dbe3ef;
+    color: var(--text-main);
 }
 
 .markdown-body tbody tr:nth-child(even) {
-    background: rgba(15, 23, 42, 0.56);
+    background: rgba(248, 250, 252, 0.88);
 }
 
 .markdown-body tbody tr:hover {
-    background: rgba(45, 212, 191, 0.07);
+    background: rgba(252, 231, 243, 0.58);
 }
 
 .mermaid-diagram {
     overflow-x: auto;
     margin: 0 0 18px;
     padding: 16px;
-    border: 1px solid rgba(148, 163, 184, 0.22);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(2, 6, 23, 0.72);
+    background: rgba(255, 255, 255, 0.78);
 }
 
 .mermaid-diagram svg {
@@ -220,6 +220,6 @@
 
 .markdown-body blockquote {
     padding-left: 16px;
-    border-left: 3px solid #2dd4bf;
-    color: #cbd5e1;
+    border-left: 3px solid var(--accent-pink);
+    color: var(--text-muted);
 }

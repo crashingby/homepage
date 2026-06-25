@@ -7,7 +7,7 @@
 
 .eyebrow {
     margin: 0 0 18px;
-    color: #38bdf8;
+    color: var(--accent-blue);
     font-size: 0.95rem;
     font-weight: 700;
     letter-spacing: 0;
@@ -25,7 +25,7 @@
 .hero-subtitle {
     max-width: 760px;
     margin: 28px 0 0;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: clamp(1.1rem, 2vw, 1.45rem);
     line-height: 1.7;
 }
@@ -49,13 +49,15 @@
 }
 
 .primary-button {
-    background: #38bdf8;
-    color: #020617;
+    background: linear-gradient(135deg, #60a5fa, #f472b6);
+    color: #ffffff;
+    box-shadow: 0 12px 28px rgba(96, 165, 250, 0.28);
 }
 
 .secondary-button {
-    border: 1px solid rgba(148, 163, 184, 0.45);
-    color: #e5e7eb;
+    border: 1px solid var(--border);
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.56);
 }
 
 .primary-button:hover,
@@ -64,13 +66,13 @@
 }
 
 .secondary-button:hover {
-    border-color: #38bdf8;
-    background: rgba(56, 189, 248, 0.08);
+    border-color: rgba(96, 165, 250, 0.58);
+    background: rgba(219, 234, 254, 0.72);
 }
 
 .section {
     padding: 56px 0;
-    border-top: 1px solid rgba(148, 163, 184, 0.2);
+    border-top: 1px solid var(--border);
 }
 
 .section h2 {
@@ -81,7 +83,7 @@
 
 .section p {
     max-width: 780px;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: 1.05rem;
     line-height: 1.8;
 }
@@ -98,9 +100,10 @@
     flex-direction: column;
     align-items: flex-start;
     padding: 24px;
-    border: 1px solid rgba(148, 163, 184, 0.22);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(15, 23, 42, 0.72);
+    background: var(--surface);
+    box-shadow: var(--shadow-soft);
     backdrop-filter: blur(16px);
     transition:
         transform 0.2s ease,
@@ -110,8 +113,8 @@
 
 .project-card:hover {
     transform: translateY(-4px);
-    border-color: rgba(56, 189, 248, 0.6);
-    background: rgba(15, 23, 42, 0.92);
+    border-color: rgba(96, 165, 250, 0.58);
+    background: var(--surface-strong);
 }
 
 .project-card h3 {
@@ -127,9 +130,9 @@
 .project-link {
     margin-top: auto;
     padding: 10px 14px;
-    border: 1px solid rgba(56, 189, 248, 0.45);
+    border: 1px solid rgba(96, 165, 250, 0.45);
     border-radius: 8px;
-    color: #7dd3fc;
+    color: var(--accent-blue);
     font-size: 0.92rem;
     font-weight: 700;
     transition:
@@ -141,9 +144,9 @@
 
 .project-link:hover {
     transform: translateY(-1px);
-    border-color: rgba(56, 189, 248, 0.85);
-    background: rgba(56, 189, 248, 0.12);
-    color: #e0f2fe;
+    border-color: rgba(236, 72, 153, 0.52);
+    background: rgba(252, 231, 243, 0.72);
+    color: #be185d;
 }
 
 @media (max-width: 720px) {

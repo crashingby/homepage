@@ -237,7 +237,17 @@ function MermaidDiagram({ chart }: { chart: string }) {
                 mermaid.initialize({
                     startOnLoad: false,
                     securityLevel: 'strict',
-                    theme: 'dark',
+                    theme: 'base',
+                    themeVariables: {
+                        background: '#ffffff',
+                        primaryColor: '#dbeafe',
+                        primaryTextColor: '#0f172a',
+                        primaryBorderColor: '#60a5fa',
+                        lineColor: '#64748b',
+                        secondaryColor: '#fce7f3',
+                        tertiaryColor: '#f8fafc',
+                        fontFamily: 'Inter, ui-sans-serif, system-ui, sans-serif',
+                    },
                 })
 
                 const result = await mermaid.render(id, chart)

@@ -5,7 +5,7 @@
 .page h1 {
     margin: 0;
     max-width: 880px;
-    color: #f8fafc;
+    color: var(--text-main);
     font-size: clamp(2.6rem, 7vw, 5.8rem);
     line-height: 1;
     letter-spacing: 0;
@@ -14,7 +14,7 @@
 .page-intro {
     max-width: 720px;
     margin: 22px 0 0;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: 1.15rem;
     line-height: 1.75;
 }
@@ -31,26 +31,26 @@
     align-items: center;
     gap: 8px;
     padding: 10px 12px;
-    border: 1px solid rgba(148, 163, 184, 0.26);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    color: #dbeafe;
-    background: rgba(15, 23, 42, 0.62);
+    color: var(--text-main);
+    background: rgba(255, 255, 255, 0.66);
     font-weight: 800;
 }
 
 .topic-nav a:hover,
 .topic-nav a.active {
-    border-color: rgba(45, 212, 191, 0.62);
-    color: #f8fafc;
-    background: rgba(45, 212, 191, 0.12);
+    border-color: rgba(96, 165, 250, 0.58);
+    color: var(--accent-blue);
+    background: linear-gradient(90deg, rgba(219, 234, 254, 0.86), rgba(252, 231, 243, 0.62));
 }
 
 .topic-nav span {
     min-width: 22px;
     padding: 2px 6px;
     border-radius: 8px;
-    color: #0b1020;
-    background: #99f6e4;
+    color: #1d4ed8;
+    background: var(--accent-blue-soft);
     font-size: 0.78rem;
     line-height: 1.35;
     text-align: center;
@@ -64,9 +64,10 @@
 
 .post-card {
     padding: 24px;
-    border: 1px solid rgba(148, 163, 184, 0.22);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(15, 23, 42, 0.72);
+    background: var(--surface);
+    box-shadow: var(--shadow-soft);
     transition:
         transform 0.2s ease,
         border-color 0.2s ease,
@@ -75,13 +76,13 @@
 
 .post-card:hover {
     transform: translateY(-3px);
-    border-color: rgba(45, 212, 191, 0.58);
-    background: rgba(15, 23, 42, 0.94);
+    border-color: rgba(96, 165, 250, 0.58);
+    background: var(--surface-strong);
 }
 
 .post-card h2 {
     margin: 12px 0 10px;
-    color: #f8fafc;
+    color: var(--text-main);
     font-size: clamp(1.35rem, 3vw, 2rem);
     line-height: 1.2;
     letter-spacing: 0;
@@ -90,7 +91,7 @@
 .post-card p {
     max-width: 760px;
     margin: 0;
-    color: #cbd5e1;
+    color: var(--text-muted);
     line-height: 1.75;
 }
 
@@ -98,13 +99,13 @@
     display: flex;
     gap: 12px;
     flex-wrap: wrap;
-    color: #94a3b8;
+    color: var(--text-soft);
     font-size: 0.92rem;
     font-weight: 700;
 }
 
 .post-meta a {
-    color: #99f6e4;
+    color: var(--accent-blue);
 }
 
 .tag-list {
@@ -116,10 +117,10 @@
 
 .tag-list span {
     padding: 5px 8px;
-    border: 1px solid rgba(45, 212, 191, 0.35);
+    border: 1px solid rgba(236, 72, 153, 0.24);
     border-radius: 8px;
-    color: #99f6e4;
-    background: rgba(45, 212, 191, 0.08);
+    color: #be185d;
+    background: rgba(252, 231, 243, 0.68);
     font-size: 0.86rem;
     font-weight: 700;
 }
@@ -127,14 +128,14 @@
 .back-link {
     display: inline-flex;
     margin-bottom: 32px;
-    color: #99f6e4;
+    color: var(--accent-blue);
     font-weight: 800;
 }
 
 .post-header {
     max-width: 880px;
     padding-bottom: 32px;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    border-bottom: 1px solid var(--border);
 }
 
 .post-header h1 {
@@ -143,7 +144,7 @@
 
 .post-header p {
     margin: 22px 0 0;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: 1.15rem;
     line-height: 1.75;
 }
@@ -162,9 +163,11 @@
     overflow-y: auto;
     margin-top: 34px;
     padding: 16px;
-    border: 1px solid rgba(148, 163, 184, 0.22);
+    border: 1px solid var(--border);
     border-radius: 8px;
-    background: rgba(15, 23, 42, 0.62);
+    background: rgba(255, 255, 255, 0.7);
+    box-shadow: 0 14px 36px rgba(59, 130, 246, 0.1);
+    backdrop-filter: blur(16px);
 }
 
 .post-toc::-webkit-scrollbar {
@@ -172,21 +175,21 @@
 }
 
 .post-toc::-webkit-scrollbar-track {
-    background: rgba(15, 23, 42, 0.48);
+    background: rgba(219, 234, 254, 0.45);
 }
 
 .post-toc::-webkit-scrollbar-thumb {
     border-radius: 8px;
-    background: rgba(148, 163, 184, 0.35);
+    background: rgba(96, 165, 250, 0.34);
 }
 
 .post-toc::-webkit-scrollbar-thumb:hover {
-    background: rgba(45, 212, 191, 0.45);
+    background: rgba(236, 72, 153, 0.38);
 }
 
 .post-toc p {
     margin: 0 0 12px;
-    color: #f8fafc;
+    color: var(--text-main);
     font-size: 0.92rem;
     font-weight: 800;
 }
@@ -200,18 +203,18 @@
     display: block;
     padding: 7px 8px;
     border-radius: 6px;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: 0.88rem;
     line-height: 1.45;
 }
 
 .post-toc a:hover {
-    color: #f8fafc;
-    background: rgba(45, 212, 191, 0.1);
+    color: var(--accent-blue);
+    background: rgba(219, 234, 254, 0.68);
 }
 
 .post-toc .toc-level-1 {
-    color: #f8fafc;
+    color: var(--text-main);
     font-weight: 800;
 }
 
@@ -221,12 +224,12 @@
 
 .post-toc .toc-level-3 {
     padding-left: 26px;
-    color: #94a3b8;
+    color: var(--text-soft);
 }
 
 .post-toc .toc-level-4 {
     padding-left: 38px;
-    color: #7f8ea3;
+    color: #7c8aa0;
     font-size: 0.82rem;
 }
 

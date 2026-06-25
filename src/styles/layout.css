@@ -2,8 +2,8 @@
     position: sticky;
     top: 0;
     z-index: 20;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.18);
-    background: rgba(11, 16, 32, 0.82);
+    border-bottom: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.78);
     backdrop-filter: blur(18px);
 }
 
@@ -18,7 +18,7 @@
 }
 
 .site-mark {
-    color: #f8fafc;
+    color: var(--text-main);
     font-weight: 800;
 }
 
@@ -31,15 +31,16 @@
 .nav-links a {
     padding: 8px 10px;
     border-radius: 8px;
-    color: #cbd5e1;
+    color: var(--text-muted);
     font-size: 0.94rem;
     font-weight: 700;
 }
 
 .nav-links a:hover,
 .nav-links a.active {
-    color: #f8fafc;
-    background: rgba(45, 212, 191, 0.12);
+    color: var(--accent-blue);
+    background:
+        linear-gradient(90deg, rgba(219, 234, 254, 0.92), rgba(252, 231, 243, 0.72));
 }
 
 .app {
