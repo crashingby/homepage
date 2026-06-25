@@ -50,6 +50,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: '软件构造复习',
         description: '有关软件构造的知识笔记',
     },
+    'Paper-Reading': {
+        label: '论文阅读笔记',
+        description: '简单总结读过的论文',
+    },
 }
 
 const fallbackTopic: BlogTopic = {
