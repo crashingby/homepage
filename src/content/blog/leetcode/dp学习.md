@@ -2739,3 +2739,281 @@ public:
 这道题的所谓“隐藏 DP 属性”，就是多出来的那一个“异或和限制”。
 
 **当题目多了一个对“历史累积状态”的限制（比如异或和、数字总和、奇偶性），且这个状态的取值范围很小时，直接在 DP 数组里加一个维度去硬生生记录它！**
+
+## [3603. 交替方向的最小路径代价 II - 力扣（LeetCode）](https://leetcode.cn/problems/minimum-cost-path-with-alternating-directions-ii/description/)
+
+给你一个 $m \times n$ 的网格。进入单元格 `(i, j)` 的成本为：
+
+$$
+(i + 1) \times (j + 1)
+$$
+
+另外，`waitCost[i][j]` 表示在单元格 `(i, j)` 原地等待 1 秒的成本。
+
+路径从第 1 步进入 `(0, 0)` 开始，并支付 `(0, 0)` 的进入成本。之后每一步遵循交替规则：
+
+- **奇数秒**：必须向右或向下移动到相邻单元格，并支付目标单元格的进入成本。
+- **偶数秒**：必须在当前单元格等待 1 秒，并支付当前单元格的 `waitCost`。
+
+返回到达 `(m - 1, n - 1)` 所需的最小总成本。
+
+### 题目直觉
+
+这道题看起来有“奇偶秒”的限制，好像需要把时间奇偶性放进状态里。但仔细看移动规则后，会发现一个关键点：
+
+- 从 `(0, 0)` 到任意格子 `(i, j)`，无论路径怎么走，移动次数都一定是 `i + j`。
+- 每次移动后，如果还没有到终点，下一秒一定要在当前格子等待。
+- 因此，**每个中间格子都会支付一次等待成本，起点和终点不应该额外等待**。
+
+所以它其实可以转化成一个网格最短路径 DP：
+
+- 每进入一个格子，都支付进入成本。
+- 每经过一个非起点、非终点的中间格子，还要支付一次等待成本。
+- 只能从上方或左方转移过来。
+
+### 递归切入（探索逻辑）
+
+还是先问“最后一步”：
+
+如果最终到达单元格 `(i, j)`，那么最后一步一定来自：
+
+- `(i - 1, j)`，也就是从上方往下走。
+- `(i, j - 1)`，也就是从左方往右走。
+
+进入 `(i, j)` 时，一定要支付当前格子的进入成本：
+
+$$
+enter(i, j) = (i + 1)(j + 1)
+$$
+
+如果我们先把 `waitCost[i][j]` 也统一加进当前格子的代价里，那么递归可以写成：
+
+$$
+dfs(i, j) =
+\min(dfs(i - 1, j), dfs(i, j - 1))
++ enter(i, j)
++ waitCost[i][j]
+$$
+
+这个递归式的含义是：
+
+- `dfs(i, j)` 表示到达 `(i, j)` 后，已经支付了当前格子的进入成本和等待成本。
+- 之所以先把等待成本也算进去，是为了让所有格子都走同一个递归公式。
+- 起点和终点不应该等待，所以后面用初始化和答案返回做抵消。
+
+用记忆化搜索写出来，大概是这样：
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <functional>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    long long minCost(int m, int n, vector<vector<int>>& waitCost) {
+        constexpr long long kInf = LLONG_MAX / 4;
+        vector memo(m, vector<long long>(n, -1));
+
+        function<long long(int, int)> dfs = [&](int i, int j) -> long long {
+            if (i < 0 || j < 0) {
+                return kInf;
+            }
+
+            // 起点只支付进入成本，不支付等待成本。
+            if (i == 0 && j == 0) {
+                return 1;
+            }
+
+            long long& res = memo[i][j];
+            if (res != -1) {
+                return res;
+            }
+
+            const long long enter_cost = 1LL * (i + 1) * (j + 1);
+            const long long best_prev = min(dfs(i - 1, j), dfs(i, j - 1));
+
+            // 先统一加上当前格子的等待成本。
+            // 如果当前格子是终点，最终答案再把这一次等待成本扣掉。
+            res = best_prev + enter_cost + waitCost[i][j];
+            return res;
+        };
+
+        return dfs(m - 1, n - 1) - waitCost[m - 1][n - 1];
+    }
+};
+```
+
+这段递归代码不是最优写法，但它很适合帮助我们确认状态转移：
+
+- 坐标 `(i, j)` 足够描述当前位置。
+- 最优代价只依赖上方和左方两个子问题。
+- 大量子问题会重复出现，所以可以自然翻译成递推 DP。
+
+### 状态定义
+
+把上面的递归翻译成递推时，继续使用偏移写法：
+
+- `f[i + 1][j + 1]` 表示走到单元格 `(i, j)` 后，已经支付了当前格子的进入成本和当前格子的等待成本时的最小代价。
+- 这个定义会把每个格子的 `waitCost[i][j]` 都先加进去。
+- 为了让起点和终点不支付等待成本，需要用初始化和最终答案做抵消。
+
+这里的“先统一加，再统一抵消”是这份代码最妙的地方。它让所有格子都可以用同一个转移方程，不需要在循环里特判起点和终点。
+
+### 状态转移
+
+到达 `(i, j)` 的最后一步只可能来自两个方向：
+
+- 从上方 `(i - 1, j)` 向下走来。
+- 从左方 `(i, j - 1)` 向右走来。
+
+因此：
+
+$$
+f[i + 1][j + 1] =
+\min(f[i][j + 1], f[i + 1][j])
++ waitCost[i][j]
++ (i + 1)(j + 1)
+$$
+
+其中：
+
+- `f[i][j + 1]` 是上方格子的最小代价。
+- `f[i + 1][j]` 是左方格子的最小代价。
+- `waitCost[i][j]` 是当前格子的等待成本。
+- `(i + 1) * (j + 1)` 是进入当前格子的成本。
+
+### 初始化为什么是负的 `waitCost[0][0]`
+
+按照状态定义，计算 `(0, 0)` 时会自动加上：
+
+- `waitCost[0][0]`
+- `(0 + 1) * (0 + 1)`
+
+但起点进入之后，题目并不要求在起点等待。为了抵消这一次多加的等待成本，可以设置：
+
+```cpp
+f[0][1] = -waitCost[0][0];
+```
+
+这样计算起点时：
+
+$$
+f[1][1] = -waitCost[0][0] + waitCost[0][0] + 1 = 1
+$$
+
+正好只保留起点的进入成本。
+
+### 为什么答案还要减去终点的等待成本
+
+按统一转移方程，终点 `(m - 1, n - 1)` 也会被加上 `waitCost[m - 1][n - 1]`。
+
+但到达终点后路径已经结束，不需要继续等待。因此最终返回：
+
+```cpp
+return f[m][n] - waitCost[m - 1][n - 1];
+```
+
+### 二维 DP 写法
+
+```cpp
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    long long minCost(int m, int n, vector<vector<int>>& waitCost) {
+        vector f(m + 1, vector<long long>(n + 1, LLONG_MAX));
+
+        // 起点不需要等待。这里先放一个负的等待成本，
+        // 后面计算 f[1][1] 时会被 waitCost[0][0] 抵消掉。
+        f[0][1] = -waitCost[0][0];
+
+        for (int i = 0; i < m; i++) {
+            for (int j = 0; j < n; j++) {
+                const long long enter_cost = 1LL * (i + 1) * (j + 1);
+
+                // 当前格子的最小代价 = 上方或左方的较小代价
+                // + 当前格子的等待成本
+                // + 当前格子的进入成本。
+                f[i + 1][j + 1] = min(f[i][j + 1], f[i + 1][j])
+                                + waitCost[i][j]
+                                + enter_cost;
+            }
+        }
+
+        // 终点到达后不需要等待，所以减去终点被统一加上的等待成本。
+        return f[m][n] - waitCost[m - 1][n - 1];
+    }
+};
+```
+
+### 维度降级（空间优化）
+
+观察依赖关系：
+
+- `f[i + 1][j + 1]` 依赖上方 `f[i][j + 1]`。
+- `f[i + 1][j + 1]` 依赖左方 `f[i + 1][j]`。
+
+因此只需要保留一行 `dp`：
+
+- `dp[j + 1]` 在更新前表示上方格子的状态。
+- `dp[j]` 表示当前行左方格子的状态。
+- 更新后的 `dp[j + 1]` 就变成当前格子的状态。
+
+这和最小路径和的滚动数组完全一致。
+
+### 空间优化代码
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    long long minCost(int m, int n, vector<vector<int>>& waitCost) {
+        constexpr long long kInf = LLONG_MAX / 4;
+        vector<long long> dp(n + 1, kInf);
+
+        // 虚拟入口。起点本身不需要等待，所以用负等待成本抵消统一转移里的加法。
+        dp[1] = -waitCost[0][0];
+
+        for (int i = 0; i < m; i++) {
+            for (int j = 0; j < n; j++) {
+                const long long enter_cost = 1LL * (i + 1) * (j + 1);
+
+                // dp[j + 1]：上一行同列，也就是从上方走来。
+                // dp[j]：当前行左列，也就是从左方走来。
+                const long long best_prev = min(dp[j + 1], dp[j]);
+
+                // 更新为当前格子的最小代价。
+                // 这里仍然统一加上当前格子的等待成本，终点会在返回前扣掉。
+                dp[j + 1] = best_prev + waitCost[i][j] + enter_cost;
+            }
+        }
+
+        // 终点不需要等待，扣掉统一转移中多算的一次 waitCost。
+        return dp[n] - waitCost[m - 1][n - 1];
+    }
+};
+```
+
+### 复杂度分析
+
+- 时间复杂度：$O(mn)$，每个格子只计算一次。
+- 空间复杂度：二维版本是 $O(mn)$，空间优化版本是 $O(n)$。
+
+### 状态“完备性”自检
+
+- **是否需要记录时间奇偶？** 不需要。因为只能向右或向下走，到达 `(i, j)` 的移动次数固定为 `i + j`，等待节奏也随之固定。
+- **是否有后效性？** 没有。到达当前格子的最小代价确定后，后续只关心当前位置，不关心之前怎么走。
+- **为什么可以压缩空间？** 当前格子只依赖上方和左方，不依赖更早的行列。
+
+这道题的核心不是“奇偶时间 DP”，而是看穿题目规则后，把它化简成 **最小路径和 + 中间节点等待成本**。
