@@ -205,6 +205,366 @@ else:
 
 也因此，被 `@triton.jit` 装饰后的对象不再是普通 Python function，而是一个带有编译、缓存、launch 能力的 `JITFunction` 对象。
 
+### 用实验观察 `@triton.jit` 返回了什么
+
+只看 `JITFunction`、`JITCallable`、`KernelInterface` 这些类名会比较抽象。更容易建立直觉的方式是：**先写一个最小 kernel，然后直接打印 `@triton.jit` 返回对象的成员变量和接口行为**。
+
+
+这个脚本默认不 launch GPU kernel，只观察 Python 侧对象。这样可以先把 `@triton.jit` 的对象模型看清楚，再去理解真实 launch。
+
+核心代码如下：
+
+```python
+import inspect
+from typing import Any
+
+import triton
+import triton.language as tl
+from triton.runtime.jit import JITCallable, JITFunction, KernelInterface
+
+
+def custom_repr(_kernel: Any) -> str:
+    # 传给 @triton.jit(repr=...)。
+    # 后面调用 kernel.repr(None) 时，应该能看到这个字符串。
+    return "custom_repr_vector_add"
+
+
+@triton.jit
+def add_kernel_plain(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # 注意：这个函数定义完成后，add_kernel_plain 已经不是普通 Python function。
+    # @triton.jit 会把它替换成 JITFunction 对象。
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+
+@triton.jit(
+    repr=custom_repr,
+    do_not_specialize=["n_elements"],
+    do_not_specialize_on_alignment=["x_ptr", "y_ptr", "out_ptr"],
+    debug=False,
+    noinline=False,
+)
+def add_kernel_with_options(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # kernel 内容和 add_kernel_plain 一样。
+    # 区别只在 @triton.jit(...) 的参数，方便观察这些参数存到了哪里。
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+
+def raw_kernel(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
+    # 不直接装饰它，而是在 main 里手动调用 triton.jit(raw_kernel)。
+    # 这样可以对比 @triton.jit、triton.jit(fn)、triton.jit(...)(fn) 三种入口。
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
+    x = tl.load(x_ptr + offsets, mask=mask, other=0.0)
+    y = tl.load(y_ptr + offsets, mask=mask, other=0.0)
+    tl.store(out_ptr + offsets, x + y, mask=mask)
+
+
+def inspect_jit_function(name: str, kernel: JITFunction) -> None:
+    # 这一组 isinstance 对应源码里的继承关系：
+    # class JITFunction(JITCallable, KernelInterface[T])
+    print(name)
+    print("type(object)", type(kernel))
+    print("isinstance(JITFunction)", isinstance(kernel, JITFunction))
+    print("isinstance(JITCallable)", isinstance(kernel, JITCallable))
+    print("isinstance(KernelInterface)", isinstance(kernel, KernelInterface))
+
+    # 这些成员来自 JITCallable.__init__：
+    # 它保留原始 Python function、函数签名、源码和源码位置。
+    print(".fn", kernel.fn)
+    print(".signature", kernel.signature)
+    print(".src[:100]", kernel.src[:100].replace("\n", "\\n"))
+    print(".raw_src[0]", kernel.raw_src[0].rstrip())
+
+    # 这些成员来自 JITFunction.__init__：
+    # 它保存 @triton.jit(...) 传入的配置，以及参数分析结果。
+    print(".do_not_specialize", kernel.do_not_specialize)
+    print(".do_not_specialize_on_alignment", kernel.do_not_specialize_on_alignment)
+    print(".arg_names", kernel.arg_names)
+    print(".constexprs", kernel.constexprs)
+
+    # params 里的每个元素都是 KernelParam。
+    # 这里能看到 tl.constexpr 和 do_not_specialize 最终落到了哪个参数上。
+    for param in kernel.params:
+        print(f"param[{param.num}] {param.name!r}")
+        print("  .annotation", param.annotation)
+        print("  .is_constexpr", param.is_constexpr)
+        print("  .do_not_specialize", param.do_not_specialize)
+        print("  .do_not_specialize_on_alignment", param.do_not_specialize_on_alignment)
+
+    # 直接调用 kernel(...) 会进入 JITFunction.__call__，源码里故意抛错。
+    try:
+        kernel(None, None, None, 0, BLOCK_SIZE=128)
+    except Exception as exc:
+        print("direct kernel(...) call", type(exc).__name__, exc)
+
+    # kernel[grid] 会进入 KernelInterface.__getitem__，返回一个记住 grid 的 launcher。
+    grid = lambda meta: (triton.cdiv(1024, meta["BLOCK_SIZE"]),)
+    launcher = kernel[grid]
+    print("kernel[grid]", launcher)
+    print("type(kernel[grid])", type(launcher))
+
+def main() -> None:
+    print("triton version:", triton.__version__)
+
+    print()
+    print("=" * 88)
+    print("Decorator entry points")
+    print("=" * 88)
+
+    direct = triton.jit(raw_kernel)
+    decorator = triton.jit(do_not_specialize=["n_elements"])
+    via_decorator = decorator(raw_kernel)
+
+    show("@triton.jit result type", type(add_kernel_plain))
+    show("triton.jit(fn) result type", type(direct))
+    show("triton.jit(...)", decorator)
+    show("type(triton.jit(...))", type(decorator))
+    show("triton.jit(...)(fn) result type", type(via_decorator))
+    show("same raw function wrapped twice?", direct.fn is via_decorator.fn)
+    show("different wrapper objects?", direct is not via_decorator)
+
+    inspect_jit_function("@triton.jit", add_kernel_plain)
+    inspect_jit_function("@triton.jit(...options...)", add_kernel_with_options)
+
+    print()
+    print("Run a real launch separately after understanding the object model.")
+    print("For example, extend this script with torch CUDA tensors and call kernel[grid](...).")
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+这段代码的重点不是向量加法本身，而是观察三件事：
+
+- **装饰器入口**：`@triton.jit`、`triton.jit(fn)`、`triton.jit(...)(fn)` 最后分别返回什么。
+- **对象成员**：`JITFunction` 保存了原始函数、源码、签名、JIT 配置和参数元数据。
+- **调用行为**：为什么不能直接 `kernel(...)`，而要写 `kernel[grid](...)`。
+
+#### 装饰器入口的输出
+
+运行脚本后，第一段输出是：
+
+```shell
+triton version: 3.7.0
+
+Decorator entry points
+@triton.jit result type                    <class 'triton.runtime.jit.JITFunction'>
+triton.jit(fn) result type                 <class 'triton.runtime.jit.JITFunction'>
+triton.jit(...)                            <function jit.<locals>.decorator at 0x...>
+type(triton.jit(...))                      <class 'function'>
+triton.jit(...)(fn) result type            <class 'triton.runtime.jit.JITFunction'>
+same raw function wrapped twice?           True
+different wrapper objects?                 True
+```
+
+这段输出对应前面的 overload 解释：
+
+| 输出现象 | 对应源码逻辑 | 结论 |
+|---|---|---|
+| `@triton.jit result type` 是 `JITFunction` | `fn is not None -> return decorator(fn)` | 无参数装饰器会直接包装函数。 |
+| `triton.jit(fn)` 也是 `JITFunction` | 显式把函数作为 `fn` 传入 | 和 `@triton.jit` 本质一样。 |
+| `triton.jit(...)` 是 `function` | `fn is None -> return decorator` | 带参数调用时，第一步只返回 decorator。 |
+| `triton.jit(...)(fn)` 是 `JITFunction` | 第二步调用 `decorator(fn)` | 函数真正传进去之后才产生 `JITFunction`。 |
+| `same raw function wrapped twice? True` | 两个 wrapper 的 `.fn` 指向同一个原始函数 | 原始 Python function 是同一个。 |
+| `different wrapper objects? True` | 每次包装都会 new 一个 `JITFunction` | wrapper 对象不是同一个。 |
+
+也就是说：**只要最终把函数交给 `decorator(fn)`，正常 runtime 下都会得到 `JITFunction`**。
+
+#### 返回对象的类型关系
+
+观察 `@triton.jit` 的返回对象：
+
+```shell
+@triton.jit
+object                                     JITFunction(__main__:add_kernel_plain)
+type(object)                               <class 'triton.runtime.jit.JITFunction'>
+isinstance(JITFunction)                    True
+isinstance(JITCallable)                    True
+isinstance(KernelInterface)                True
+```
+
+这正好对应源码里的继承关系：
+
+```python
+class JITFunction(JITCallable, KernelInterface[T]):
+    ...
+```
+
+所以可以这样理解：
+
+- **`JITCallable` 部分**：负责保存 Python 函数本身、源码、签名、hash 依赖。
+- **`KernelInterface` 部分**：负责提供 `kernel[grid](...)` 和 `warmup(...)` 这种启动接口。
+- **`JITFunction` 自己**：负责把这些能力组合起来，管理编译缓存、参数特化和 launch。
+
+#### 原始 Python 函数没有丢
+
+输出里还能看到：
+
+```shell
+.fn                                        <function add_kernel_plain at 0x...>
+.signature                                 <Signature (x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: 'tl.constexpr')>
+.src[:100]                                 'def add_kernel_plain(x_ptr, y_ptr, out_ptr, n_elements, BLOCK_SIZE: tl.constexpr):\n...'
+.raw_src[0]                                '@triton.jit'
+```
+
+这说明 `@triton.jit` 并不是把原始函数“编译完就扔掉”。它会把原始函数和源码保存在 `JITCallable` 这一层：
+
+| 成员 | 来自源码类 | 作用 |
+|---|---|---|
+| `.fn` | `JITCallable` | 原始 Python function。 |
+| `.signature` | `JITCallable` | 参数签名，用于绑定 runtime 参数。 |
+| `.src` | `JITCallable` | 去掉 decorator 后的函数源码，用于 AST parse 和编译。 |
+| `.raw_src` | `JITCallable` | 原始源码行，包含 decorator。 |
+
+这里 `.src` 和 `.raw_src` 的区别也很直观：
+
+- `.raw_src[0]` 还是 `@triton.jit`。
+- `.src` 从 `def add_kernel_plain(...)` 开始，因为 Triton 编译 kernel 需要的是函数体本身。
+
+#### JIT 选项会进入 `JITFunction`
+
+对带参数的版本：
+
+```python
+@triton.jit(
+    repr=custom_repr,
+    do_not_specialize=["n_elements"],
+    do_not_specialize_on_alignment=["x_ptr", "y_ptr", "out_ptr"],
+    debug=False,
+    noinline=False,
+)
+def add_kernel_with_options(...):
+    ...
+```
+
+输出是：
+
+```shell
+@triton.jit(...options...): JITFunction configuration fields
+.do_not_specialize                         ['n_elements']
+.do_not_specialize_on_alignment            ['x_ptr', 'y_ptr', 'out_ptr']
+._repr                                     <function custom_repr at 0x...>
+.debug                                     False
+.noinline                                  False
+.arg_names                                 ['x_ptr', 'y_ptr', 'out_ptr', 'n_elements', 'BLOCK_SIZE']
+.constexprs                                [4]
+```
+
+这说明 `@triton.jit(...)` 的选项会先存到 `JITFunction` 对象上：
+
+- `do_not_specialize` 记录原始用户配置。
+- `do_not_specialize_on_alignment` 记录哪些参数不按对齐信息特化。
+- `_repr` 保存自定义展示函数。
+- `debug` / `noinline` 保存默认调试和内联策略。
+- `arg_names` 是参数名列表。
+- `constexprs=[4]` 表示第 4 个位置的参数 `BLOCK_SIZE` 被识别为 `tl.constexpr`。
+
+注意这里的参数位置是从 0 开始计数：
+
+| 位置 | 参数 |
+|---:|---|
+| `0` | `x_ptr` |
+| `1` | `y_ptr` |
+| `2` | `out_ptr` |
+| `3` | `n_elements` |
+| `4` | `BLOCK_SIZE` |
+
+所以 `constexprs=[4]` 对应 `BLOCK_SIZE: tl.constexpr`。
+
+#### 每个参数会变成 `KernelParam`
+
+脚本继续打印 `kernel.params`，普通版本里 `BLOCK_SIZE` 的输出是：
+
+```shell
+param[4] 'BLOCK_SIZE'
+  .annotation                              'constexpr'
+  .is_constexpr                            True
+  .do_not_specialize                       False
+  .do_not_specialize_on_alignment          False
+```
+
+带参数版本里，`n_elements` 和指针参数会发生变化：
+
+```shell
+param[0] 'x_ptr'
+  .do_not_specialize_on_alignment          True
+
+param[1] 'y_ptr'
+  .do_not_specialize_on_alignment          True
+
+param[2] 'out_ptr'
+  .do_not_specialize_on_alignment          True
+
+param[3] 'n_elements'
+  .do_not_specialize                       True
+
+param[4] 'BLOCK_SIZE'
+  .annotation                              'constexpr'
+  .is_constexpr                            True
+```
+
+这就把 `JITFunction.__init__` 里的逻辑看清楚了：
+
+```python
+for i, param in enumerate(self.signature.parameters.values()):
+    dns = i in do_not_specialize or param.name in do_not_specialize
+    dns_oa = i in do_not_specialize_on_alignment or param.name in do_not_specialize_on_alignment
+    self.params.append(KernelParam(i, param, dns, dns_oa))
+```
+
+也就是说：
+
+- `do_not_specialize=["n_elements"]` 最终会落到 `param[3].do_not_specialize=True`。
+- `do_not_specialize_on_alignment=["x_ptr", "y_ptr", "out_ptr"]` 最终会落到前三个指针参数的 `do_not_specialize_on_alignment=True`。
+- `BLOCK_SIZE: tl.constexpr` 最终会落到 `param[4].annotation='constexpr'` 和 `param[4].is_constexpr=True`。
+
+这比只看参数表更容易记住：**`@triton.jit(...)` 的配置最终会被拆到每个 `KernelParam` 上，后续 binder 和 specialization 会使用这些参数元数据**。
+
+#### 为什么不能直接调用 `kernel(...)`
+
+最后一段输出：
+
+```shell
+direct kernel(...) call                    RuntimeError: Cannot call @triton.jit'd outside of the scope of a kernel
+kernel[grid]                               <function KernelInterface.__getitem__.<locals>.<lambda> at 0x...>
+type(kernel[grid])                         <class 'function'>
+callable(kernel[grid])                     True
+```
+
+这对应两个源码接口：
+
+```python
+class JITFunction(...):
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError("Cannot call @triton.jit'd outside of the scope of a kernel")
+
+
+class KernelInterface(Generic[T]):
+    def __getitem__(self, grid) -> T:
+        return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+```
+
+所以：
+
+- `kernel(...)` 走的是 `JITFunction.__call__`，在 host 侧直接报错。
+- `kernel[grid]` 走的是 `KernelInterface.__getitem__`，返回一个记住 `grid` 的 launcher。
+- 真正 launch 的写法是 `kernel[grid](...)`，它会进入 `JITFunction.run(grid=grid, warmup=False, ...)`。
+
+这也是 Triton kernel 启动语法和普通 Python 函数调用最本质的区别。
+
 **约束：**
 
 - 被 `@triton.jit` 装饰的函数运行在 GPU 语义下，不能随意调用普通 Python 库。
@@ -267,7 +627,7 @@ class KernelInterface(Generic[T]):
 | Method | Prototype | Meaning |
 |---|---|---|
 | `warmup` | `warmup(self, *args, grid, **kwargs)` | 走 `warmup=True` 的编译路径，用 mock tensor 包装 dtype 参数；用于提前编译，不做真实 launch。 |
-| `run` | `run(self, *args, grid, warmup, **kwargs)` | 抽象接口，基类里直接 `raise NotImplementedError`，由 `JITFunction.run` 实现。 |
+| `run` | `run(self, *args, grid, warmup, **kwargs)` | 抽象接口，基类里直接 `raise NotImplementedError`，**由 `JITFunction.run` 实现**。 |
 | `__getitem__` | `__getitem__(self, grid) -> T` | 支持 `kernel[grid](...)` 语法。它返回一个闭包，把 `grid` 记住，再调用 `run(grid=grid, warmup=False, ...)`。 |
 
 `add_kernel[grid](...)` 这套写法就是来自 `KernelInterface.__getitem__`。这里的 `[]` 不是数组索引，而是 Python 的 `__getitem__` 语法，被 Triton 用来绑定 launch grid。
