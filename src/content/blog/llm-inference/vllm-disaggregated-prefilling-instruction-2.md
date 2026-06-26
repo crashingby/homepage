@@ -158,7 +158,7 @@ Factory 的几个设计点值得注意：
 
 ## v1 基类的角色划分
 
-`KVConnectorBase_V1` 是最重要的接口文件。它把 connector 明确拆成 scheduler-side 和 worker-side 两组方法。
+`KVConnectorBase_V1` 是最重要的接口文件。它先把 connector 按**运行位置**拆成两组方法：scheduler-side 和 worker-side。
 
 ```mermaid
 classDiagram
@@ -205,18 +205,77 @@ classDiagram
     SupportsHMA <|.. KVConnectorBase_V1
 ```
 
-这张类图故意只放核心方法。读这个基类时，最重要的是分清方法运行位置。
+这张类图只表达一件事：**基类接口只知道自己运行在 scheduler 进程还是 worker 进程**。它并不直接把方法定义成 “Prefill 专用” 或 “Decode 专用”。
+
+### 先分清三层角色
+
+读这一节时，最容易混的是把三种角色混成一种。源码里其实是三层概念叠在一起：
+
+| 角色层级 | 源码位置 | 它回答的问题 | 典型取值 |
+| --- | --- | --- | --- |
+| **进程角色** | `KVConnectorRole` | 这个 connector 对象跑在 vLLM 的哪个进程里？ | `SCHEDULER` / `WORKER` |
+| **部署角色** | `KVTransferConfig.kv_role` | 这个 vLLM 实例主要生产 KV 还是消费 KV？ | `kv_producer` / `kv_consumer` / `kv_both` |
+| **请求角色** | `request.kv_transfer_params` 或 connector metadata | 当前这个请求、本轮调度到底要 load 还是 store？ | `do_remote_prefill` / `do_remote_decode` / `is_store` |
+
+所以一句话总结是：**scheduler / worker 是单个 vLLM 实例内部的进程分工，Prefill / Decode 是多个 vLLM 实例之间的部署分工，load / store 是某个请求在某一轮里的行为分工**。
+
+普通 vLLM 实例里，本来就有 scheduler 和 worker：scheduler 负责决定请求怎么排、block 怎么分；worker 负责真正跑模型 forward。PD 分离之后，不是把一个 scheduler 拆成 P scheduler 和 D scheduler，而是启动了多个 vLLM 实例：Prefill 实例有自己的 scheduler 和 worker，Decode 实例也有自己的 scheduler 和 worker。
+
+```mermaid
+flowchart TB
+    subgraph P["Prefill vLLM 实例"]
+        PS["Prefill scheduler 进程<br/>带 Scheduler Connector"]
+        PW["Prefill worker 进程<br/>带 Worker Connector"]
+        PS -->|"SchedulerOutput.kv_connector_metadata"| PW
+    end
+
+    subgraph D["Decode vLLM 实例"]
+        DS["Decode scheduler 进程<br/>带 Scheduler Connector"]
+        DW["Decode worker 进程<br/>带 Worker Connector"]
+        DS -->|"SchedulerOutput.kv_connector_metadata"| DW
+    end
+
+    PW -->|"保存 / 发送 KV"| X["外部 KV 后端或传输层"]
+    X -->|"读取 / 接收 KV"| DW
+    DW -.->|"worker metadata / 完成状态"| DS
+    PW -.->|"worker metadata / 完成状态"| PS
+```
+
+这张图比“两个 scheduler”更准确：**不是 vLLM 的 scheduler 天然分成 prefill scheduler 和 decode scheduler，而是每个 vLLM 实例都有一个普通 scheduler；这个实例被部署成 P 或 D 后，它的 connector 行为才呈现出 P/D 差异**。
+
+### 四个位置分别做什么
+
+把两套坐标叠起来，就得到四个位置。这个四象限比单纯记接口名更有用：
+
+| 位置 | 常见职责 | 对应基础介绍里的概念 |
+| --- | --- | --- |
+| **Prefill Scheduler Connector** | 决定哪些请求的 KV 需要保存、发送、暴露给 Decode；在 NIXL push 模式里，`request_finished()` 会记录完成的 block，后续交给 worker 推送。 | KV producer 的控制面 |
+| **Prefill Worker Connector** | 在 attention 层之后执行 `save_kv_layer()`，或者根据 metadata 把已经算好的 KV 发送出去。 | 生产 KV cache 的数据面 |
+| **Decode Scheduler Connector** | 调用 `get_num_new_matched_tokens()` 判断外部 KV 命中多少 token；分配本地 block 后用 `update_state_after_alloc()` 记录“这些 block 要接收 KV”。 | KV consumer 的控制面 |
+| **Decode Worker Connector** | forward 前 `start_load_kv()`，每层 attention 前 `wait_for_layer_load()`，把外部 KV 放进本地 paged KV buffer。 | 消费 KV cache 的数据面 |
+
+但这个表只是**单向 PD**的最常见情况，不是接口的硬规则。NIXL 源码里已经能看到更复杂的场景：
+
+- `kv_role='kv_producer'` 通常给 Prefill 实例用，`kv_role='kv_consumer'` 通常给 Decode 实例用；NIXL 里还提示 `kv_both` 已经不推荐作为普通配置。
+- `do_remote_prefill` 常见含义是 Decode 侧要使用 Prefill 侧算好的 prompt KV，所以 Decode scheduler 需要知道“外部能提供多少 token”。
+- `do_remote_decode` 在 bidirectional / multiturn 场景里会反过来让 Prefill 侧也可能从 Decode 侧拉取一部分 KV，所以某些 scheduler-side 接口在 Prefill 实例上也可能有意义。
+
+因此不要把接口理解成 “P 调哪些、D 调哪些” 的死表，而要理解成：**同一套接口在每个启用 connector 的 vLLM 实例里都会挂上去；具体是否做事，由 connector 实现、`kv_role`、请求参数和本轮 metadata 决定**。
 
 ### Scheduler 侧接口
 
-Scheduler 侧接口负责**决定本轮该加载什么、保存什么、什么时候释放 block**。
+Scheduler 侧接口负责**做控制决策**：外部 KV 命中了多少、分配好的 block 要怎么用、本轮要告诉 worker 做什么、请求结束时 block 能不能立刻释放。
 
-- `get_num_new_matched_tokens(request, num_computed_tokens)`：查询外部 KV cache 命中多少新 token。返回 `(tokens, load_kv_async)`；如果 tokens 是 `None`，表示 connector 还不能确定，需要 scheduler 之后再试。
-- `update_state_after_alloc(request, blocks, num_external_tokens)`：scheduler 分配 KV block 后通知 connector。connector 可以记录这些 block，下一次构造 metadata 时告诉 worker 去加载 KV。
-- `build_connector_meta(scheduler_output)`：根据本轮调度结果生成 `KVConnectorMetadata`，放进 `SchedulerOutput.kv_connector_metadata`。
-- `request_finished(request, block_ids)`：请求结束、block 即将释放前调用。connector 可以选择接管异步保存/发送，返回 `True` 表示 block 暂时不能立即释放。
+| 接口 | scheduler 侧语义 | Prefill 实例里常见行为 | Decode 实例里常见行为 |
+| --- | --- | --- | --- |
+| `get_num_new_matched_tokens(request, num_computed_tokens)` | 查询外部 KV cache 可以额外提供多少 token。vLLM 主调度循环只要发现有 connector，就会调用它。 | 单向 PD 里通常返回 `0` 或不做事；bidirectional / multiturn 中，如果 Prefill 也要消费远端 KV，就可能返回命中 token 数。 | 最典型的使用方：告诉 scheduler prompt 的多少 token 可以从外部 KV 读入，从而跳过本地 prefill。 |
+| `update_state_after_alloc(request, blocks, num_external_tokens)` | scheduler 分配本地 paged KV block 后，把 block 信息交给 connector。 | 如果本实例要接收远端 KV，也会记录这些 block；如果只是生产 KV，可能不需要处理这个请求。 | 常见路径是记录“外部 KV 要放进哪些本地 block”，下一步生成 metadata 给 worker。 |
+| `build_connector_meta(scheduler_output)` | 把本轮调度决策打包成 `KVConnectorMetadata`，塞进 `SchedulerOutput` 发给 worker。 | 常见是生成 store/send 相关 metadata，比如哪些请求完成后需要保存或推送。 | 常见是生成 load/recv 相关 metadata，比如哪些请求需要加载外部 KV。 |
+| `request_finished(request, block_ids)` | 请求结束且 block 将被释放前调用，connector 可以接管这些 block 的异步保存或发送。 | 非常常见：Prefill 算完 prompt 后，保存或发送这批 KV。返回 `True` 表示 block 暂时别释放。 | 在需要把 Decode 侧生成的 KV 暴露给后续请求、后续轮次或反向传输时也会使用。 |
+| `update_connector_output(kv_connector_output)` | 接收 worker 回传的完成状态或 worker metadata。 | 用来确认异步发送 / 保存完成，之后释放资源。 | 用来确认异步接收 / 加载完成，或者更新请求状态。 |
+| `take_events()` | 导出 connector 收集到的 KV cache 事件。 | 可用于观测生产侧事件。 | 可用于观测消费侧事件。 |
 
-Scheduler 中查询外部 KV 命中的逻辑大致是：
+`get_num_new_matched_tokens()` 是这里最容易误解的接口。它的调用点在 vLLM scheduler 的通用路径里：
 
 ```python
 # 如果启用了 KVConnector，就查询外部已经缓存了多少 token。
@@ -239,20 +298,27 @@ num_computed_tokens = (
 )
 ```
 
-这段代码对应基础介绍里的“Decode 可以跳过一部分 prefill”。这里的 `num_external_computed_tokens` 就是“外部 connector 能提供的 KV cache 覆盖了多少 token”。
+这段逻辑不关心当前实例叫 Prefill 还是 Decode。它只做一个抽象动作：**本地 prefix cache 已经命中了一部分 token，connector 再告诉我外部 KV cache 还能补多少 token**。
+
+在最普通的单向 PD 里，这个接口主要在 Decode 实例上真正发挥作用；Prefill 实例即使挂了 connector，也通常返回 `0`。但在 NIXL pull scheduler 里，`do_remote_decode` 加上远端 block 信息时，注释明确说 Decode node 可能已经有一部分 prefill request 的 KV blocks，于是 Prefill 侧也可以把这些 KV 当成外部命中来使用。这就是为什么基类不能把它写死成 D-only。
 
 ### Worker 侧接口
 
-Worker 侧接口负责**在模型 forward 前后真正搬 KV cache**。
+Worker 侧接口负责**真正搬数据**：在 forward 前加载 KV，在 attention 每层前等待 KV 到位，在 attention 每层后保存 KV，在 forward 后等待保存完成。
 
-- `bind_connector_metadata(metadata)`：model runner 在 forward 前绑定 scheduler 传来的 metadata。
-- `start_load_kv(forward_context)`：forward 前启动 KV 加载，可以同步，也可以异步。
-- `wait_for_layer_load(layer_name)`：attention 层执行前等待这一层的 KV 加载完成。
-- `save_kv_layer(layer_name, kv_layer, attn_metadata)`：attention 层执行后保存这一层的 KV。
-- `wait_for_save()`：forward 结束后等待所有保存任务完成，避免 paged KV buffer 被覆盖。
-- `get_finished(finished_req_ids)`：把异步发送/接收完成的请求 ID 回报给 scheduler。
+| 接口 | worker 侧语义 | Prefill 实例里常见行为 | Decode 实例里常见行为 |
+| --- | --- | --- | --- |
+| `bind_connector_metadata(metadata)` | model runner 在 forward 前绑定 scheduler 发来的 metadata。 | 接收 store/send 指令。 | 接收 load/recv 指令。 |
+| `clear_connector_metadata()` | forward 后清掉本轮 metadata，避免污染下一轮。 | 两边都需要。 | 两边都需要。 |
+| `register_kv_caches(kv_caches)` | 把本地 paged KV buffer 注册给 connector，便于后续传输或拷贝。 | 生产侧要从这些 buffer 里取 KV。 | 消费侧要把远端 KV 写进这些 buffer。 |
+| `start_load_kv(forward_context)` | forward 前启动加载，可以同步，也可以异步。 | 单向 PD 中通常不做；双向场景可能会加载远端 KV。 | 常见路径：从外部后端或远端 P worker 接收 KV。 |
+| `wait_for_layer_load(layer_name)` | 每层 attention 前等待这一层 KV 加载完成。 | 只有本轮确实 load 时才有意义。 | 常见路径：确保当前层 KV 已经写进 paged KV buffer。 |
+| `save_kv_layer(layer_name, kv_layer, attn_metadata)` | 每层 attention 后保存这一层新产生的 KV。 | 最典型的生产动作：Prefill 算完 prompt 后保存或发送 KV。 | 如果 Decode 侧也要把新生成 KV 暴露给后续请求或反向传输，也可能保存。 |
+| `wait_for_save()` | forward 后等待保存或发送完成，避免 block 被覆盖。 | 常见路径：等生产侧 KV 保存完成。 | 有保存动作时同样需要。 |
+| `get_finished(finished_req_ids)` | 回报异步发送 / 接收已经完成的请求。 | 回报 finished_sending。 | 回报 finished_recving。 |
+| `build_connector_worker_meta()` | worker 生成回传给 scheduler 的 metadata。 | 可回传发送状态、注册信息、传输结果。 | 可回传接收状态、注册信息、传输结果。 |
 
-Worker 侧调用点在 `vllm/v1/worker/gpu/kv_connector.py` 里：
+Worker 侧调用点在 `vllm/v1/worker/gpu/kv_connector.py` 里。它也不直接判断 P/D，而是按固定生命周期调用 connector：
 
 ```python
 def pre_forward(self, scheduler_output):
@@ -287,7 +353,30 @@ def post_forward(self, finished_req_ids, wait_for_save=True):
     return output
 ```
 
-这段代码对应基础介绍里的最后一张时序图：`start_load_kv()` 在 forward 前发生，`wait_for_save()` 在 forward 后发生，layer-wise 的 `wait_for_layer_load()` 和 `save_kv_layer()` 则由 attention 层内部调用。
+这段代码对应基础介绍里的时序图：`start_load_kv()` 在 forward 前发生，`wait_for_layer_load()` 和 `save_kv_layer()` 在 attention 层内部按 layer 发生，`wait_for_save()` 在 forward 后发生。
+
+### ExampleConnector 怎么体现这套划分
+
+`ExampleConnector` 是教学示例，它没有把 `kv_role` 做得很复杂，而是把本轮行为压缩成 `ReqMeta.is_store`：
+
+- `is_store=True`：worker 侧走保存路径。你可以把它理解成最常见的 Prefill producer 行为，也就是“我刚算出了 prompt KV，要把它存出去”。
+- `is_store=False`：worker 侧走加载路径。你可以把它理解成最常见的 Decode consumer 行为，也就是“我不想重算 prompt，要把外部 KV 读进本地 paged KV buffer”。
+
+这也是为什么看 `ExampleConnector` 时，不要期待它有非常清楚的 `if prefill` / `if decode` 分支。示例的重点是演示 v1 接口怎样串起来：
+
+```mermaid
+flowchart TB
+    S1["Scheduler: get_num_new_matched_tokens<br/>判断外部 KV 命中"] --> S2["Scheduler: update_state_after_alloc<br/>记录本地 block"]
+    S2 --> S3["Scheduler: build_connector_meta<br/>生成 ReqMeta"]
+    S3 --> W1["Worker: bind_connector_metadata<br/>绑定本轮指令"]
+    W1 --> W2{"ReqMeta.is_store"}
+    W2 -->|"true"| W3["save_kv_layer<br/>保存 KV 到外部"]
+    W2 -->|"false"| W4["start_load_kv<br/>从外部加载 KV"]
+    W3 --> W5["wait_for_save / get_finished"]
+    W4 --> W6["wait_for_layer_load / get_finished"]
+```
+
+用一句话把这一节收束起来：**`KVConnectorBase_V1` 的方法名描述的是 vLLM 内部生命周期，不描述 P/D 部署身份；P/D 身份是 connector 实现利用 `kv_role`、`kv_transfer_params` 和 metadata 在这些生命周期钩子里解释出来的**。
 
 ## Scheduler 到 Worker 的元数据通路
 
@@ -714,15 +803,18 @@ flowchart TB
 `KVConnectorBase_V1` 最重要的作用是定义“scheduler 侧该实现什么”和“worker 侧该实现什么”。这里必须保留源码里的分区标记，因为它直接告诉你：哪些方法是 worker/model runner/attention 调用的，哪些方法是 scheduler 调用的。
 
 ```python
-class SupportsHMA(ABC):  # 标记某个 connector 支持 Hybrid Memory Allocator，也就是 HMA。
+# 标记某个 connector 支持 Hybrid Memory Allocator，也就是 HMA。
+class SupportsHMA(ABC):
     """表示 connector 支持 HMA 的接口。
 
     HMA 场景下，一个请求可能跨多个 KV cache group。支持 HMA 的 connector
     需要在请求结束时一次性处理所有 group 的 block，而不是只处理单组 block。
     """
 
-    @abstractmethod  # 支持 HMA 的 connector 必须实现这个接口。
-    def request_finished_all_groups(self, request, block_ids):  # scheduler 侧：请求结束时拿到所有 KV cache group 的 block ids。
+    # 支持 HMA 的 connector 必须实现这个接口。
+    @abstractmethod
+    # scheduler 侧：请求结束时拿到所有 KV cache group 的 block ids。
+    def request_finished_all_groups(self, request, block_ids):
         """请求结束且所有 KV cache group 的 block 即将释放前调用。
 
         Args:
@@ -734,70 +826,91 @@ class SupportsHMA(ABC):  # 标记某个 connector 支持 Hybrid Memory Allocator
             - `defer_free=True` 表示 connector 接管异步保存/发送，block 暂时不能释放。
             - `kv_transfer_params` 会随请求输出返回，可被后续请求或 proxy 使用。
         """
-        raise NotImplementedError  # 这里只定义协议，不给默认实现。
+        # 这里只定义协议，不给默认实现。
+        raise NotImplementedError
 
 
-def supports_hma(connector: Any) -> bool:  # 工具函数：判断 connector 类或实例是否支持 HMA。
-    if isinstance(connector, type):  # 如果传进来的是类。
-        return issubclass(connector, SupportsHMA)  # 判断类是否继承 SupportsHMA。
-    else:  # 如果传进来的是实例。
-        return isinstance(connector, SupportsHMA)  # 判断实例是否实现 SupportsHMA。
+# 工具函数：判断 connector 类或实例是否支持 HMA。
+def supports_hma(connector: Any) -> bool:
+    # 如果传进来的是类。
+    if isinstance(connector, type):
+        # 判断类是否继承 SupportsHMA。
+        return issubclass(connector, SupportsHMA)
+    # 如果传进来的是实例。
+    else:
+        # 判断实例是否实现 SupportsHMA。
+        return isinstance(connector, SupportsHMA)
 
 
-class KVConnectorRole(enum.Enum):  # 定义 connector 运行在哪一种 vLLM 内部角色里。
-    SCHEDULER = 0  # scheduler 进程里的 connector，负责调度和生成 metadata。
-    WORKER = 1  # worker 进程里的 connector，负责模型执行时真正 load/save KV。
+# 定义 connector 运行在哪一种 vLLM 内部角色里。
+class KVConnectorRole(enum.Enum):
+    # scheduler 进程里的 connector，负责调度和生成 metadata。
+    SCHEDULER = 0
+    # worker 进程里的 connector，负责模型执行时真正 load/save KV。
+    WORKER = 1
 
 
-class KVConnectorHandshakeMetadata(ABC):  # P/D worker 之间带外握手用的 metadata 基类。
+# P/D worker 之间带外握手用的 metadata 基类。
+class KVConnectorHandshakeMetadata(ABC):
     """P/D worker 之间的带外握手 metadata。
 
     例如 NIXL 这类 connector 可能需要交换地址、rank、内存注册信息等。
     这个对象必须可序列化，因为它会跨进程或跨节点传递。
     """
-    pass  # 基类不规定字段，具体 connector 自己定义。
+    # 基类不规定字段，具体 connector 自己定义。
+    pass
 
 
-class KVConnectorMetadata(ABC):  # Scheduler Connector 传给 Worker Connector 的 metadata 基类。
+# Scheduler Connector 传给 Worker Connector 的 metadata 基类。
+class KVConnectorMetadata(ABC):
     """Scheduler -> Worker 的 connector metadata。
 
     Scheduler connector 会在 `build_connector_meta()` 中构造它，
     Worker connector 会在 forward 前通过 `bind_connector_metadata()` 读取它。
     """
-    pass  # 例如 ExampleConnector 会定义 ExampleConnectorMetadata(requests=...)。
+    # 例如 ExampleConnector 会定义 ExampleConnectorMetadata(requests=...)。
+    pass
 
 
-class KVConnectorWorkerMetadata(ABC):  # Worker Connector 回传给 Scheduler Connector 的 metadata 基类。
+# Worker Connector 回传给 Scheduler Connector 的 metadata 基类。
+class KVConnectorWorkerMetadata(ABC):
     """Worker -> Scheduler 的 connector metadata。
 
     每个 worker 都可能生成自己的 metadata。单个 engine step 结束后，
     这些 metadata 会先聚合，再交给 scheduler connector。
     """
 
-    @abstractmethod  # 要求子类实现聚合逻辑。
+    # 要求子类实现聚合逻辑。
+    @abstractmethod
     def aggregate(self, other: "KVConnectorWorkerMetadata") -> "KVConnectorWorkerMetadata":
         """把另一个 worker metadata 合并到当前 metadata。"""
-        pass  # scheduler 收到多个 worker metadata 前，需要先把它们合并。
+        # scheduler 收到多个 worker metadata 前，需要先把它们合并。
+        pass
 
 
-class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
+# 所有 v1 KV connector 的抽象基类。
+class KVConnectorBase_V1(ABC):
     """v1 KV connector 基类。
 
     这个类本身不实现具体传输，只规定 scheduler 侧和 worker 侧的接口。
     具体 connector 需要实现抽象方法，并按需要 override 默认空实现。
     """
 
-    @property  # 这是一个属性，不是普通函数调用。
-    def prefer_cross_layer_blocks(self) -> bool:  # 是否偏好“跨层 KV block”布局。
+    # 这是一个属性，不是普通函数调用。
+    @property
+    # 是否偏好“跨层 KV block”布局。
+    def prefer_cross_layer_blocks(self) -> bool:
         """是否偏好把所有层 KV 放进跨层 block。
 
         Returns:
             默认 `False`。某些 connector 如果希望按跨层连续内存传输来提升效率，
             可以 override 成 `True`。
         """
-        return False  # 默认不要求跨层 block；生产级 connector 可按需要 override。
+        # 默认不要求跨层 block；生产级 connector 可按需要 override。
+        return False
 
-    def __init__(self, vllm_config, role, kv_cache_config):  # 所有 connector 初始化入口。
+    # 所有 connector 初始化入口。
+    def __init__(self, vllm_config, role, kv_cache_config):
         """初始化 connector 基类状态。
 
         Args:
@@ -805,19 +918,29 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
             role: 当前 connector 是 scheduler 侧还是 worker 侧。
             kv_cache_config: KV cache 布局和分组配置。
         """
-        self._connector_metadata = None  # worker 侧当前 step 绑定的 Scheduler -> Worker metadata。
-        self._vllm_config = vllm_config  # 保存完整 vLLM 配置，子类可能要读并行、缓存等配置。
-        if vllm_config.kv_transfer_config is not None:  # KV transfer 配置必须存在。
-            self._kv_transfer_config = vllm_config.kv_transfer_config  # 保存 connector 专用配置。
-        else:  # 没有 KV transfer 配置却创建 connector，属于使用错误。
+        # worker 侧当前 step 绑定的 Scheduler -> Worker metadata。
+        self._connector_metadata = None
+        # 保存完整 vLLM 配置，子类可能要读并行、缓存等配置。
+        self._vllm_config = vllm_config
+        # KV transfer 配置必须存在。
+        if vllm_config.kv_transfer_config is not None:
+            # 保存 connector 专用配置。
+            self._kv_transfer_config = vllm_config.kv_transfer_config
+        # 没有 KV transfer 配置却创建 connector，属于使用错误。
+        else:
             raise ValueError("kv_transfer_config must be set for KVConnectorBase_V1")
-        self._kv_cache_config = kv_cache_config  # 保存 KV cache 布局、group 等信息。
-        self._role = role  # 记录当前 connector 是 scheduler 角色还是 worker 角色。
+        # 保存 KV cache 布局、group 等信息。
+        self._kv_cache_config = kv_cache_config
+        # 记录当前 connector 是 scheduler 角色还是 worker 角色。
+        self._role = role
 
-    @property  # 让外部可以只读访问 role。
-    def role(self) -> KVConnectorRole:  # 返回当前 connector 所在角色。
+    # 让外部可以只读访问 role。
+    @property
+    # 返回当前 connector 所在角色。
+    def role(self) -> KVConnectorRole:
         """返回当前 connector 的运行角色。"""
-        return self._role  # SCHEDULER 或 WORKER。
+        # SCHEDULER 或 WORKER。
+        return self._role
 
     # ==============================
     # Worker-side methods
@@ -831,14 +954,16 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         这个函数通常由 model runner 在每次模型执行前调用。
         metadata 会在本轮 forward 中指导 worker connector 加载或保存 KV cache。
         """
-        self._connector_metadata = connector_metadata  # worker forward 前绑定 scheduler 生成的 metadata。
+        # worker forward 前绑定 scheduler 生成的 metadata。
+        self._connector_metadata = connector_metadata
 
     def clear_connector_metadata(self) -> None:
         """清理当前绑定的 connector metadata。
 
         这个函数通常由 model runner 在每次模型执行后调用，避免 metadata 泄漏到下一轮。
         """
-        self._connector_metadata = None  # worker forward 后清理 metadata，避免污染下一步。
+        # worker forward 后清理 metadata，避免污染下一步。
+        self._connector_metadata = None
 
     def _get_connector_metadata(self) -> KVConnectorMetadata:
         """获取当前已绑定的 connector metadata。
@@ -846,12 +971,15 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         这个函数只应该在 connector 内部调用。调用前必须已经执行过
         `bind_connector_metadata()`。
         """
-        assert self._connector_metadata is not None  # 只有绑定 metadata 后才能读取。
-        return self._connector_metadata  # 子类内部通过它拿到本轮 load/store 计划。
+        # 只有绑定 metadata 后才能读取。
+        assert self._connector_metadata is not None
+        # 子类内部通过它拿到本轮 load/store 计划。
+        return self._connector_metadata
 
     def has_connector_metadata(self) -> bool:
         """判断当前 worker connector 是否已经绑定 metadata。"""
-        return self._connector_metadata is not None  # True 表示当前 forward 有 connector metadata。
+        # True 表示当前 forward 有 connector metadata。
+        return self._connector_metadata is not None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """注册每层 KV cache tensor。
@@ -862,7 +990,8 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         Note:
             NIXL 这类 connector 可能需要提前注册 GPU 内存，ExampleConnector 不需要。
         """
-        return  # 默认空实现。
+        # 默认空实现。
+        return
 
     def register_cross_layers_kv_cache(self, kv_cache, attn_backend):
         """注册跨层 KV cache tensor。
@@ -870,55 +999,66 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         某些模型或 connector 会使用一个大 tensor 存所有层 KV。只有当
         `prefer_cross_layer_blocks=True` 且模型层布局统一时才会走这个接口。
         """
-        return  # 默认不处理。
+        # 默认不处理。
+        return
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """设置 host/device KV 拷贝操作。
 
         host buffer 传输时可能需要平台相关的 h2d / d2h copy op。
         """
-        return  # 默认不处理。
+        # 默认不处理。
+        return
 
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         """处理抢占或 block 覆盖前的 connector 逻辑。
 
         异步保存类 connector 可能要在 block 被覆盖前先把旧 KV 保存出去。
         """
-        return  # 默认不处理。
+        # 默认不处理。
+        return
 
-    @abstractmethod  # 子类必须实现 worker 侧加载入口。
+    # 子类必须实现 worker 侧加载入口。
+    @abstractmethod
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         """开始把 connector 中的 KV cache 加载到 vLLM paged KV buffer。
 
         调用位置通常在 forward 前。connector 可以同步完成加载，也可以只启动异步加载，
         再由 `wait_for_layer_load()` 在每层 attention 前等待。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
-    @abstractmethod  # 子类必须实现 layer 级等待加载完成接口。
+    # 子类必须实现 layer 级等待加载完成接口。
+    @abstractmethod
     def wait_for_layer_load(self, layer_name: str) -> None:
         """等待指定层的 KV cache 已经加载到 paged KV buffer。
 
         调用位置通常在 attention layer 内部。这个接口支持 layer-by-layer pipeline。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
-    @abstractmethod  # 子类必须实现 layer 级保存接口。
+    # 子类必须实现 layer 级保存接口。
+    @abstractmethod
     def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
         """把当前层 KV cache 从 paged KV buffer 保存到 connector。
 
         调用位置通常在 attention layer 内部。connector 可以同步保存，也可以启动异步保存。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
-    @abstractmethod  # 子类必须实现保存完成等待接口。
+    # 子类必须实现保存完成等待接口。
+    @abstractmethod
     def wait_for_save(self):
         """等待所有 save 操作完成。
 
         调用位置通常在 forward 结束时。这样可以避免 paged KV buffer 被覆盖时，
         异步保存还没有完成。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
         """回报异步发送/保存和接收/加载完成的请求。
@@ -929,31 +1069,38 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         Returns:
             `(finished_sending, finished_recving)`，分别表示异步 send/save 和 recv/load 完成的请求。
         """
-        return None, None  # 默认没有异步任务。
+        # 默认没有异步任务。
+        return None, None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """返回加载失败的 block id 集合。"""
-        return set()  # 默认认为没有失败。
+        # 默认认为没有失败。
+        return set()
 
     def shutdown(self):
         """worker 退出时关闭 connector 并释放资源。"""
-        return None  # 默认无需清理。
+        # 默认无需清理。
+        return None
 
     def get_kv_connector_stats(self):
         """返回最近一个统计周期内的 connector 指标。"""
-        return None  # 默认没有指标。
+        # 默认没有指标。
+        return None
 
     def get_kv_connector_kv_cache_events(self):
         """返回最近收集到的 KV cache events。"""
-        return None  # 默认没有事件。
+        # 默认没有事件。
+        return None
 
     def get_handshake_metadata(self):
         """返回 P/D worker 带外握手 metadata。"""
-        return None  # 默认不需要握手。
+        # 默认不需要握手。
+        return None
 
     def build_connector_worker_meta(self):
         """构造 Worker -> Scheduler 的 metadata。"""
-        return None  # 默认 worker 没有额外信息要回传。
+        # 默认 worker 没有额外信息要回传。
+        return None
 
     # ==============================
     # Scheduler-side methods
@@ -966,9 +1113,11 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
 
         connector 如果需要追踪 block 引用计数、prefix cache block 状态，可以 override。
         """
-        return  # 默认不处理。
+        # 默认不处理。
+        return
 
-    @abstractmethod  # 子类必须实现 scheduler 侧“外部 KV 命中查询”。
+    # 子类必须实现 scheduler 侧“外部 KV 命中查询”。
+    @abstractmethod
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int):
         """查询外部 KV cache 能提供多少额外 token。
 
@@ -981,32 +1130,39 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
             - `num_external_tokens=None` 表示暂时无法确定，scheduler 应稍后重试。
             - `load_kv_async=True` 表示外部 KV 会异步加载。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
-    @abstractmethod  # 子类必须实现 scheduler 侧“分配 block 后更新状态”。
+    # 子类必须实现 scheduler 侧“分配 block 后更新状态”。
+    @abstractmethod
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
         """scheduler 分配 KV block 后通知 connector 更新状态。
 
         典型用途是：如果某个请求要从外部加载 KV，那么 connector 需要记录
         request、block ids、token 数等，供 `build_connector_meta()` 使用。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
-    @abstractmethod  # 子类必须实现 scheduler 侧“构造 metadata”。
+    # 子类必须实现 scheduler 侧“构造 metadata”。
+    @abstractmethod
     def build_connector_meta(self, scheduler_output: SchedulerOutput) -> KVConnectorMetadata:
         """根据本轮调度结果构造 Scheduler -> Worker metadata。
 
         注意：这个函数不应该修改 `scheduler_output` 的其他字段。
         """
-        pass  # 抽象方法，子类必须实现。
+        # 抽象方法，子类必须实现。
+        pass
 
     def on_new_request(self, request: "Request") -> None:
         """scheduler 接收到新请求时的 connector 钩子。"""
-        return  # 默认不做 bookkeeping。
+        # 默认不做 bookkeeping。
+        return
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """scheduler 根据 worker connector 输出更新自身状态。"""
-        return  # 默认不处理。
+        # 默认不处理。
+        return
 
     def request_finished(self, request: "Request", block_ids: list[int]):
         """请求结束且 block 即将释放前调用。
@@ -1015,22 +1171,27 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
             `(defer_free, kv_transfer_params)`。默认 `defer_free=False`，表示 connector
             不接管异步释放，scheduler 可以按正常流程释放 block。
         """
-        return False, None  # 默认不接管 block 释放，也不返回 kv_transfer_params。
+        # 默认不接管 block 释放，也不返回 kv_transfer_params。
+        return False, None
 
     def take_events(self):
         """取走 connector 收集到的新 KV cache events。"""
-        return ()  # 默认没有事件。
+        # 默认没有事件。
+        return ()
 
     def has_pending_push_work(self) -> bool:
         """是否还有 push 模式后台工作需要 engine 继续 step。"""
-        return False  # 默认没有 pending push work。
+        # 默认没有 pending push work。
+        return False
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config) -> str | None:
         """返回 connector 要求的 KV cache layout，例如 HND 或 NHD。"""
-        if cls is KVConnectorBase_V1:  # 抽象基类不能被直接查询布局要求。
+        # 抽象基类不能被直接查询布局要求。
+        if cls is KVConnectorBase_V1:
             raise TypeError("get_required_kvcache_layout should not be called on the abstract base class")
-        return None  # 默认不要求特殊 KV cache layout。
+        # 默认不要求特殊 KV cache layout。
+        return None
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
@@ -1039,31 +1200,39 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
         如果 connector 依赖 Python 逐层执行 `wait_for_layer_load()` 或 `save_kv_layer()`，
         就不能让整段 forward 被 CUDA graph 完整捕获，需要 piecewise 模式。
         """
-        return False  # 默认不需要 PIECEWISE CUDA graph。
+        # 默认不需要 PIECEWISE CUDA graph。
+        return False
 
     def get_finished_count(self) -> int | None:
         """返回 connector 期望聚合的完成计数。"""
-        return None  # 默认使用 world_size。
+        # 默认使用 world_size。
+        return None
 
     @classmethod
     def build_kv_connector_stats(cls, data=None):
         """根据 connector 自定义数据构造 stats 对象。"""
-        return None  # 默认没有自定义 stats。
+        # 默认没有自定义 stats。
+        return None
 
     def set_xfer_handshake_metadata(self, metadata):
         """设置 TP rank -> handshake metadata。"""
-        return None  # 默认不处理。
+        # 默认不处理。
+        return None
 
     def set_xfer_handshake_metadata_pp_aware(self, metadata):
         """设置 PP-aware 的 handshake metadata。"""
-        if any(pp_rank != 0 for pp_rank, _ in metadata):  # 默认实现只支持 pp_rank 为 0。
+        # 默认实现只支持 pp_rank 为 0。
+        if any(pp_rank != 0 for pp_rank, _ in metadata):
             raise ValueError(f"{type(self).__name__} received pp_rank > 0 handshake metadata but does not support PP-disaggregated KV transfer.")
-        self.set_xfer_handshake_metadata({tp_rank: meta for (_, tp_rank), meta in metadata.items()})  # 转成非 PP-aware 格式。
+        # 转成非 PP-aware 格式。
+        self.set_xfer_handshake_metadata({tp_rank: meta for (_, tp_rank), meta in metadata.items()})
 
     def reset_cache(self) -> bool | None:
         """重置 connector 内部缓存。"""
-        logger.debug("Connector cache reset requested, but %s does not implement reset_cache().", type(self).__name__)  # 记录 debug 日志。
-        return None  # 默认不支持 reset cache。
+        # 记录 debug 日志。
+        logger.debug("Connector cache reset requested, but %s does not implement reset_cache().", type(self).__name__)
+        # 默认不支持 reset cache。
+        return None
 ```
 
 这段骨架说明了一个核心事实：`KVConnectorBase_V1` 本身没有任何具体 KV 传输逻辑，它只是规定了 **scheduler 如何问、worker 如何做、两边如何通过 metadata 对接**。读这个文件时，先看分区标题：`Worker-side methods` 是模型执行期间调用的，`Scheduler-side methods` 是调度阶段调用的。
@@ -1073,63 +1242,103 @@ class KVConnectorBase_V1(ABC):  # 所有 v1 KV connector 的抽象基类。
 `ExampleConnector` 是最适合入门的实现，因为它把“外部 KV cache 后端”简化成了共享磁盘目录：Prefill 侧把 KV 写成 `.safetensors`，Decode 侧再按同样的 key 读回来。
 
 ```python
-@dataclass  # 自动生成 __init__ 等方法，适合保存请求级 metadata。
-class ReqMeta:  # 一个请求在 connector 里对应的一条 load/store 计划。
-    token_ids: torch.Tensor  # 参与缓存 key 计算的 token 序列，通常是 prompt token 的 block 对齐前缀。
-    slot_mapping: torch.Tensor  # token 在 paged KV buffer 中的 slot 位置，一般和 token_ids 等长。
-    is_store: bool  # True 表示保存 KV，False 表示加载 KV。
-    mm_hashes: list[str]  # 多模态输入的 hash，避免同 token 不同图片/音频发生 key 冲突。
+# 自动生成 __init__ 等方法，适合保存请求级 metadata。
+@dataclass
+# 一个请求在 connector 里对应的一条 load/store 计划。
+class ReqMeta:
+    # 参与缓存 key 计算的 token 序列，通常是 prompt token 的 block 对齐前缀。
+    token_ids: torch.Tensor
+    # token 在 paged KV buffer 中的 slot 位置，一般和 token_ids 等长。
+    slot_mapping: torch.Tensor
+    # True 表示保存 KV，False 表示加载 KV。
+    is_store: bool
+    # 多模态输入的 hash，避免同 token 不同图片/音频发生 key 冲突。
+    mm_hashes: list[str]
 
-    @staticmethod  # 不依赖已有 ReqMeta 实例，只是一个构造辅助函数。
+    # 不依赖已有 ReqMeta 实例，只是一个构造辅助函数。
+    @staticmethod
     def make_meta(token_ids, block_ids, block_size, is_store, mm_hashes) -> "ReqMeta":
-        valid_num_tokens = align_to_block_size(len(token_ids), block_size)  # token 数向下对齐到 block 边界。
-        token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]  # 只保留 block 对齐后的 token。
-        block_ids_tensor = torch.tensor(block_ids)  # 把 block id 列表转成 tensor，方便向量化计算。
-        num_blocks = block_ids_tensor.shape[0]  # 当前请求占用了多少个 KV block。
-        block_offsets = torch.arange(0, block_size)  # 一个 block 内部的 token offset：0 到 block_size-1。
-        slot_mapping = (  # 计算每个 token 在 paged KV buffer 中的全局 slot。
-            block_offsets.reshape((1, block_size))  # 形状变成 [1, block_size]，用于广播。
-            + block_ids_tensor.reshape((num_blocks, 1)) * block_size  # block_id * block_size 得到 block 起始 slot。
-        )  # 结果形状是 [num_blocks, block_size]。
-        slot_mapping = slot_mapping.flatten()[:valid_num_tokens]  # 展平成 token 级 slot，并裁掉多余位置。
-        return ReqMeta(  # 返回请求级 metadata。
-            token_ids=token_ids_tensor,  # 保存对齐后的 token ids。
-            slot_mapping=slot_mapping,  # 保存 token -> paged KV slot 的映射。
-            is_store=is_store,  # 保存本请求是 store 还是 load。
-            mm_hashes=mm_hashes,  # 保存多模态 hash。
+        # token 数向下对齐到 block 边界。
+        valid_num_tokens = align_to_block_size(len(token_ids), block_size)
+        # 只保留 block 对齐后的 token。
+        token_ids_tensor = torch.tensor(token_ids)[:valid_num_tokens]
+        # 把 block id 列表转成 tensor，方便向量化计算。
+        block_ids_tensor = torch.tensor(block_ids)
+        # 当前请求占用了多少个 KV block。
+        num_blocks = block_ids_tensor.shape[0]
+        # 一个 block 内部的 token offset：0 到 block_size-1。
+        block_offsets = torch.arange(0, block_size)
+        # 计算每个 token 在 paged KV buffer 中的全局 slot。
+        slot_mapping = (
+            # 形状变成 [1, block_size]，用于广播。
+            block_offsets.reshape((1, block_size))
+            # block_id * block_size 得到 block 起始 slot。
+            + block_ids_tensor.reshape((num_blocks, 1)) * block_size
+        # 结果形状是 [num_blocks, block_size]。
+        )
+        # 展平成 token 级 slot，并裁掉多余位置。
+        slot_mapping = slot_mapping.flatten()[:valid_num_tokens]
+        # 返回请求级 metadata。
+        return ReqMeta(
+            # 保存对齐后的 token ids。
+            token_ids=token_ids_tensor,
+            # 保存 token -> paged KV slot 的映射。
+            slot_mapping=slot_mapping,
+            # 保存本请求是 store 还是 load。
+            is_store=is_store,
+            # 保存多模态 hash。
+            mm_hashes=mm_hashes,
         )
 
 
-@dataclass  # scheduler -> worker 的 metadata 容器。
-class ExampleConnectorMetadata(KVConnectorMetadata):  # 继承 KVConnectorMetadata，说明它会塞进 SchedulerOutput。
-    requests: list[ReqMeta] = field(default_factory=list)  # 本轮所有需要 connector 处理的请求计划。
+# scheduler -> worker 的 metadata 容器。
+@dataclass
+# 继承 KVConnectorMetadata，说明它会塞进 SchedulerOutput。
+class ExampleConnectorMetadata(KVConnectorMetadata):
+    # 本轮所有需要 connector 处理的请求计划。
+    requests: list[ReqMeta] = field(default_factory=list)
 
     def add_request(self, token_ids, block_ids, block_size, is_store, mm_hashes) -> None:
-        self.requests.append(  # 往本轮 metadata 里追加一个请求计划。
-            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, mm_hashes)  # 把原始字段转成 ReqMeta。
+        # 往本轮 metadata 里追加一个请求计划。
+        self.requests.append(
+            # 把原始字段转成 ReqMeta。
+            ReqMeta.make_meta(token_ids, block_ids, block_size, is_store, mm_hashes)
         )
 
 
-class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorBase_V1 的一个具体实现。
-    def __init__(self, vllm_config, role, kv_cache_config):  # connector 初始化入口。
-        super().__init__(  # 先调用基类初始化，保存 vllm_config、kv_transfer_config、role 等。
-            vllm_config=vllm_config,  # 完整 vLLM 配置。
-            role=role,  # 当前实例是 scheduler connector 还是 worker connector。
-            kv_cache_config=kv_cache_config,  # KV cache 配置。
+# ExampleConnector 是 KVConnectorBase_V1 的一个具体实现。
+class ExampleConnector(KVConnectorBase_V1):
+    # connector 初始化入口。
+    def __init__(self, vllm_config, role, kv_cache_config):
+        # 先调用基类初始化，保存 vllm_config、kv_transfer_config、role 等。
+        super().__init__(
+            # 完整 vLLM 配置。
+            vllm_config=vllm_config,
+            # 当前实例是 scheduler connector 还是 worker connector。
+            role=role,
+            # KV cache 配置。
+            kv_cache_config=kv_cache_config,
         )
-        self._block_size = vllm_config.cache_config.block_size  # 记录 block_size，后面算 slot_mapping 要用。
-        self._requests_need_load: dict[str, Request] = {}  # scheduler 侧状态：哪些请求下一步需要 load 外部 KV。
-        self._storage_path = self._kv_transfer_config.get_from_extra_config(  # 从 extra_config 读取共享存储目录。
-            "shared_storage_path", "/tmp"  # 没配时默认写到 /tmp。
+        # 记录 block_size，后面算 slot_mapping 要用。
+        self._block_size = vllm_config.cache_config.block_size
+        # scheduler 侧状态：哪些请求下一步需要 load 外部 KV。
+        self._requests_need_load: dict[str, Request] = {}
+        # 从 extra_config 读取共享存储目录。
+        self._storage_path = self._kv_transfer_config.get_from_extra_config(
+            # 没配时默认写到 /tmp。
+            "shared_storage_path", "/tmp"
         )
-        logger.info(self._kv_transfer_config)  # 打印 KV transfer 配置，方便 debug。
-        logger.info("Shared storage path is %s", self._storage_path)  # 打印共享目录。
+        # 打印 KV transfer 配置，方便 debug。
+        logger.info(self._kv_transfer_config)
+        # 打印共享目录。
+        logger.info("Shared storage path is %s", self._storage_path)
 ```
 
 上面这段先建立 ExampleConnector 的数据模型：scheduler 侧会构造 `ExampleConnectorMetadata(requests=[ReqMeta, ...])`，worker 侧拿到 metadata 后按 `ReqMeta.is_store` 决定保存还是加载。
 
 ```python
-    def start_load_kv(self, forward_context, **kwargs) -> None:  # worker 侧：forward 前启动 KV 加载。
+    # worker 侧：forward 前启动 KV 加载。
+    def start_load_kv(self, forward_context, **kwargs) -> None:
         """从 connector 缓冲区加载 KV cache 到 vLLM 的 paged KV buffer。
 
         Args:
@@ -1142,49 +1351,83 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             KV cache 已经被写入本地 paged KV buffer。
         """
         def inject_kv_into_layer(dst_kv_cache_layer, src_kv_cache, slot_mapping, attn_metadata) -> None:
-            if isinstance(attn_metadata, MLACommonMetadata):  # MLA attention 的 KV cache 布局不同，需要特殊处理。
-                dst_kv_cache_layer_shape = dst_kv_cache_layer.shape  # 读取目标 KV cache tensor 形状。
-                num_pages = dst_kv_cache_layer_shape[0]  # 第一维是 page 数。
-                page_size = dst_kv_cache_layer_shape[1]  # 第二维是每个 page 的 token 数。
-                dst_kv_cache_layer = dst_kv_cache_layer.reshape(num_pages * page_size, -1)  # 展平成 token slot 维度。
-                dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache  # 按 slot_mapping 把外部 KV 写进目标 KV buffer。
-            else:  # 非 MLA attention 使用常见的 [block, K/V, offset, ...] 布局。
-                block_idxs = slot_mapping // self._block_size  # slot 除以 block_size 得到 block index。
-                offsets = slot_mapping % self._block_size  # slot 对 block_size 取模得到 block 内 offset。
-                dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache  # 写入对应 block 和 offset 的 K/V 位置。
+            # MLA attention 的 KV cache 布局不同，需要特殊处理。
+            if isinstance(attn_metadata, MLACommonMetadata):
+                # 读取目标 KV cache tensor 形状。
+                dst_kv_cache_layer_shape = dst_kv_cache_layer.shape
+                # 第一维是 page 数。
+                num_pages = dst_kv_cache_layer_shape[0]
+                # 第二维是每个 page 的 token 数。
+                page_size = dst_kv_cache_layer_shape[1]
+                # 展平成 token slot 维度。
+                dst_kv_cache_layer = dst_kv_cache_layer.reshape(num_pages * page_size, -1)
+                # 按 slot_mapping 把外部 KV 写进目标 KV buffer。
+                dst_kv_cache_layer[slot_mapping, ...] = src_kv_cache
+            # 非 MLA attention 使用常见的 [block, K/V, offset, ...] 布局。
+            else:
+                # slot 除以 block_size 得到 block index。
+                block_idxs = slot_mapping // self._block_size
+                # slot 对 block_size 取模得到 block 内 offset。
+                offsets = slot_mapping % self._block_size
+                # 写入对应 block 和 offset 的 K/V 位置。
+                dst_kv_cache_layer[block_idxs, :, offsets] = src_kv_cache
 
-        metadata = self._get_connector_metadata()  # 读取 scheduler 通过 SchedulerOutput 传来的 metadata。
-        assert isinstance(metadata, ExampleConnectorMetadata)  # ExampleConnector 只接受自己的 metadata 类型。
+        # 读取 scheduler 通过 SchedulerOutput 传来的 metadata。
+        metadata = self._get_connector_metadata()
+        # ExampleConnector 只接受自己的 metadata 类型。
+        assert isinstance(metadata, ExampleConnectorMetadata)
 
-        attn_metadata = forward_context.attn_metadata  # 从 forward context 拿 attention metadata。
-        if attn_metadata is None:  # 没有 attention metadata 就无法判断 KV 布局。
-            logger.warning("In connector.start_load_kv, but the attn_metadata is None")  # 打 warning 方便定位。
-            return  # 直接退出，不加载 KV。
+        # 从 forward context 拿 attention metadata。
+        attn_metadata = forward_context.attn_metadata
+        # 没有 attention metadata 就无法判断 KV 布局。
+        if attn_metadata is None:
+            # 打 warning 方便定位。
+            logger.warning("In connector.start_load_kv, but the attn_metadata is None")
+            # 直接退出，不加载 KV。
+            return
 
-        for request in metadata.requests:  # 遍历本轮 scheduler 交给 worker 的每个请求计划。
-            if request.is_store:  # start_load_kv 只处理 load 请求。
-                continue  # store 请求留给 save_kv_layer 处理。
-            logger.info("Inject KV cache of %d tokens to the paged memory", len(request.slot_mapping))  # 打印注入 token 数。
-            for layer_name in forward_context.no_compile_layers:  # 遍历不被 compile 捕获的层，通常可访问 Python 层对象。
-                layer = forward_context.no_compile_layers[layer_name]  # 根据层名拿到层对象。
-                kv_cache_layer = getattr(layer, "kv_cache", None)  # 只有 attention 层才有 kv_cache 属性。
-                if kv_cache_layer is None:  # MLP / MoE 等非 attention 层没有 KV cache。
-                    continue  # 跳过非 attention 层。
-                filename = self._generate_filename_debug(layer_name, request.token_ids, request.mm_hashes)  # 算出这一层 KV 文件路径。
-                kv_cache = safetensors.torch.load_file(filename, device=str(kv_cache_layer.device))["kv_cache"]  # 从磁盘读 KV 到目标设备。
-                if isinstance(attn_metadata, dict):  # 多层 attention metadata 通常按 layer_name 存在 dict 里。
-                    inject_kv_into_layer(  # 把磁盘读出的 KV 注入本地 paged KV buffer。
-                        kv_cache_layer,  # 目标：当前 attention 层的 paged KV buffer。
-                        kv_cache,  # 来源：磁盘读取的 KV tensor。
-                        request.slot_mapping,  # token 写入位置。
-                        attn_metadata[layer_name],  # 当前层 attention metadata。
+        # 遍历本轮 scheduler 交给 worker 的每个请求计划。
+        for request in metadata.requests:
+            # start_load_kv 只处理 load 请求。
+            if request.is_store:
+                # store 请求留给 save_kv_layer 处理。
+                continue
+            # 打印注入 token 数。
+            logger.info("Inject KV cache of %d tokens to the paged memory", len(request.slot_mapping))
+            # 遍历不被 compile 捕获的层，通常可访问 Python 层对象。
+            for layer_name in forward_context.no_compile_layers:
+                # 根据层名拿到层对象。
+                layer = forward_context.no_compile_layers[layer_name]
+                # 只有 attention 层才有 kv_cache 属性。
+                kv_cache_layer = getattr(layer, "kv_cache", None)
+                # MLP / MoE 等非 attention 层没有 KV cache。
+                if kv_cache_layer is None:
+                    # 跳过非 attention 层。
+                    continue
+                # 算出这一层 KV 文件路径。
+                filename = self._generate_filename_debug(layer_name, request.token_ids, request.mm_hashes)
+                # 从磁盘读 KV 到目标设备。
+                kv_cache = safetensors.torch.load_file(filename, device=str(kv_cache_layer.device))["kv_cache"]
+                # 多层 attention metadata 通常按 layer_name 存在 dict 里。
+                if isinstance(attn_metadata, dict):
+                    # 把磁盘读出的 KV 注入本地 paged KV buffer。
+                    inject_kv_into_layer(
+                        # 目标：当前 attention 层的 paged KV buffer。
+                        kv_cache_layer,
+                        # 来源：磁盘读取的 KV tensor。
+                        kv_cache,
+                        # token 写入位置。
+                        request.slot_mapping,
+                        # 当前层 attention metadata。
+                        attn_metadata[layer_name],
                     )
 ```
 
 这段代码对应 Decode worker 的行为：**外部 KV cache 已经存在，所以 worker 在 forward 前把 KV 注入本地 paged KV buffer**。ExampleConnector 是同步读文件，所以它的 `wait_for_layer_load()` 是空实现。
 
 ```python
-    def wait_for_layer_load(self, layer_name: str) -> None:  # worker 侧：等待某一层 KV 加载完成。
+    # worker 侧：等待某一层 KV 加载完成。
+    def wait_for_layer_load(self, layer_name: str) -> None:
         """等待指定 attention 层的 KV cache 加载完成。
 
         Args:
@@ -1194,9 +1437,11 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             ExampleConnector 没有异步加载，所以这里是空实现。异步 connector
             会在这里阻塞，直到当前层 KV 已经可用。
         """
-        return  # ExampleConnector 同步加载，start_load_kv 返回时已经加载完，所以这里什么都不做。
+        # ExampleConnector 同步加载，start_load_kv 返回时已经加载完，所以这里什么都不做。
+        return
 
-    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:  # worker 侧：保存当前层 KV。
+    # worker 侧：保存当前层 KV。
+    def save_kv_layer(self, layer_name, kv_layer, attn_metadata, **kwargs) -> None:
         """把当前 attention 层的 KV cache 从 paged KV buffer 保存到 connector。
 
         Args:
@@ -1209,37 +1454,55 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             ExampleConnector 会按 `slot_mapping` 抽取请求对应 token 的 KV，
             然后同步保存成 safetensors 文件。
         """
-        def extract_kv_from_layer(layer, slot_mapping) -> torch.Tensor:  # 从 paged KV buffer 抽取当前请求对应 token 的 KV。
-            if isinstance(attn_metadata, MLACommonMetadata):  # MLA 布局特殊处理。
-                num_pages, page_size = layer.shape[0], layer.shape[1]  # 取 page 数和 page size。
-                return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]  # 展平后按 slot 抽取 KV。
-            block_idxs = slot_mapping // self._block_size  # 普通布局：slot -> block index。
-            offsets = slot_mapping % self._block_size  # 普通布局：slot -> block 内 offset。
-            return layer[block_idxs, :, offsets]  # 抽取对应 token 的 K/V。
+        # 从 paged KV buffer 抽取当前请求对应 token 的 KV。
+        def extract_kv_from_layer(layer, slot_mapping) -> torch.Tensor:
+            # MLA 布局特殊处理。
+            if isinstance(attn_metadata, MLACommonMetadata):
+                # 取 page 数和 page size。
+                num_pages, page_size = layer.shape[0], layer.shape[1]
+                # 展平后按 slot 抽取 KV。
+                return layer.reshape(num_pages * page_size, -1)[slot_mapping, ...]
+            # 普通布局：slot -> block index。
+            block_idxs = slot_mapping // self._block_size
+            # 普通布局：slot -> block 内 offset。
+            offsets = slot_mapping % self._block_size
+            # 抽取对应 token 的 K/V。
+            return layer[block_idxs, :, offsets]
 
-        connector_metadata = self._get_connector_metadata()  # 读取本轮 scheduler metadata。
-        assert isinstance(connector_metadata, ExampleConnectorMetadata)  # 确认 metadata 类型正确。
-        for request in connector_metadata.requests:  # 遍历本轮请求计划。
-            if request.is_store:  # save_kv_layer 只处理 store 请求。
-                filename = self._generate_filename_debug(layer_name, request.token_ids, request.mm_hashes)  # 生成当前层输出文件路径。
-                kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)  # 从本地 paged KV buffer 抽出 KV。
-                tensors = {"kv_cache": kv_cache.detach().cpu()}  # detach 避免 autograd，cpu 表示写盘前搬到 CPU。
-                safetensors.torch.save_file(tensors, filename)  # 保存为 safetensors 文件。
+        # 读取本轮 scheduler metadata。
+        connector_metadata = self._get_connector_metadata()
+        # 确认 metadata 类型正确。
+        assert isinstance(connector_metadata, ExampleConnectorMetadata)
+        # 遍历本轮请求计划。
+        for request in connector_metadata.requests:
+            # save_kv_layer 只处理 store 请求。
+            if request.is_store:
+                # 生成当前层输出文件路径。
+                filename = self._generate_filename_debug(layer_name, request.token_ids, request.mm_hashes)
+                # 从本地 paged KV buffer 抽出 KV。
+                kv_cache = extract_kv_from_layer(kv_layer, request.slot_mapping)
+                # detach 避免 autograd，cpu 表示写盘前搬到 CPU。
+                tensors = {"kv_cache": kv_cache.detach().cpu()}
+                # 保存为 safetensors 文件。
+                safetensors.torch.save_file(tensors, filename)
 
-    def wait_for_save(self):  # worker 侧：等待保存完成。
+    # worker 侧：等待保存完成。
+    def wait_for_save(self):
         """等待所有 KV 保存任务完成。
 
         Note:
             ExampleConnector 是同步保存，`save_kv_layer()` 返回时文件已经写完，
             所以这里不需要额外等待。异步 connector 会在这里等待后台传输完成。
         """
-        return  # ExampleConnector 同步保存，save_kv_layer 返回时已经写完。
+        # ExampleConnector 同步保存，save_kv_layer 返回时已经写完。
+        return
 ```
 
 这段代码对应 Prefill worker 的行为：**Prefill 计算出每层 KV 后，worker connector 把这些 KV 从 paged KV buffer 抽出来并写到共享目录**。
 
 ```python
-    def get_num_new_matched_tokens(self, request, num_computed_tokens) -> tuple[int | None, bool]:  # scheduler 侧：查询外部 KV 命中。
+    # scheduler 侧：查询外部 KV 命中。
+    def get_num_new_matched_tokens(self, request, num_computed_tokens) -> tuple[int | None, bool]:
         """查询外部 KV cache 能覆盖多少新的 token。
 
         Args:
@@ -1255,15 +1518,22 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             ExampleConnector 用磁盘目录是否存在来判断外部缓存命中，并且同步加载，
             所以第二个返回值恒为 `False`。
         """
-        if not self._found_match_for_request(request):  # 如果磁盘上找不到这个请求对应的缓存目录。
-            return 0, False  # 外部命中 0 个 token，并且不需要异步加载。
+        # 如果磁盘上找不到这个请求对应的缓存目录。
+        if not self._found_match_for_request(request):
+            # 外部命中 0 个 token，并且不需要异步加载。
+            return 0, False
 
-        logger.info("External Cache Hit!")  # 打日志说明外部 KV cache 命中。
-        token_ids = request.prompt_token_ids or []  # 取 prompt token；没有时用空列表兜底。
-        num_tokens_to_check = align_to_block_size(len(token_ids) - 1, self._block_size)  # 只检查 prompt 去掉最后一个 token 后的 block 对齐前缀。
-        return num_tokens_to_check - num_computed_tokens, False  # 返回“外部比本地多覆盖的 token 数”；False 表示同步加载。
+        # 打日志说明外部 KV cache 命中。
+        logger.info("External Cache Hit!")
+        # 取 prompt token；没有时用空列表兜底。
+        token_ids = request.prompt_token_ids or []
+        # 只检查 prompt 去掉最后一个 token 后的 block 对齐前缀。
+        num_tokens_to_check = align_to_block_size(len(token_ids) - 1, self._block_size)
+        # 返回“外部比本地多覆盖的 token 数”；False 表示同步加载。
+        return num_tokens_to_check - num_computed_tokens, False
 
-    def update_state_after_alloc(self, request, blocks, num_external_tokens):  # scheduler 侧：KV block 分配后更新 connector 状态。
+    # scheduler 侧：KV block 分配后更新 connector 状态。
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
         """在 scheduler 分配 KV block 后更新 connector 状态。
 
         Args:
@@ -1275,10 +1545,13 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             ExampleConnector 只需要记录“哪些请求下一步要 load”，真正的 block ids
             会在 `build_connector_meta()` 里从 `SchedulerOutput` 获取。
         """
-        if num_external_tokens > 0:  # 只有外部 KV 命中时才需要加载。
-            self._requests_need_load[request.request_id] = request  # 记录请求，稍后 build_connector_meta 会生成 load metadata。
+        # 只有外部 KV 命中时才需要加载。
+        if num_external_tokens > 0:
+            # 记录请求，稍后 build_connector_meta 会生成 load metadata。
+            self._requests_need_load[request.request_id] = request
 
-    def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:  # scheduler 侧：构造本轮传给 worker 的 metadata。
+    # scheduler 侧：构造本轮传给 worker 的 metadata。
+    def build_connector_meta(self, scheduler_output) -> KVConnectorMetadata:
         """根据本轮 scheduler 输出构造 Scheduler -> Worker 的 connector metadata。
 
         Args:
@@ -1293,107 +1566,181 @@ class ExampleConnector(KVConnectorBase_V1):  # ExampleConnector 是 KVConnectorB
             这个函数会消耗并清空 `_requests_need_load`，因此它既是 metadata
             构造函数，也是 ExampleConnector scheduler 侧状态推进点。
         """
-        meta = ExampleConnectorMetadata()  # 新建空 metadata 容器。
-        total_need_load = 0  # 统计本轮需要 load 的请求数，用于最后自检。
+        # 新建空 metadata 容器。
+        meta = ExampleConnectorMetadata()
+        # 统计本轮需要 load 的请求数，用于最后自检。
+        total_need_load = 0
 
-        for new_req in scheduler_output.scheduled_new_reqs:  # 遍历本轮新调度的请求。
-            token_ids = new_req.prompt_token_ids or []  # 取请求 prompt token。
-            mm_hashes = [f.identifier for f in new_req.mm_features]  # 取多模态特征 hash。
-            if new_req.req_id in self._requests_need_load:  # 如果之前 update_state_after_alloc 标记它需要 load。
-                meta.add_request(  # 往 metadata 添加一个 load 请求。
-                    token_ids=token_ids,  # 用 prompt token 构造缓存 key。
-                    block_ids=new_req.block_ids[0],  # 使用第一个 KV cache group 的 block ids。
-                    block_size=self._block_size,  # 传入 block_size 以计算 slot_mapping。
-                    is_store=False,  # False 表示 worker 侧要加载 KV。
-                    mm_hashes=mm_hashes,  # 传入多模态 hash。
+        # 遍历本轮新调度的请求。
+        for new_req in scheduler_output.scheduled_new_reqs:
+            # 取请求 prompt token。
+            token_ids = new_req.prompt_token_ids or []
+            # 取多模态特征 hash。
+            mm_hashes = [f.identifier for f in new_req.mm_features]
+            # 如果之前 update_state_after_alloc 标记它需要 load。
+            if new_req.req_id in self._requests_need_load:
+                # 往 metadata 添加一个 load 请求。
+                meta.add_request(
+                    # 用 prompt token 构造缓存 key。
+                    token_ids=token_ids,
+                    # 使用第一个 KV cache group 的 block ids。
+                    block_ids=new_req.block_ids[0],
+                    # 传入 block_size 以计算 slot_mapping。
+                    block_size=self._block_size,
+                    # False 表示 worker 侧要加载 KV。
+                    is_store=False,
+                    # 传入多模态 hash。
+                    mm_hashes=mm_hashes,
                 )
-                total_need_load += 1  # 记录一个 load 请求。
-            else:  # 如果这个新请求不需要 load，则考虑是否需要 store。
-                if not self._found_match_for_prompt(token_ids, mm_hashes):  # 如果磁盘还没有对应 prompt KV。
-                    meta.add_request(  # 往 metadata 添加一个 store 请求。
-                        token_ids=token_ids,  # 保存这个 prompt 对应的 KV。
-                        block_ids=new_req.block_ids[0],  # 当前请求分配到的 KV block ids。
-                        block_size=self._block_size,  # 用于计算 slot_mapping。
-                        is_store=True,  # True 表示 worker 侧要保存 KV。
-                        mm_hashes=mm_hashes,  # 多模态 hash 参与缓存 key。
+                # 记录一个 load 请求。
+                total_need_load += 1
+            # 如果这个新请求不需要 load，则考虑是否需要 store。
+            else:
+                # 如果磁盘还没有对应 prompt KV。
+                if not self._found_match_for_prompt(token_ids, mm_hashes):
+                    # 往 metadata 添加一个 store 请求。
+                    meta.add_request(
+                        # 保存这个 prompt 对应的 KV。
+                        token_ids=token_ids,
+                        # 当前请求分配到的 KV block ids。
+                        block_ids=new_req.block_ids[0],
+                        # 用于计算 slot_mapping。
+                        block_size=self._block_size,
+                        # True 表示 worker 侧要保存 KV。
+                        is_store=True,
+                        # 多模态 hash 参与缓存 key。
+                        mm_hashes=mm_hashes,
                     )
 
-        cached_reqs = scheduler_output.scheduled_cached_reqs  # 本轮调度的 cached/resumed 请求集合。
-        for i, req_id in enumerate(cached_reqs.req_ids):  # 遍历这些 cached 请求。
-            resumed_from_preemption = req_id in cached_reqs.resumed_req_ids  # 判断是否从 preemption 恢复。
-            if not resumed_from_preemption or req_id not in self._requests_need_load:  # 只处理“恢复且需要 load”的请求。
-                continue  # 其他 cached 请求不需要 ExampleConnector 处理。
+        # 本轮调度的 cached/resumed 请求集合。
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        # 遍历这些 cached 请求。
+        for i, req_id in enumerate(cached_reqs.req_ids):
+            # 判断是否从 preemption 恢复。
+            resumed_from_preemption = req_id in cached_reqs.resumed_req_ids
+            # 只处理“恢复且需要 load”的请求。
+            if not resumed_from_preemption or req_id not in self._requests_need_load:
+                # 其他 cached 请求不需要 ExampleConnector 处理。
+                continue
 
-            num_computed_tokens = cached_reqs.num_computed_tokens[i]  # 已经计算的 token 数。
-            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]  # 本轮新调度的 token 数。
-            new_block_ids = cached_reqs.new_block_ids[i]  # 恢复请求本轮使用的 block ids。
-            request = self._requests_need_load[req_id]  # 从暂存 dict 找回完整 Request。
-            total_tokens = num_computed_tokens + num_new_tokens  # 需要覆盖的总 token 数。
-            token_ids = request.all_token_ids[:total_tokens]  # cached_req 本身 token 信息不全，所以从 Request 里取完整前缀。
-            assert new_block_ids is not None  # resumed 请求应当有 block ids。
-            block_ids = new_block_ids[0]  # 取第一个 KV cache group 的 block ids。
+            # 已经计算的 token 数。
+            num_computed_tokens = cached_reqs.num_computed_tokens[i]
+            # 本轮新调度的 token 数。
+            num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # 恢复请求本轮使用的 block ids。
+            new_block_ids = cached_reqs.new_block_ids[i]
+            # 从暂存 dict 找回完整 Request。
+            request = self._requests_need_load[req_id]
+            # 需要覆盖的总 token 数。
+            total_tokens = num_computed_tokens + num_new_tokens
+            # cached_req 本身 token 信息不全，所以从 Request 里取完整前缀。
+            token_ids = request.all_token_ids[:total_tokens]
+            # resumed 请求应当有 block ids。
+            assert new_block_ids is not None
+            # 取第一个 KV cache group 的 block ids。
+            block_ids = new_block_ids[0]
 
-            meta.add_request(  # 添加一个 load 请求。
-                token_ids=token_ids,  # 用完整前缀 token 构造 key。
-                block_ids=block_ids,  # 对应目标 paged KV block。
-                block_size=self._block_size,  # 用于 slot_mapping。
-                is_store=False,  # 这是 load。
-                mm_hashes=[f.identifier for f in request.mm_features],  # 多模态 hash。
+            # 添加一个 load 请求。
+            meta.add_request(
+                # 用完整前缀 token 构造 key。
+                token_ids=token_ids,
+                # 对应目标 paged KV block。
+                block_ids=block_ids,
+                # 用于 slot_mapping。
+                block_size=self._block_size,
+                # 这是 load。
+                is_store=False,
+                # 多模态 hash。
+                mm_hashes=[f.identifier for f in request.mm_features],
             )
-            total_need_load += 1  # load 请求计数加一。
+            # load 请求计数加一。
+            total_need_load += 1
 
-        assert total_need_load == len(self._requests_need_load)  # 确保所有标记要 load 的请求都被放进 metadata。
-        self._requests_need_load.clear()  # metadata 已经构造完，清空临时状态，避免下轮重复处理。
-        return meta  # 返回 Scheduler -> Worker metadata。
+        # 确保所有标记要 load 的请求都被放进 metadata。
+        assert total_need_load == len(self._requests_need_load)
+        # metadata 已经构造完，清空临时状态，避免下轮重复处理。
+        self._requests_need_load.clear()
+        # 返回 Scheduler -> Worker metadata。
+        return meta
 ```
 
 这段是 ExampleConnector 最关键的 scheduler 逻辑：命中外部缓存的请求会走 `is_store=False`，未命中的新请求会走 `is_store=True`。也就是说，**同一个 connector 类既能在 P 侧做 KV 生产，也能在 D 侧做 KV 消费，具体行为由 scheduler 生成的 metadata 决定**。
 
 ```python
-    def _found_match_for_request(self, request) -> bool:  # scheduler 侧辅助函数：判断某个 Request 是否命中磁盘缓存。
+    # scheduler 侧辅助函数：判断某个 Request 是否命中磁盘缓存。
+    def _found_match_for_request(self, request) -> bool:
         """判断一个 Request 的 prompt 前缀是否已经有磁盘 KV cache。"""
-        return self._found_match_for_prompt(  # 复用 prompt 级判断函数。
-            list(request.prompt_token_ids or []),  # Request 里的 prompt token。
-            [f.identifier for f in request.mm_features],  # Request 里的多模态 hash。
+        # 复用 prompt 级判断函数。
+        return self._found_match_for_prompt(
+            # Request 里的 prompt token。
+            list(request.prompt_token_ids or []),
+            # Request 里的多模态 hash。
+            [f.identifier for f in request.mm_features],
         )
 
-    def _found_match_for_prompt(self, prompt_token_ids, mm_hashes) -> bool:  # 根据 prompt token 和多模态 hash 判断缓存是否存在。
+    # 根据 prompt token 和多模态 hash 判断缓存是否存在。
+    def _found_match_for_prompt(self, prompt_token_ids, mm_hashes) -> bool:
         """根据 prompt token 和多模态 hash 检查对应缓存目录是否存在。"""
-        num_tokens_to_check = align_to_block_size(  # 计算需要作为 key 的 block 对齐 token 数。
-            len(prompt_token_ids) - 1, self._block_size  # debug 假设最后一个 token 是新生成 token，所以排除掉。
+        # 计算需要作为 key 的 block 对齐 token 数。
+        num_tokens_to_check = align_to_block_size(
+            # debug 假设最后一个 token 是新生成 token，所以排除掉。
+            len(prompt_token_ids) - 1, self._block_size
         )
-        foldername = self._generate_foldername_debug(  # 根据 token 前缀和 mm_hashes 生成缓存目录。
-            torch.tensor(prompt_token_ids)[:num_tokens_to_check],  # 只使用 block 对齐后的前缀 token。
-            mm_hashes,  # 多模态 hash 也参与 key。
-            create_folder=False,  # 查询时不创建目录。
+        # 根据 token 前缀和 mm_hashes 生成缓存目录。
+        foldername = self._generate_foldername_debug(
+            # 只使用 block 对齐后的前缀 token。
+            torch.tensor(prompt_token_ids)[:num_tokens_to_check],
+            # 多模态 hash 也参与 key。
+            mm_hashes,
+            # 查询时不创建目录。
+            create_folder=False,
         )
-        return os.path.exists(foldername)  # 目录存在就认为外部 KV cache 命中。
+        # 目录存在就认为外部 KV cache 命中。
+        return os.path.exists(foldername)
 
-    def _generate_foldername_debug(self, token_ids, mm_hashes, create_folder=False) -> str:  # 生成缓存目录名。
+    # 生成缓存目录名。
+    def _generate_foldername_debug(self, token_ids, mm_hashes, create_folder=False) -> str:
         """根据 token 前缀和多模态 hash 生成缓存目录路径。"""
-        token_bytes = token_ids.numpy().tobytes()  # 把 token tensor 转成 bytes，作为 hash 输入。
-        if mm_hashes:  # 如果请求有多模态输入。
-            mm_str = "-".join(mm_hashes)  # 把多个多模态 hash 拼成一个字符串。
-            token_bytes += mm_str.encode("utf-8")  # 加入 hash 输入，避免同 token 不同多模态内容冲突。
-        input_ids_hash = safe_hash(token_bytes, usedforsecurity=False).hexdigest()  # 计算稳定 hash，作为目录名。
-        foldername = os.path.join(self._storage_path, input_ids_hash)  # 拼出共享存储路径下的缓存目录。
-        if create_folder:  # 如果调用方需要写入文件。
-            os.makedirs(foldername, exist_ok=True)  # 创建目录，已存在也不报错。
-        return foldername  # 返回缓存目录。
+        # 把 token tensor 转成 bytes，作为 hash 输入。
+        token_bytes = token_ids.numpy().tobytes()
+        # 如果请求有多模态输入。
+        if mm_hashes:
+            # 把多个多模态 hash 拼成一个字符串。
+            mm_str = "-".join(mm_hashes)
+            # 加入 hash 输入，避免同 token 不同多模态内容冲突。
+            token_bytes += mm_str.encode("utf-8")
+        # 计算稳定 hash，作为目录名。
+        input_ids_hash = safe_hash(token_bytes, usedforsecurity=False).hexdigest()
+        # 拼出共享存储路径下的缓存目录。
+        foldername = os.path.join(self._storage_path, input_ids_hash)
+        # 如果调用方需要写入文件。
+        if create_folder:
+            # 创建目录，已存在也不报错。
+            os.makedirs(foldername, exist_ok=True)
+        # 返回缓存目录。
+        return foldername
 
-    def _generate_filename_debug(self, layer_name, token_ids, mm_hashes) -> str:  # 生成某一层 KV cache 文件路径。
+    # 生成某一层 KV cache 文件路径。
+    def _generate_filename_debug(self, layer_name, token_ids, mm_hashes) -> str:
         """根据 layer name 和缓存目录生成该层 safetensors 文件路径。"""
-        foldername = self._generate_foldername_debug(  # 先根据 token 前缀生成目录。
-            token_ids,  # 参与 key 的 token。
-            mm_hashes=mm_hashes,  # 参与 key 的多模态 hash。
-            create_folder=True,  # 生成文件路径通常是为了写入，所以确保目录存在。
+        # 先根据 token 前缀生成目录。
+        foldername = self._generate_foldername_debug(
+            # 参与 key 的 token。
+            token_ids,
+            # 参与 key 的多模态 hash。
+            mm_hashes=mm_hashes,
+            # 生成文件路径通常是为了写入，所以确保目录存在。
+            create_folder=True,
         )
-        return os.path.join(foldername, f"{layer_name}.safetensors")  # 每层一个 safetensors 文件。
+        # 每层一个 safetensors 文件。
+        return os.path.join(foldername, f"{layer_name}.safetensors")
 
 
-def align_to_block_size(num_tokens: int, block_size) -> int:  # 把 token 数向下对齐到 block 边界。
+# 把 token 数向下对齐到 block 边界。
+def align_to_block_size(num_tokens: int, block_size) -> int:
     """返回小于 `num_tokens` 的最大 block 对齐 token 数。"""
-    return (num_tokens - 1) // block_size * block_size  # 例如 block_size=16 时，17 会对齐到 16。
+    # 例如 block_size=16 时，17 会对齐到 16。
+    return (num_tokens - 1) // block_size * block_size
 ```
 
 辅助函数说明了 ExampleConnector 的缓存 key 设计：**目录名由 token 前缀和多模态 hash 决定，文件名由 layer name 决定**。所以它能按“同一个 prompt 前缀”复用 KV cache，但它不是生产级实现，只是为了把接口链路讲清楚。
