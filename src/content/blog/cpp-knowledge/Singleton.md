@@ -975,6 +975,236 @@ private:
 MyManager::getInstance().run();
 ```
 
+## 完整推荐模板：带配置的 CRTP 单例基类
+
+配置接口也可以上移到 CRTP 基类里，但基类必须提前知道配置类型。
+
+普通的单例基类只有一个模板参数：
+
+```cpp
+template <typename Derived>
+class Singleton;
+```
+
+它只知道派生类类型 `Derived`，不知道派生类到底用什么配置。因此配置型单例基类至少需要两个模板参数：
+
+```cpp
+template <typename Derived, typename Config>
+class ConfigurableSingleton;
+```
+
+这样基类才能统一提供：
+
+- `configure(Config config)`：在实例创建前保存配置。
+- `getInstance()`：第一次访问时消费配置，并构造唯一实例。
+- `pendingConfig()`：保存尚未被构造函数消费的配置。
+- `configMutex()`：保护配置写入和消费过程。
+- `isCreated()`：禁止实例创建后再次配置。
+
+### 通用基类模板
+
+下面这版保持简单：仍然使用函数内 `static Derived instance(...)` 管理生命周期。
+
+它适合“配置在启动阶段确定，实例创建后不再改变”的单例对象。
+
+```cpp
+#pragma once
+
+#include <mutex>
+#include <optional>
+#include <stdexcept>
+#include <utility>
+
+/**
+ * @brief 带启动配置的 CRTP 单例基类。
+ *
+ * @tparam Derived 具体的单例类型。
+ * @tparam Config 单例构造时使用的配置类型。
+ * @tparam RequireExplicitConfigure 是否要求必须先调用 configure()。
+ */
+template <typename Derived, typename Config, bool RequireExplicitConfigure = false>
+class ConfigurableSingleton {
+public:
+    /**
+     * @brief 在单例实例创建前设置启动配置。
+     *
+     * @param config 传给 Derived 构造函数的启动配置。
+     *
+     * @throws std::logic_error 如果实例已经创建，则抛出异常。
+     */
+    static void configure(Config config)
+    {
+        std::lock_guard<std::mutex> lock(configMutex());
+
+        if (isCreated()) {
+            throw std::logic_error("singleton has already been created.");
+        }
+
+        pendingConfig() = std::move(config);
+    }
+
+    /**
+     * @brief 返回进程内唯一的 Derived 实例。
+     *
+     * 第一次调用会消费 pending config，并用该配置构造 Derived。
+     * 如果没有显式 configure()，且 RequireExplicitConfigure 为 false，则使用 Config{}。
+     *
+     * @return 单例对象的引用。
+     */
+    static Derived& getInstance()
+    {
+        static Derived instance(takeConfigForConstruction());
+        markCreated();
+        return instance;
+    }
+
+    ConfigurableSingleton(const ConfigurableSingleton&) = delete;
+    ConfigurableSingleton& operator=(const ConfigurableSingleton&) = delete;
+
+protected:
+    ConfigurableSingleton() = default;
+    ~ConfigurableSingleton() = default;
+
+private:
+    /**
+     * @brief 取出构造配置。
+     *
+     * @return 用于构造 Derived 的配置对象。
+     */
+    static Config takeConfigForConstruction()
+    {
+        std::lock_guard<std::mutex> lock(configMutex());
+
+        if constexpr (RequireExplicitConfigure) {
+            if (!pendingConfig().has_value()) {
+                throw std::logic_error("singleton must be configured before getInstance().");
+            }
+        }
+
+        Config config = pendingConfig().has_value()
+            ? std::move(*pendingConfig())
+            : Config{};
+
+        pendingConfig().reset();
+        return config;
+    }
+
+    static void markCreated()
+    {
+        std::lock_guard<std::mutex> lock(configMutex());
+        isCreated() = true;
+    }
+
+    static std::optional<Config>& pendingConfig()
+    {
+        static std::optional<Config> config;
+        return config;
+    }
+
+    static std::mutex& configMutex()
+    {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    static bool& isCreated()
+    {
+        static bool created = false;
+        return created;
+    }
+};
+```
+
+这版基类的边界很清楚：
+
+- 基类负责**配置时序**：先配置，后创建，创建后不再允许配置。
+- 派生类负责**业务语义**：定义配置结构体、校验字段是否合法、把配置写入成员变量。
+- 生命周期仍然交给函数内 `static`，保持 Meyers Singleton 的简单性。
+
+### 派生类写法
+
+派生类只需要把配置类型作为第二个模板参数传给基类，然后提供一个接收 `Config` 的私有构造函数。
+
+```cpp
+#include <string>
+
+struct ServiceConfig {
+    std::string endpoint;
+    int worker_count{4};
+};
+
+class Service : public ConfigurableSingleton<Service, ServiceConfig> {
+    friend class ConfigurableSingleton<Service, ServiceConfig>;
+
+public:
+    void run()
+    {
+        // 使用 mConfig 执行业务逻辑。
+    }
+
+private:
+    explicit Service(ServiceConfig config)
+        : mConfig(std::move(config))
+    {
+        if (mConfig.worker_count <= 0) {
+            throw std::logic_error("worker_count must be greater than 0.");
+        }
+    }
+
+private:
+    ServiceConfig mConfig;
+};
+```
+
+使用方式：
+
+```cpp
+ServiceConfig config;
+config.endpoint = "127.0.0.1:8080";
+config.worker_count = 8;
+
+Service::configure(std::move(config));
+Service::getInstance().run();
+```
+
+这里的设计重点是：**配置接口可以通用，但配置内容不能通用**。
+
+基类不知道 `endpoint` 是不是必须非空，也不知道 `worker_count` 的合法范围，所以这些检查应该放在派生类构造函数里。
+
+### 如果配置必须显式传入
+
+有些单例不能使用默认配置，比如必须从配置文件读取端口、模型路径、设备 ID。可以把第三个模板参数设成 `true`：
+
+```cpp
+class RuntimeContext
+    : public ConfigurableSingleton<RuntimeContext, RuntimeConfig, true> {
+    friend class ConfigurableSingleton<RuntimeContext, RuntimeConfig, true>;
+
+private:
+    explicit RuntimeContext(RuntimeConfig config)
+        : mConfig(std::move(config))
+    {
+    }
+
+private:
+    RuntimeConfig mConfig;
+};
+```
+
+这样如果调用方忘了配置：
+
+```cpp
+RuntimeContext::getInstance();
+```
+
+会直接抛出：
+
+```cpp
+std::logic_error("singleton must be configured before getInstance().")
+```
+
+这比悄悄使用空配置更安全。
+
 ## 写单例时的检查清单
 
 - **实例访问方式**：优先返回 `T&`，不要把所有权暴露给调用方。
