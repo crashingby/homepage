@@ -3017,3 +3017,278 @@ public:
 - **为什么可以压缩空间？** 当前格子只依赖上方和左方，不依赖更早的行列。
 
 这道题的核心不是“奇偶时间 DP”，而是看穿题目规则后，把它化简成 **最小路径和 + 中间节点等待成本**。
+
+## [1289. 下降路径最小和 II - 力扣（LeetCode）](https://leetcode.cn/problems/minimum-falling-path-sum-ii/description/)
+
+给你一个 `n x n` 的整数矩阵 `grid`，需要从每一行中选择一个数字，组成一条下降路径。
+
+这条路径有一个限制：**相邻两行选中的数字不能在同一列**。
+
+返回所有合法路径中的最小数字和。
+
+**示例 1：**
+
+**输入：** `grid = [[1,2,3],[4,5,6],[7,8,9]]`
+
+**输出：** `13`
+
+**解释：** 最小路径可以选择 `[1, 5, 7]`，相邻两行的列下标分别是 `0 -> 1 -> 0`，没有连续两次选择同一列。
+
+**示例 2：**
+
+**输入：** `grid = [[7]]`
+
+**输出：** `7`
+
+**提示：**
+
+- `n == grid.length == grid[i].length`
+- `1 <= n <= 200`
+- `-99 <= grid[i][j] <= 99`
+
+### 递归切入（探索逻辑）
+
+这道题还是先问“最后一步”。
+
+如果我们已经决定最后落在第 `i` 行第 `j` 列，也就是选择了 `grid[i][j]`，那么上一行只能来自第 `i - 1` 行的某个列 `k`，并且必须满足：
+
+$$
+k \ne j
+$$
+
+所以可以先写出递归含义：
+
+`dfs(i, j)` 表示选择到 `grid[i][j]`，并且路径最后停在第 `i` 行第 `j` 列时的最小路径和。
+
+那么转移就是：
+
+$$
+dfs(i, j) =
+grid[i][j] + \min_{k \ne j} dfs(i - 1, k)
+$$
+
+递归边界也很自然：
+
+$$
+dfs(0, j) = grid[0][j]
+$$
+
+也就是说，第一行本身就是路径起点，选哪个数都可以。
+
+### 定义定型（规范表达，处理偏移）
+
+把递归翻译成递推：
+
+- **状态定义**：`dp[i][j]` 表示选择到第 `i` 行第 `j` 列，并且以 `grid[i][j]` 作为当前行选择时的最小路径和。
+- **初始化**：第一行没有上一行约束，所以 `dp[0][j] = grid[0][j]`。
+- **状态转移**：
+
+$$
+dp[i][j] =
+grid[i][j] + \min_{k \ne j} dp[i - 1][k]
+$$
+
+- **最终答案**：
+
+$$
+\min_j dp[n - 1][j]
+$$
+
+这里不需要像网格路径题那样加安全垫偏移，因为它不是从上/左两个方向处理边界，而是按行推进。第 `0` 行直接作为初始化，后面的每一行只看上一行。
+
+### 维度降级（空间优化）
+
+朴素 DP 的依赖非常单纯：第 `i` 行只依赖第 `i - 1` 行。
+
+所以如果只是从二维表压缩空间，可以用一维数组保存上一行：
+
+- `prev[j]` 表示上一行落在第 `j` 列的最小路径和。
+- 计算当前行时，枚举当前列 `j`，再去上一行里找所有 `k != j` 的最小值。
+
+不过这只能把空间从 $O(n^2)$ 压到 $O(n)$，时间仍然是 $O(n^3)$：
+
+- 一共有 $n^2$ 个状态。
+- 每个状态都要扫描上一行的 $n$ 个列。
+
+这道题真正重要的优化，不只是“滚动数组”，而是把：
+
+$$
+\min_{k \ne j} dp[i - 1][k]
+$$
+
+从每次 $O(n)$ 查询，优化成每次 $O(1)$ 查询。
+
+### 维度互换（本题不需要）
+
+这道题里，“行”是天然的阶段，“列”是当前阶段的状态。
+
+相邻限制只发生在连续两行之间：当前列 `j` 不能等于上一行列 `k`。因此状态推进方向必须按行走，没必要把行列维度互换。
+
+如果强行互换，会让问题语义变成“按列选择行”，但题目要求的是“每一行选择一个数”，约束对象就变了。
+
+### 状态“完备性”自检
+
+- **状态里只记录当前列够不够？** 够。题目只限制相邻两行不能同列，转移到下一行时只需要知道上一行选了哪一列。
+- **需要记录整条路径吗？** 不需要。路径历史对未来没有影响，未来只关心上一行最后停在哪一列，以及到那里为止的最小和。
+- **有负数会不会破坏优化？** 不会。我们维护的是上一行的最小值和次小值，负数只会改变大小关系，不会改变转移逻辑。
+- **`n = 1` 怎么办？** 只有一个格子，没有相邻行约束，答案就是 `grid[0][0]`。
+- **为什么需要次小值？** 如果当前列 `j` 正好等于上一行最小值所在列，就不能用这个最小值，只能退而求其次，使用上一行的次小值。
+
+### dp代码
+
+这是最直接的二维 DP 写法，思路清楚，但每个状态都要扫描上一行所有列。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求非零偏移下降路径的最小和。
+     *
+     * dp[row][col] 表示路径选择到第 row 行第 col 列时的最小路径和。
+     * 当前列 col 不能从上一行的同一列 col 转移过来，所以需要枚举上一行所有 k != col。
+     *
+     * @param grid n x n 整数矩阵。
+     * @return 合法下降路径的最小数字和。
+     */
+    int minFallingPathSum(vector<vector<int>>& grid) {
+        const int n = grid.size();
+        vector<vector<int>> dp(n, vector<int>(n, 0));
+
+        dp[0] = grid[0];
+
+        for (int row = 1; row < n; row++) {
+            for (int col = 0; col < n; col++) {
+                int best_prev = numeric_limits<int>::max();
+
+                // 从上一行选择一个不同列的状态转移过来。
+                for (int prev_col = 0; prev_col < n; prev_col++) {
+                    if (prev_col == col) {
+                        continue;
+                    }
+                    best_prev = min(best_prev, dp[row - 1][prev_col]);
+                }
+
+                dp[row][col] = best_prev + grid[row][col];
+            }
+        }
+
+        return *min_element(dp[n - 1].begin(), dp[n - 1].end());
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n^3)$。
+- 空间复杂度：$O(n^2)$。
+
+### 空间优化
+
+朴素写法慢在这里：
+
+```cpp
+for (int prev_col = 0; prev_col < n; prev_col++) {
+    if (prev_col == col) {
+        continue;
+    }
+    best_prev = min(best_prev, dp[row - 1][prev_col]);
+}
+```
+
+对于同一行的所有 `col` 来说，大家都在问同一个问题：
+
+> 上一行里，排除当前列之后，最小值是多少？
+
+上一行的信息其实可以浓缩成三个变量：
+
+- `first_min_sum`：上一行的最小路径和。
+- `first_min_col`：上一行最小路径和所在的列。
+- `second_min_sum`：上一行的次小路径和。
+
+计算当前列 `col` 时：
+
+- 如果 `col != first_min_col`，说明上一行的最小值不和当前列冲突，可以直接用 `first_min_sum`。
+- 如果 `col == first_min_col`，说明上一行最小值在同一列，不能用，只能用 `second_min_sum`。
+
+这样每个状态就能 $O(1)$ 转移，总时间从 $O(n^3)$ 降到 $O(n^2)$。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用“上一行最小值 + 次小值”优化下降路径最小和。
+     *
+     * 每一行只需要从上一行转移。为了避免每个状态都扫描上一整行，
+     * 维护上一行的最小路径和、最小值所在列、次小路径和。
+     *
+     * @param grid n x n 整数矩阵。
+     * @return 合法下降路径的最小数字和。
+     */
+    int minFallingPathSum(vector<vector<int>>& grid) {
+        const int n = grid.size();
+
+        int first_min_sum = numeric_limits<int>::max();
+        int second_min_sum = numeric_limits<int>::max();
+        int first_min_col = -1;
+
+        // 用第 0 行初始化“上一行”的最小值和次小值。
+        for (int col = 0; col < n; col++) {
+            const int value = grid[0][col];
+            if (value < first_min_sum) {
+                second_min_sum = first_min_sum;
+                first_min_sum = value;
+                first_min_col = col;
+            } else if (value < second_min_sum) {
+                second_min_sum = value;
+            }
+        }
+
+        for (int row = 1; row < n; row++) {
+            int cur_first_min_sum = numeric_limits<int>::max();
+            int cur_second_min_sum = numeric_limits<int>::max();
+            int cur_first_min_col = -1;
+
+            for (int col = 0; col < n; col++) {
+                // 如果上一行的最小值和当前列冲突，就只能用上一行次小值。
+                const int best_prev =
+                    (col == first_min_col) ? second_min_sum : first_min_sum;
+                const int cur_sum = best_prev + grid[row][col];
+
+                // 一边计算当前行状态，一边维护当前行的最小值和次小值。
+                if (cur_sum < cur_first_min_sum) {
+                    cur_second_min_sum = cur_first_min_sum;
+                    cur_first_min_sum = cur_sum;
+                    cur_first_min_col = col;
+                } else if (cur_sum < cur_second_min_sum) {
+                    cur_second_min_sum = cur_sum;
+                }
+            }
+
+            first_min_sum = cur_first_min_sum;
+            second_min_sum = cur_second_min_sum;
+            first_min_col = cur_first_min_col;
+        }
+
+        return first_min_sum;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n^2)$，每个格子只计算一次。
+- 空间复杂度：$O(1)$，只维护最小值、次小值和最小值列下标。
+
+这道题的核心手感是：**当转移里出现“从上一层所有状态里取最小值，但要排除一个状态”时，优先想到维护最小值和次小值。**
