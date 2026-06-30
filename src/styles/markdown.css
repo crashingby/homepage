@@ -1,5 +1,5 @@
 .markdown-body {
-    max-width: 820px;
+    max-width: 1040px;
     padding-top: 34px;
     color: var(--text-main);
     font-size: 1.04rem;
@@ -56,6 +56,14 @@
 .markdown-body a {
     color: var(--accent-blue);
     border-bottom: 1px solid rgba(37, 99, 235, 0.3);
+}
+
+.markdown-body img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto 18px;
+    border-radius: 8px;
 }
 
 .markdown-body code {
