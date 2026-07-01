@@ -127,6 +127,7 @@
 
 .back-link {
     display: inline-flex;
+    margin-left: 356px;
     margin-bottom: 32px;
     color: var(--accent-blue);
     font-weight: 800;
@@ -134,6 +135,7 @@
 
 .post-header {
     max-width: 1040px;
+    margin-left: 356px;
     padding-bottom: 32px;
     border-bottom: 1px solid var(--border);
 }
@@ -244,6 +246,11 @@
 
     .post-card {
         padding: 18px;
+    }
+
+    .back-link,
+    .post-header {
+        margin-left: 0;
     }
 
     .blog-post-layout {
