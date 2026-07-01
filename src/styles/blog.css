@@ -150,20 +150,15 @@
 }
 
 .blog-post-layout {
-    display: grid;
-    grid-template-columns: 280px minmax(0, 1040px);
-    gap: 72px;
-    align-items: start;
-    margin-top: 0;
+    display: block;
 }
 
 .post-toc {
-    position: sticky;
-    grid-column: 1;
-    grid-row: 1;
+    position: fixed;
     top: 92px;
+    left: 24px;
     z-index: 10;
-    width: auto;
+    width: 280px;
     max-height: calc(100vh - 116px);
     overflow-y: auto;
     margin-top: 34px;
@@ -176,8 +171,7 @@
 }
 
 .blog-post-layout .markdown-body {
-    grid-column: 2;
-    grid-row: 1;
+    margin-left: 356px;
 }
 
 .post-toc::-webkit-scrollbar {
@@ -263,5 +257,9 @@
         overflow-y: visible;
         margin-top: 24px;
         margin-bottom: 8px;
+    }
+
+    .blog-post-layout .markdown-body {
+        margin-left: 0;
     }
 }
