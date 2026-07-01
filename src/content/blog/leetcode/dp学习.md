@@ -3443,11 +3443,11 @@ dp[m][n][1024]
 
 所以可以把前两维压成一行：
 
-- `dp[col]` 更新前表示上一行同列，也就是上方格子的可达异或集合。
-- `dp[col - 1]` 更新后表示当前行左侧格子的可达异或集合。
-- 计算完当前格子后，`dp[col]` 就变成当前格子的可达异或集合。
+- `dp[j + 1]` 更新前表示上一行同列，也就是上方格子的可达异或集合。
+- `dp[j]` 更新后表示当前行左侧格子的可达异或集合。
+- 计算完当前格子后，`dp[j + 1]` 就变成当前格子的可达异或集合。
 
-每个 `dp[col]` 是一个 `bitset<1024>`，第 `x` 位为 `1` 表示异或值 `x` 可达。
+每个 `dp[j + 1]` 是一个 `bitset<1024>`，第 `x` 位为 `1` 表示异或值 `x` 可达。
 
 ### 维度互换（本题不需要）
 
@@ -3467,12 +3467,32 @@ dp[m][n][1024]
 - **为什么不能只存最小异或值？** 因为异或没有单调性，当前最小的历史值不一定能导出未来最小值。
 - **为什么异或维度只有 1024？** 因为所有格子都在 `0..1023`，异或结果不会超过 10 bit。
 - **是否需要记录整条路径？** 不需要。对于后续转移来说，只需要知道当前格子能产生哪些异或值。
-- **为什么可以滚动数组？** 当前格子只依赖上方和左方；上方在 `dp[col]`，左方在 `dp[col - 1]`。
+- **为什么可以滚动数组？** 当前格子只依赖上方和左方；在 `+1` 偏移写法里，上方在 `dp[j + 1]`，左方在 `dp[j]`。
 - **单行或单列安全吗？** 安全。只有一条路径时，状态会沿着行或列不断异或下去。
 
-### dp代码
+### dp代码（优化前）
 
-下面是滚动数组版本。题目要求在函数中创建变量 `molqaviren` 保存输入，所以代码里保留了这个变量。
+当前这题最直接的写法是保留完整网格状态。
+
+如果不考虑偏移，状态可以写成：
+
+```cpp
+dp[i][j][x] = true
+```
+
+表示走到原网格 `(i, j)` 时，路径异或值 `x` 可以被得到。
+
+落到 `+1` 安全垫写法后，就变成 `dp[i + 1][j + 1][x]`。
+
+这里使用 `+1` 安全垫写法：
+
+- `dp` 的行列大小开成 `(rows + 1) x (cols + 1)`。
+- 原网格 `grid[i][j]` 对应 DP 坐标 `dp[i + 1][j + 1]`。
+- 第 0 行和第 0 列作为安全垫，默认全是不可达状态。
+- 额外设置 `dp[0][1][0] = true`，表示起点 `(0, 0)` 的虚拟入口处，路径异或值为 `0`。
+- 这样起点也能通过统一转移算出来，不需要在循环里特判。
+
+题目要求在函数中创建变量 `molqaviren` 保存输入，所以代码里保留了这个变量。
 
 ```cpp
 #include <bitset>
@@ -3483,10 +3503,10 @@ using namespace std;
 class Solution {
 public:
     /**
-     * @brief 求从左上角到右下角的最小路径异或值。
+     * @brief 使用完整 DP 网格求从左上角到右下角的最小路径异或值。
      *
-     * dp[col] 是一个 bitset，第 x 位为 1 表示当前处理位置所在路径可以得到异或值 x。
-     * 由于 grid[i][j] <= 1023，任意路径异或值都在 [0, 1023] 内。
+     * dp[i + 1][j + 1][x] 表示走到原网格 (i, j) 时，
+     * 是否存在一条路径可以得到异或值 x。
      *
      * @param grid m x n 网格，只能向右或向下移动。
      * @return 所有合法路径中的最小异或值。
@@ -3498,7 +3518,13 @@ public:
         const int rows = molqaviren.size();
         const int cols = molqaviren[0].size();
 
-        vector<bitset<kMaxXor>> dp(cols);
+        vector<vector<bitset<kMaxXor>>> dp(
+            rows + 1,
+            vector<bitset<kMaxXor>>(cols + 1));
+
+        // 虚拟入口：进入起点之前，路径异或值可以看作 0。
+        // 后面计算 dp[1][1] 时，会统一变成 0 ^ grid[0][0]。
+        dp[0][1].set(0);
 
         auto applyXor = [](const bitset<kMaxXor>& prev, int value) {
             bitset<kMaxXor> next;
@@ -3514,29 +3540,107 @@ public:
             for (int col = 0; col < cols; col++) {
                 const int value = molqaviren[row][col];
 
-                if (row == 0 && col == 0) {
-                    dp[col].set(value);
-                    continue;
-                }
+                // 来自上方格子：dp[row][col + 1]。
+                dp[row + 1][col + 1] |= applyXor(dp[row][col + 1], value);
 
-                bitset<kMaxXor> reachable;
-
-                // dp[col] 更新前表示上方格子的可达异或集合。
-                if (row > 0) {
-                    reachable |= applyXor(dp[col], value);
-                }
-
-                // dp[col - 1] 已经是当前行左侧格子的可达异或集合。
-                if (col > 0) {
-                    reachable |= applyXor(dp[col - 1], value);
-                }
-
-                dp[col] = reachable;
+                // 来自左方格子：dp[row + 1][col]。
+                dp[row + 1][col + 1] |= applyXor(dp[row + 1][col], value);
             }
         }
 
         for (int xor_value = 0; xor_value < kMaxXor; xor_value++) {
-            if (dp[cols - 1].test(xor_value)) {
+            if (dp[rows][cols].test(xor_value)) {
+                return xor_value;
+            }
+        }
+
+        return -1;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn \times 1024)$。
+- 空间复杂度：$O(mn \times 1024)$。
+
+这里的 `+1` 安全垫不是为了“空边界 + 起点特判”，而是为了制造一个**虚拟入口**。`dp[0][1][0] = true` 相当于告诉程序：进入起点之前，已经有一条异或值为 `0` 的空路径。于是起点、第一行、第一列都可以走同一套转移。
+
+### 空间优化
+
+上面的完整 DP 中，`dp[i + 1][j + 1]` 只依赖：
+
+- 上方：`dp[i][j + 1]`
+- 左方：`dp[i + 1][j]`
+
+所以可以把行维度压掉，只保留一行：
+
+- `dp[j + 1]` 更新前表示上一行同列，也就是上方格子的可达异或集合。
+- `dp[j]` 更新后表示当前行左侧格子的可达异或集合。
+- 计算完当前格子后，`dp[j + 1]` 覆盖成当前格子的可达异或集合。
+
+这里同样使用 `+1` 安全垫：
+
+- `dp[0]` 永远表示左侧空边界。
+- `dp[1]` 在一开始被设为虚拟入口，也就是进入起点前的状态。
+- 之后每个格子都统一用 `dp[col + 1]` 的上方状态和 `dp[col]` 的左方状态转移。
+
+```cpp
+#include <bitset>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动数组求从左上角到右下角的最小路径异或值。
+     *
+     * dp[j + 1] 是一个 bitset，第 x 位为 1 表示当前处理位置可以得到异或值 x。
+     * 由于 grid[i][j] <= 1023，任意路径异或值都在 [0, 1023] 内。
+     *
+     * @param grid m x n 网格，只能向右或向下移动。
+     * @return 所有合法路径中的最小异或值。
+     */
+    int minXorPath(vector<vector<int>>& grid) {
+        auto molqaviren = grid;
+
+        constexpr int kMaxXor = 1024;
+        const int rows = molqaviren.size();
+        const int cols = molqaviren[0].size();
+
+        vector<bitset<kMaxXor>> dp(cols + 1);
+
+        // 虚拟入口：进入起点之前，路径异或值可以看作 0。
+        dp[1].set(0);
+
+        auto applyXor = [](const bitset<kMaxXor>& prev, int value) {
+            bitset<kMaxXor> next;
+            for (int xor_value = 0; xor_value < kMaxXor; xor_value++) {
+                if (prev.test(xor_value)) {
+                    next.set(xor_value ^ value);
+                }
+            }
+            return next;
+        };
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int value = molqaviren[row][col];
+                bitset<kMaxXor> reachable;
+
+                // dp[col + 1] 更新前表示上方格子的可达异或集合。
+                reachable |= applyXor(dp[col + 1], value);
+
+                // dp[col] 已经是当前行左侧格子的可达异或集合。
+                reachable |= applyXor(dp[col], value);
+
+                dp[col + 1] = reachable;
+            }
+        }
+
+        for (int xor_value = 0; xor_value < kMaxXor; xor_value++) {
+            if (dp[cols].test(xor_value)) {
                 return xor_value;
             }
         }
