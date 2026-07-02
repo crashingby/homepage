@@ -213,6 +213,9 @@ def softmax_kernel(
         tl.store(output_ptrs, softmax_output, mask=mask)
 ```
 
+## 图片辅助理解
+
+![Triton 融合softmax示意图](/blog-assets/gpu-programming/triton-fused-softmax/融合softmax.svg)
 ## 为什么这里是 Persistent Kernel
 
 普通写法可能会直接启动 `grid = (n_rows,)`，也就是一行对应一个 Triton program。
