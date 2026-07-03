@@ -3672,3 +3672,347 @@ public:
 - 最后不是取指定 `k`，而是在终点的可达异或集合里找最小值。
 
 这道题的核心手感是：**当目标函数是 XOR 的最小值时，不要把它当成普通最小值 DP；先把所有可达 XOR 状态保留下来，再从可达集合里取最小。**
+
+## [3418. 机器人可以获得的最大金币数 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-amount-of-money-robot-can-earn/description/)
+
+给你一个 `m x n` 的网格 `coins`。机器人从左上角 `(0, 0)` 出发，只能向右或向下走，最终到达右下角 `(m - 1, n - 1)`。
+
+每个格子有一个值 `coins[i][j]`：
+
+- 如果 `coins[i][j] >= 0`，机器人获得这些金币。
+- 如果 `coins[i][j] < 0`，机器人遇到强盗，会损失 `abs(coins[i][j])` 枚金币。
+- 机器人最多可以**感化 2 个强盗**，让这两个负数格子不产生损失。
+
+注意：最终金币数可以是负数。
+
+返回机器人能获得的最大金币数。
+
+**示例 1：**
+
+**输入：** `coins = [[0,1,-1],[1,-2,3],[2,-3,4]]`
+
+**输出：** `8`
+
+**解释：** 一条最优路径是：
+
+- `(0, 0)`：获得 `0`。
+- `(0, 1)`：获得 `1`。
+- `(1, 1)`：遇到 `-2`，使用一次感化能力，不损失金币。
+- `(1, 2)`：获得 `3`。
+- `(2, 2)`：获得 `4`。
+
+总金币数是 `0 + 1 + 0 + 3 + 4 = 8`。
+
+**示例 2：**
+
+**输入：** `coins = [[10,10,10],[10,10,10]]`
+
+**输出：** `40`
+
+### 递归切入（探索逻辑）
+
+这道题看起来像“最大路径和”，但多了一个限制：**最多可以感化 2 个负数格子**。
+
+所以状态不能只写成：
+
+```cpp
+dp[i][j] = max(dp[i - 1][j], dp[i][j - 1]) + coins[i][j];
+```
+
+原因是：到达同一个格子时，剩余的感化次数不同，后续价值完全不同。
+
+例如两条路径到达 `(i, j)` 时金币数都是 `10`：
+
+- 路径 A 已经用完 2 次感化能力。
+- 路径 B 还没有用过感化能力。
+
+如果后面有一个 `-1000`，路径 B 显然更有价值。因此状态必须记录：**已经用了几次感化能力**。
+
+从递归角度看，走到 `(i, j)` 的最后一步只可能来自：
+
+- 上方 `(i - 1, j)`。
+- 左方 `(i, j - 1)`。
+
+设 `dfs(i, j, used)` 表示走到 `(i, j)`，并且已经使用了 `used` 次感化能力时，能获得的最大金币数。
+
+当前格子有两种处理方式：
+
+- **不感化当前格子**：无论正负，都直接加上 `coins[i][j]`。
+- **感化当前格子**：只有当前格子是负数，且 `used > 0` 时才有意义；当前格子贡献 `0`，状态来自 `used - 1`。
+
+所以递归转移大概是：
+
+$$
+dfs(i, j, used) =
+\max(dfs(i - 1, j, used), dfs(i, j - 1, used)) + coins[i][j]
+$$
+
+如果 `coins[i][j] < 0` 且 `used > 0`，还可以选择感化当前强盗：
+
+$$
+dfs(i, j, used) =
+\max(dfs(i, j, used),
+     dfs(i - 1, j, used - 1),
+     dfs(i, j - 1, used - 1))
+$$
+
+这里第二个转移没有加 `coins[i][j]`，因为强盗被感化后不会抢金币。
+
+### 定义定型（规范表达，处理偏移）
+
+这道题的额外维度非常小：最多只感化 `2` 个强盗，所以 `used` 只有 `0, 1, 2` 三种状态。
+
+状态定义：
+
+- `dp[i + 1][j + 1][used]` 表示走到原网格 `(i, j)`，并且已经使用了 `used` 次感化能力时，最多可以获得多少金币。
+
+这里继续使用 `+1` 安全垫写法：
+
+- 原网格 `coins[i][j]` 对应 DP 坐标 `dp[i + 1][j + 1]`。
+- 第 0 行和第 0 列作为安全垫，初始化为负无穷，表示不可达。
+- 设置 `dp[0][1][0] = 0` 作为虚拟入口，表示进入起点之前，金币数为 `0`，已经使用 `0` 次感化能力。
+- 这样起点 `(0, 0)` 也能通过统一转移算出来。
+
+转移时，令：
+
+```cpp
+best_prev = max(dp[i][j + 1][used], dp[i + 1][j][used]);
+```
+
+它表示从上方或左方走来，且已经使用 `used` 次感化能力时的最好结果。
+
+如果不感化当前格子：
+
+```cpp
+dp[i + 1][j + 1][used] = best_prev + coins[i][j];
+```
+
+如果当前格子是负数，并且这一步选择感化它：
+
+```cpp
+dp[i + 1][j + 1][used] =
+    max(dp[i][j + 1][used - 1], dp[i + 1][j][used - 1]);
+```
+
+最终答案不是只看 `used = 2`，因为题目说的是**最多**感化 2 个强盗。答案应该是：
+
+```cpp
+max(dp[m][n][0], dp[m][n][1], dp[m][n][2])
+```
+
+### 维度降级（空间优化）
+
+朴素写法可以开三维：
+
+```cpp
+dp[m + 1][n + 1][3]
+```
+
+其中第三维只有 `3`，所以完整 DP 也能过。
+
+但当前格子 `(i, j)` 仍然只依赖：
+
+- 上方：`dp[i][j + 1][used]`
+- 左方：`dp[i + 1][j][used]`
+
+所以可以把行维度压掉，只保留一行：
+
+- `dp[j + 1][used]` 更新前表示上方格子的状态。
+- `dp[j][used]` 更新后表示当前行左方格子的状态。
+- 算出当前格子后，用 `current` 覆盖 `dp[j + 1]`。
+
+### 维度互换（本题不需要）
+
+这道题的行列规模是 `m, n <= 500`，第三维固定为 `3`。
+
+不需要做行列互换。普通从上到下、从左到右扫描即可。
+
+### 状态“完备性”自检
+
+- **为什么不能只存最大金币数？** 因为剩余感化能力会影响后续选择，同一个格子必须区分已经用了几次感化能力。
+- **为什么第三维只需要 3？** 因为最多感化 2 个强盗，`used` 只可能是 `0, 1, 2`。
+- **正数格子需要感化吗？** 不需要。感化只用于防止负数格子的损失，正数格子直接拿金币。
+- **答案为什么取三个状态最大值？** 因为题目是“最多感化 2 个”，不要求必须用完。
+- **为什么可以滚动数组？** 当前格子只依赖上方和左方；在 `+1` 偏移写法里，上方在 `dp[j + 1]`，左方在 `dp[j]`。
+
+### dp代码（优化前）
+
+完整 DP 版本直接保存每个格子的三种 `used` 状态。
+
+这里的关键是用 `kNegInf` 表示不可达状态。不能用 `0` 初始化，因为这道题的答案可能是负数。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用完整三维 DP 求机器人从左上角到右下角的最大金币数。
+     *
+     * dp[i + 1][j + 1][used] 表示走到原网格 (i, j) 时，
+     * 已经使用 used 次感化能力后可以获得的最大金币数。
+     *
+     * @param coins m x n 网格，只能向右或向下移动。
+     * @return 在最多感化 2 个强盗的限制下，路径上的最大金币数。
+     */
+    int maximumAmount(vector<vector<int>>& coins) {
+        constexpr int kMaxNeutralize = 2;
+        constexpr int kNegInf = numeric_limits<int>::min() / 4;
+        using State = array<int, kMaxNeutralize + 1>;
+
+        const int rows = coins.size();
+        const int cols = coins[0].size();
+
+        vector<vector<State>> dp(rows + 1, vector<State>(cols + 1));
+        for (auto& row : dp) {
+            for (auto& state : row) {
+                state.fill(kNegInf);
+            }
+        }
+
+        // 虚拟入口：进入起点之前，金币数为 0，且没有使用感化能力。
+        dp[0][1][0] = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int value = coins[row][col];
+
+                for (int used = 0; used <= kMaxNeutralize; used++) {
+                    const int best_prev = max(
+                        dp[row][col + 1][used],
+                        dp[row + 1][col][used]);
+
+                    // 不感化当前格子：正数直接获得，负数直接损失。
+                    dp[row + 1][col + 1][used] = max(
+                        dp[row + 1][col + 1][used],
+                        best_prev + value);
+
+                    if (value < 0 && used > 0) {
+                        const int best_prev_without_this_neutralize = max(
+                            dp[row][col + 1][used - 1],
+                            dp[row + 1][col][used - 1]);
+
+                        // 感化当前强盗：当前格子的贡献按 0 计算。
+                        dp[row + 1][col + 1][used] = max(
+                            dp[row + 1][col + 1][used],
+                            best_prev_without_this_neutralize);
+                    }
+                }
+            }
+        }
+
+        return max({
+            dp[rows][cols][0],
+            dp[rows][cols][1],
+            dp[rows][cols][2],
+        });
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn \times 3)$，也就是 $O(mn)$。
+- 空间复杂度：$O(mn \times 3)$，也就是 $O(mn)$。
+
+### 空间优化
+
+完整 DP 中，当前格子只依赖上方和左方，所以可以压成一维。
+
+滚动数组里：
+
+- `dp[col + 1][used]` 更新前表示上方格子的状态。
+- `dp[col][used]` 表示当前行左方格子的状态。
+- `current[used]` 临时保存当前格子的三个状态，算完后覆盖 `dp[col + 1]`。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动数组求机器人从左上角到右下角的最大金币数。
+     *
+     * dp[col + 1][used] 更新前表示上方格子的状态；
+     * dp[col][used] 表示当前行左方格子的状态。
+     *
+     * @param coins m x n 网格，只能向右或向下移动。
+     * @return 在最多感化 2 个强盗的限制下，路径上的最大金币数。
+     */
+    int maximumAmount(vector<vector<int>>& coins) {
+        constexpr int kMaxNeutralize = 2;
+        constexpr int kNegInf = numeric_limits<int>::min() / 4;
+        using State = array<int, kMaxNeutralize + 1>;
+
+        const int rows = coins.size();
+        const int cols = coins[0].size();
+
+        vector<State> dp(cols + 1);
+        for (auto& state : dp) {
+            state.fill(kNegInf);
+        }
+
+        // 虚拟入口：进入起点之前，金币数为 0，且没有使用感化能力。
+        dp[1][0] = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int value = coins[row][col];
+                State current;
+                current.fill(kNegInf);
+
+                for (int used = 0; used <= kMaxNeutralize; used++) {
+                    const int best_prev = max(dp[col + 1][used], dp[col][used]);
+
+                    // 不感化当前格子。
+                    current[used] = max(current[used], best_prev + value);
+
+                    if (value < 0 && used > 0) {
+                        const int best_prev_without_this_neutralize = max(
+                            dp[col + 1][used - 1],
+                            dp[col][used - 1]);
+
+                        // 感化当前强盗，当前格子不产生损失。
+                        current[used] = max(
+                            current[used],
+                            best_prev_without_this_neutralize);
+                    }
+                }
+
+                dp[col + 1] = current;
+            }
+        }
+
+        return max({dp[cols][0], dp[cols][1], dp[cols][2]});
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn \times 3)$，也就是 $O(mn)$。
+- 空间复杂度：$O(n \times 3)$，也就是 $O(n)$。
+
+### 和 3882 的共同点
+
+3418 和 3882 的共同手感是：**网格位置不够，必须再加一个“历史状态维度”**。
+
+- 3882 的历史状态是“当前路径异或值是多少”。
+- 3418 的历史状态是“已经感化了几个强盗”。
+
+只要这个历史状态范围很小，就可以放心把它塞进 DP 维度里：
+
+- 3882 的异或值范围是 `0..1023`。
+- 3418 的感化次数范围是 `0..2`。
+
+这类题最重要的不是急着优化空间，而是先问自己：**只知道走到 `(i, j)` 够不够？如果不够，还需要记录哪一个会影响未来决策的历史量？**
