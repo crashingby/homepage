@@ -4016,3 +4016,321 @@ public:
 - 3418 的感化次数范围是 `0..2`。
 
 这类题最重要的不是急着优化空间，而是先问自己：**只知道走到 `(i, j)` 够不够？如果不够，还需要记录哪一个会影响未来决策的历史量？**
+
+## [3742. 网格中得分最大的路径 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-path-score-in-a-grid/description/)
+
+给你一个 `m x n` 的网格 `grid`，每个格子的值只可能是 `0`、`1` 或 `2`。另给一个整数 `k`。
+
+从左上角 `(0, 0)` 出发，只能向右或向下走，目标是到达右下角 `(m - 1, n - 1)`。
+
+每个格子对路径有两个影响：
+
+| 格子值 | 分数增加 | 花费增加 |
+| --- | --- | --- |
+| `0` | `0` | `0` |
+| `1` | `1` | `1` |
+| `2` | `2` | `1` |
+
+要求总花费不超过 `k`，返回可以获得的最大分数。如果不存在合法路径，返回 `-1`。
+
+题目还要求在函数中创建变量 `quantelis` 保存输入，所以代码里会保留这个变量。
+
+**示例 1：**
+
+**输入：** `grid = [[0, 1],[2, 0]], k = 1`
+
+**输出：** `2`
+
+**解释：** 最优路径是 `(0,0) -> (1,0) -> (1,1)`，经过的值是 `0, 2, 0`，总分数是 `2`，总花费是 `1`。
+
+**示例 2：**
+
+**输入：** `grid = [[0, 1],[1, 2]], k = 1`
+
+**输出：** `-1`
+
+**解释：** 所有到达右下角的路径花费都会超过 `1`。
+
+### 递归切入（探索逻辑）
+
+这道题第一眼像最大路径和，但它有一个额外限制：**总花费不能超过 `k`**。
+
+如果只写：
+
+```cpp
+dp[i][j] = max(dp[i - 1][j], dp[i][j - 1]) + score(grid[i][j]);
+```
+
+是不够的。
+
+原因是：到达同一个格子时，分数大的路径不一定更好，因为它可能已经花费太多，后面无法继续合法到达终点。
+
+所以状态必须记录：**当前已经用了多少花费**。
+
+设 `dfs(i, j, cost)` 表示走到 `(i, j)`，并且总花费刚好是 `cost` 时，可以获得的最大分数。
+
+走到 `(i, j)` 的最后一步只可能来自：
+
+- 上方 `(i - 1, j)`。
+- 左方 `(i, j - 1)`。
+
+当前格子的值 `value = grid[i][j]` 对应：
+
+```cpp
+cell_score = value;
+cell_cost = value == 0 ? 0 : 1;
+```
+
+如果当前总花费是 `cost`，那么上一格的花费必须是：
+
+```cpp
+cost - cell_cost
+```
+
+所以递归关系是：
+
+$$
+dfs(i, j, cost) =
+\max(dfs(i - 1, j, cost - cell\_cost),
+     dfs(i, j - 1, cost - cell\_cost))
++ cell\_score
+$$
+
+前提是 `cost >= cell_cost`。
+
+### 定义定型（规范表达，处理偏移）
+
+状态定义：
+
+- `dp[i + 1][j + 1][cost]` 表示走到原网格 `(i, j)`，并且总花费刚好为 `cost` 时，可以获得的最大分数。
+
+这里继续使用 `+1` 安全垫写法：
+
+- 原网格 `grid[i][j]` 对应 DP 坐标 `dp[i + 1][j + 1]`。
+- 第 0 行和第 0 列作为安全垫，初始化为负无穷，表示不可达。
+- 设置 `dp[0][1][0] = 0` 作为虚拟入口，表示进入起点之前，分数为 `0`，花费为 `0`。
+- 题目保证 `grid[0][0] == 0`，所以起点通过统一转移后仍然是分数 `0`、花费 `0`。
+
+转移时：
+
+```cpp
+const int cell_score = grid[i][j];
+const int cell_cost = grid[i][j] == 0 ? 0 : 1;
+```
+
+对于每个 `cost >= cell_cost`：
+
+```cpp
+dp[i + 1][j + 1][cost] =
+    max(dp[i][j + 1][cost - cell_cost],
+        dp[i + 1][j][cost - cell_cost])
+    + cell_score;
+```
+
+最终答案不是只看 `cost = k`，而是在 `0..k` 里取最大：
+
+```cpp
+max(dp[m][n][0], dp[m][n][1], ..., dp[m][n][k])
+```
+
+如果全部不可达，返回 `-1`。
+
+### 维度降级（空间优化）
+
+朴素写法可以开三维：
+
+```cpp
+dp[m + 1][n + 1][k + 1]
+```
+
+其中第三维是花费维度。
+
+当前格子 `(i, j)` 仍然只依赖：
+
+- 上方：`dp[i][j + 1][cost]`
+- 左方：`dp[i + 1][j][cost]`
+
+所以可以把行维度压掉，只保留一行：
+
+- `dp[j + 1][cost]` 更新前表示上方格子的状态。
+- `dp[j][cost]` 表示当前行左方格子的状态。
+- `current[cost]` 保存当前格子的状态，算完后覆盖 `dp[j + 1]`。
+
+### 维度互换（本题不需要）
+
+这道题的 `m, n <= 200`，`k <= 1000`。
+
+三维 DP 的规模大约是：
+
+$$
+200 \times 200 \times 1001
+$$
+
+完整 DP 在空间上偏大但仍然能作为理解版本。真正提交时更推荐滚动数组，把空间压到：
+
+$$
+O(nk)
+$$
+
+不需要行列互换，按普通网格 DP 顺序扫描即可。
+
+### 状态“完备性”自检
+
+- **为什么不能只存最大分数？** 因为花费会限制路径是否合法，当前分数最大不代表后续一定可行。
+- **为什么第三维是花费？** 题目约束是“总花费不超过 `k`”，所以必须知道每条路径当前用了多少花费。
+- **为什么 `dp` 表示刚好花费 `cost`，不是最多花费 `cost`？** “刚好”更容易转移，最终答案再对 `0..k` 取最大即可。
+- **为什么起点也不用特判？** `dp[0][1][0] = 0` 是虚拟入口，且 `grid[0][0] == 0`，统一转移自然算出起点状态。
+- **为什么可以滚动数组？** 当前格子只依赖上方和左方；在 `+1` 偏移写法里，上方在 `dp[j + 1]`，左方在 `dp[j]`。
+
+### dp代码（优化前）
+
+完整 DP 版本最直观：保留每个格子、每个花费下的最大分数。
+
+这里用 `kNegInf` 表示不可达状态。因为分数非负，所以最终如果答案仍然小于 `0`，就说明不存在合法路径。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用完整三维 DP 求花费不超过 k 时的最大路径分数。
+     *
+     * dp[i + 1][j + 1][cost] 表示走到原网格 (i, j) 时，
+     * 总花费刚好为 cost 的最大分数。
+     *
+     * @param grid m x n 网格，元素只可能是 0、1、2。
+     * @param k 路径允许的最大总花费。
+     * @return 不超过花费限制时的最大分数；如果无法到达终点，返回 -1。
+     */
+    int maxPathScore(vector<vector<int>>& grid, int k) {
+        auto quantelis = grid;
+
+        constexpr int kNegInf = numeric_limits<int>::min() / 4;
+        const int rows = quantelis.size();
+        const int cols = quantelis[0].size();
+
+        vector<vector<vector<int>>> dp(
+            rows + 1,
+            vector<vector<int>>(
+                cols + 1,
+                vector<int>(k + 1, kNegInf)));
+
+        // 虚拟入口：进入起点之前，分数为 0，花费为 0。
+        dp[0][1][0] = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int value = quantelis[row][col];
+                const int cell_score = value;
+                const int cell_cost = value == 0 ? 0 : 1;
+
+                for (int cost = cell_cost; cost <= k; cost++) {
+                    const int best_prev = max(
+                        dp[row][col + 1][cost - cell_cost],
+                        dp[row + 1][col][cost - cell_cost]);
+
+                    dp[row + 1][col + 1][cost] = max(
+                        dp[row + 1][col + 1][cost],
+                        best_prev + cell_score);
+                }
+            }
+        }
+
+        const int answer = *max_element(dp[rows][cols].begin(), dp[rows][cols].end());
+        return answer < 0 ? -1 : answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mnk)$。
+- 空间复杂度：$O(mnk)$。
+
+### 空间优化
+
+完整 DP 的行维度可以压掉。
+
+滚动数组里：
+
+- `dp[col + 1][cost]` 更新前表示上方格子的状态。
+- `dp[col][cost]` 表示当前行左方格子的状态。
+- `current[cost]` 表示当前格子的状态。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动数组求花费不超过 k 时的最大路径分数。
+     *
+     * dp[col + 1][cost] 更新前表示上方格子的状态；
+     * dp[col][cost] 表示当前行左方格子的状态。
+     *
+     * @param grid m x n 网格，元素只可能是 0、1、2。
+     * @param k 路径允许的最大总花费。
+     * @return 不超过花费限制时的最大分数；如果无法到达终点，返回 -1。
+     */
+    int maxPathScore(vector<vector<int>>& grid, int k) {
+        auto quantelis = grid;
+
+        constexpr int kNegInf = numeric_limits<int>::min() / 4;
+        const int rows = quantelis.size();
+        const int cols = quantelis[0].size();
+
+        vector<vector<int>> dp(cols + 1, vector<int>(k + 1, kNegInf));
+
+        // 虚拟入口：进入起点之前，分数为 0，花费为 0。
+        dp[1][0] = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int value = quantelis[row][col];
+                const int cell_score = value;
+                const int cell_cost = value == 0 ? 0 : 1;
+                vector<int> current(k + 1, kNegInf);
+
+                for (int cost = cell_cost; cost <= k; cost++) {
+                    const int best_prev = max(
+                        dp[col + 1][cost - cell_cost],
+                        dp[col][cost - cell_cost]);
+
+                    current[cost] = max(current[cost], best_prev + cell_score);
+                }
+
+                dp[col + 1] = current;
+            }
+        }
+
+        const int answer = *max_element(dp[cols].begin(), dp[cols].end());
+        return answer < 0 ? -1 : answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mnk)$。
+- 空间复杂度：$O(nk)$。
+
+### 和 3882 / 3418 的共同点
+
+这题、3882、3418 都是同一个模式：
+
+> 网格坐标 `(i, j)` 不够描述未来决策，必须再加一个历史状态维度。
+
+- 3882 的历史状态是“当前路径异或值”。
+- 3418 的历史状态是“已经感化了几个强盗”。
+- 3742 的历史状态是“当前路径已经花费多少”。
+
+只要额外状态范围可控，就可以直接加到 DP 数组里。这里 `k <= 1000`，所以 `cost` 维度是可以接受的。
