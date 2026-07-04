@@ -74,7 +74,50 @@ include/cute/arch/mma_sm90_gmma.hpp
 | `SM70` | 最早支持该指令的 GPU 架构，这里是 Volta。 |
 | `8x8x4` | 单条 MMA 的逻辑形状，表示 $M=8, N=8, K=4$。 |
 | `F32F16F16F32` | 可以按 `D/A/B/C` 理解：输出 D 是 `float`，A/B 是 `half`，输入累加器 C 是 `float`。 |
-| `NT` | A 和 B 的排列方式。对这个 Operation，PTX 指令里是 `.col.row`。 |
+| `NT` | CuTe Operation 后缀，描述这条 PTX MMA 指令要求的 A/B fragment 布局。对这个 Operation，PTX 指令里是 `.col.row`。 |
+
+### `T/N` 后缀怎么理解
+
+这里的 `T/N` 确实来自比较传统的 BLAS / GEMM 命名习惯，但要注意：**BLAS 默认按 column-major（列主序）理解矩阵**。所以 `N` 和 `T` 不是直接等价于 PTX 里的 `.row/.col`，中间还隔着一层 column-major 语境。
+
+先看 BLAS 语义：
+
+| 标志 | BLAS 语义 | 在 column-major 基础上的直观效果 | PTX fragment 视角 |
+| --- | --- | --- | --- |
+| `N` | No transpose，不转置使用原矩阵。 | 原矩阵仍按列主序解释。 | 更接近 `.col`。 |
+| `T` | Transpose，转置后再参与 GEMM。 | 列主序矩阵转置以后，逻辑上变成按行方向连续的视角。 | 更接近 `.row`。 |
+
+因此在 SM80 这类 Operation 名字里：
+
+```text
+_TN  ->  A 使用 T 视角，B 使用 N 视角
+     ->  A 对应 row，B 对应 col
+     ->  PTX 写成 .row.col
+```
+
+这就是为什么 `SM80_16x8x16_F32F16F16F32_TN` 的源码里是：
+
+```cpp
+"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ..."
+```
+
+它不是说 `N` 本身等于 row 或者 `T` 本身等于 col，恰好相反：**在 BLAS 的列主序前提下，`N` 对应 column-major 视角，`T` 对应 row-major 视角**。
+
+所以更稳妥的理解是：
+
+- **Operation 名字里的 `T/N` 保留了 BLAS 风格的 transA/transB 命名**，默认站在 column-major 矩阵的语境里。
+- **PTX 里的 `.row/.col` 是底层指令真正看到的 fragment 布局**，例如 `_TN` 最终落到 `.row.col`。
+- **它不是现代 C++ 代码里用户输入矩阵的唯一全局布局**。用户可能用 row-major Tensor，也可能用 column-major Tensor；CuTe 会通过上层 `Tensor/Layout/Copy` 把数据整理成 Operation 需要的 fragment。
+- 真正可靠的对应关系要看 Operation 里的 PTX 字符串，以及 `MMA_Traits` 里给出的 `ALayout/BLayout`。
+
+以源码里能直接看到的两个例子为准：
+
+| Operation | PTX layout 修饰符 | 指令级含义 |
+| --- | --- | --- |
+| `SM70_8x8x4_F32F16F16F32_NT` | `.col.row` | A fragment 按 column 形式解释，B fragment 按 row 形式解释。 |
+| `SM80_16x8x16_F32F16F16F32_TN` | `.row.col` | A fragment 按 row 形式解释，B fragment 按 column 形式解释。 |
+
+所以可以把 `_TN` 翻译成“BLAS column-major 语境下的 A 转置、B 不转置”，但不要进一步误读成“用户传进来的 A 一定是转置矩阵、B 一定是列主序矩阵”。在 CuTe 里，用户矩阵从全局内存到共享内存、再到寄存器 fragment，中间会经过 `Tensor`、`Layout`、`Copy_Atom`、`TiledCopy` 和 `TiledMMA` 的组织。到了 Operation 这一层，名字最终要落到的是：**这条底层 MMA 指令希望收到什么样的 A/B fragment**。
 
 ### `SM70_8x8x4_F32F16F16F32_NT`
 
@@ -335,6 +378,53 @@ struct SM80_16x8x16_F32F16F16F32_TN
       float const& c2, float const& c3);
 };
 ```
+
+这里的 `_TN` 对应源码里的 `.row.col`：
+
+```cpp
+asm volatile(
+  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+  : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+  : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
+    "r"(b0), "r"(b1),
+    "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+```
+
+这段源码说明了两件事：
+
+- `ARegisters = uint32_t[4]`，所以每个 lane 给 A operand 提供 4 个 32-bit 寄存器。
+- `BRegisters = uint32_t[2]`，所以每个 lane 给 B operand 提供 2 个 32-bit 寄存器。
+- PTX 后缀是 `.row.col`，也就是这条 SM80 MMA 指令按 row 形式解释 A fragment，按 column 形式解释 B fragment。
+
+### 为什么 SM80 源码里几乎都是 `_TN`
+
+阅读 `include/cute/arch/mma_sm80.hpp` 会发现，常见的 F16、BF16、TF32、INT8、INT4、B1 MMA Operation 基本都命名成 `_TN`，并且对应 PTX 字符串也基本都是 `.row.col`：
+
+```cpp
+SM80_16x8x16_F16F16F16F16_TN   -> mma.sync.aligned.m16n8k16.row.col...
+SM80_16x8x16_F32F16F16F32_TN   -> mma.sync.aligned.m16n8k16.row.col...
+SM80_16x8x8_F32TF32TF32F32_TN  -> mma.sync.aligned.m16n8k8.row.col...
+SM80_16x8x32_S32S8S8S32_TN     -> mma.sync.aligned.m16n8k32.row.col...
+```
+
+原因不是说 Ampere 只能计算一种用户矩阵布局，而是 **Ampere 的 `mma.sync.aligned.m16n8k*` Operation 层使用了比较统一的指令级 operand 约定**：A 用 row 形式，B 用 column 形式。按前面 BLAS column-major 的命名方式，这正好记作 `_TN`：
+
+```text
+A: T -> column-major 矩阵转置后使用 -> row 视角
+B: N -> column-major 矩阵不转置使用 -> col 视角
+```
+
+至于用户侧想做普通 GEMM、转置 GEMM，或者全局内存里 A/B 是 row-major / column-major，都不应该在 Operation 结构体这一层解决。
+
+CuTe 通常把这些差异放在更上层处理：
+
+- **全局内存 Tensor 的 layout** 决定用户矩阵坐标如何映射到全局地址。
+- **共享内存 layout / swizzle** 决定 tile 在 shared memory 里怎么排，避免 bank conflict，同时适配后续 `ldmatrix`。
+- **`Copy_Atom` / `TiledCopy`** 决定从 shared memory 到寄存器 fragment 的搬运方式，比如是否使用 `ldmatrix.trans`。
+- **`MMA_Traits` / `TiledMMA`** 决定每个 lane 拿到的 fragment 如何对应到 MMA 的 A/B/C 坐标。
+
+也就是说，SM80 这里的 `_TN` 更像一个底层“标准插座”：Tensor Core 指令希望 A/B fragment 以 `.row.col` 方式插进来。不同 GEMM 变体要做的是在前面的布局和搬运阶段把数据整理成这个插座需要的形状，而不是在 `mma_sm80.hpp` 里为每种用户矩阵转置形式都写一套 Operation。
 
 **类型别名**
 
