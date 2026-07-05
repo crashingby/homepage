@@ -1,1 +1,1225 @@
-<svg xmlns="http://www.w3.org/2000/svg" style="background: transparent; background-color: transparent;" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="2146px" height="3050px" viewBox="-0.5 -0.5 2146 3050" content="&lt;mxfile&gt;&lt;diagram name=&quot;第 1 页&quot; id=&quot;qTDLFhJpBMYdL5CT5CZy&quot;&gt;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&lt;/diagram&gt;&lt;/mxfile&gt;"><defs/><g><g><rect x="1376" y="630" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1377px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">0</div></div></div></foreignObject><text x="1416" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">0</text></switch></g></g><g><rect x="1456" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1457px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">1</div></div></div></foreignObject><text x="1496" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">1</text></switch></g></g><g><rect x="1536" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1537px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">2</div></div></div></foreignObject><text x="1576" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">2</text></switch></g></g><g><rect x="1616" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1617px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">3</div></div></div></foreignObject><text x="1656" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">3</text></switch></g></g><g><rect x="1376" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1456" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1536" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1456" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1536" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1456" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1536" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="630" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1096" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1176" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1256" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1016" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1096" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1176" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1256" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1096" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1176" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1256" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1096" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1176" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1256" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="270" width="320" height="320" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1616" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1616" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1616" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1616" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="1570" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1610px; margin-left: 1377px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">0</div></div></div></foreignObject><text x="1416" y="1617" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">0</text></switch></g></g><g><rect x="1456" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1610px; margin-left: 1457px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">2</div></div></div></foreignObject><text x="1496" y="1617" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">2</text></switch></g></g><g><rect x="1536" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1690px; margin-left: 1377px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">1</div></div></div></foreignObject><text x="1416" y="1697" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">1</text></switch></g></g><g><rect x="1456" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1690px; margin-left: 1457px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">3</div></div></div></foreignObject><text x="1496" y="1697" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">3</text></switch></g></g><g><rect x="1536" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1456" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1536" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1456" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1536" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="1570" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1096" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1176" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1256" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1016" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1096" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1176" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1256" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/></g><g><rect x="1016" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1096" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1176" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1256" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1016" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1096" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1176" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1256" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1210" width="320" height="320" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1376" y="1210" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="1210" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="1210" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1210" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1290" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="1290" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="1290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1370" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="1370" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="1370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1376" y="1450" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1456" y="1450" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/></g><g><rect x="1536" y="1450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1616" y="1450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1120" y="0" width="546" height="170" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 85px; margin-left: 1121px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">假如0、1、2、3被调度上了<br />那么需要读取20个A/B Tile到SRAM。<br />并且B Tile的个数很多，可能导致<div>L2缓存命中率下降</div></div></div></div></foreignObject><text x="1393" y="95" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">假如0、1、2、3被调度上了...</text></switch></g></g><g><rect x="1070" y="1000" width="546" height="170" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 1085px; margin-left: 1071px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">如果是这种分组的情况，那么只用读取16个Tile。并且访问更密集，缓存命中可能更优</div></div></div></foreignObject><text x="1343" y="1095" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">如果是这种分组的情况，那么只用读取16个Tile。并且访问更密集，缓存命中可能更优</text></switch></g></g><g><rect x="1106" y="1960" width="546" height="170" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 2045px; margin-left: 1107px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">但是这只是理论情况。现实中，哪个块被调度上SM是随机的，也可能是离得很远的C Tile。这时候按组排布提升空间也有限。并不能作为完全有效的优化</div></div></div></foreignObject><text x="1379" y="2055" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">但是这只是理论情况。现实中，哪个块被调度上SM是随机的，也可能是离得很远的C Tile。这时候按组排布提升空间也有限。并不能作为完全有效的优化</text></switch></g></g><g><rect x="1206" y="2290" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1206" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1207px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">0</div></div></div></foreignObject><text x="1246" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">0</text></switch></g></g><g><rect x="1286" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1287px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">2</div></div></div></foreignObject><text x="1326" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">2</text></switch></g></g><g><rect x="1366" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1367px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">4</div></div></div></foreignObject><text x="1406" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">4</text></switch></g></g><g><rect x="1446" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1447px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">6</div></div></div></foreignObject><text x="1486" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">6</text></switch></g></g><g><rect x="1206" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1207px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">1</div></div></div></foreignObject><text x="1246" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">1</text></switch></g></g><g><rect x="1286" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1287px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">3</div></div></div></foreignObject><text x="1326" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">3</text></switch></g></g><g><rect x="1366" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1367px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">5</div></div></div></foreignObject><text x="1406" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">5</text></switch></g></g><g><rect x="1446" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1447px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">7</div></div></div></foreignObject><text x="1486" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">7</text></switch></g></g><g><rect x="1206" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1207px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">8</div></div></div></foreignObject><text x="1246" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">8</text></switch></g></g><g><rect x="1286" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1287px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">10</div></div></div></foreignObject><text x="1326" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">10</text></switch></g></g><g><rect x="1366" y="2450" width="80" height="80" fill="#a20025" stroke="#6f0000" pointer-events="all" style="fill: light-dark(rgb(162, 0, 37), rgb(255, 173, 205)); stroke: light-dark(rgb(111, 0, 0), rgb(255, 197, 197));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1367px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #ffffff; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#ffffff, #121212); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">12</div></div></div></foreignObject><text x="1406" y="2497" fill="#ffffff" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">12</text></switch></g></g><g><rect x="1446" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1447px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">14</div></div></div></foreignObject><text x="1486" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">14</text></switch></g></g><g><rect x="1206" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1207px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">9</div></div></div></foreignObject><text x="1246" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">9</text></switch></g></g><g><rect x="1286" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1287px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">11</div></div></div></foreignObject><text x="1326" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">11</text></switch></g></g><g><rect x="1366" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1367px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">13</div></div></div></foreignObject><text x="1406" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">13</text></switch></g></g><g><rect x="1446" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1447px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">15</div></div></div></foreignObject><text x="1486" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">15</text></switch></g></g><g><path d="M 1186 2290 L 1181 2290 Q 1176 2290 1176 2300 L 1176 2440 Q 1176 2450 1171 2450 L 1168.5 2450 Q 1166 2450 1171 2450 L 1173.5 2450 Q 1176 2450 1176 2460 L 1176 2600 Q 1176 2610 1181 2610 L 1186 2610" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="986" y="2430" width="180" height="40" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 178px; height: 1px; padding-top: 2450px; margin-left: 987px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">num_pid_m=4</div></div></div></foreignObject><text x="1076" y="2457" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">num_pid_m=4</text></switch></g></g><g><path d="M 1376 2100 L 1371 2100 Q 1366 2100 1366 2110 L 1366 2250 Q 1366 2260 1361 2260 L 1358.5 2260 Q 1356 2260 1361 2260 L 1363.5 2260 Q 1366 2260 1366 2270 L 1366 2410 Q 1366 2420 1371 2420 L 1376 2420" fill="none" stroke="#000000" stroke-miterlimit="10" transform="rotate(90,1366,2260)" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1281" y="2200" width="170" height="40" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 168px; height: 1px; padding-top: 2220px; margin-left: 1282px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">num_pid_n=4</div></div></div></foreignObject><text x="1366" y="2227" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">num_pid_n=4</text></switch></g></g><g><path d="M 1563 2290 L 1558 2290 Q 1553 2290 1553 2300 L 1553 2360 Q 1553 2370 1548 2370 L 1545.5 2370 Q 1543 2370 1548 2370 L 1550.5 2370 Q 1553 2370 1553 2380 L 1553 2440 Q 1553 2450 1558 2450 L 1563 2450" fill="none" stroke="#000000" stroke-miterlimit="10" transform="translate(1553,0)scale(-1,1)translate(-1553,0)" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1566" y="2350" width="240" height="40" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 238px; height: 1px; padding-top: 2370px; margin-left: 1567px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">GROUP_SIZE_M=2</div></div></div></foreignObject><text x="1686" y="2377" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">GROUP_SIZE_M=2</text></switch></g></g><g><rect x="1566" y="2400" width="580" height="40" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 578px; height: 1px; padding-top: 2420px; margin-left: 1567px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">num_pid_in_group=GROUP_SIZE_M*num_pid_n=8</div></div></div></foreignObject><text x="1856" y="2427" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">num_pid_in_group=GROUP_SIZE_M*num_pid_n=8</text></switch></g></g><g><path d="M 1456 2710 L 1407.7 2536.14" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="stroke" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/><path d="M 1406.3 2531.08 L 1411.55 2536.89 L 1407.7 2536.14 L 1404.8 2538.76 Z" fill="#000000" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="fill: light-dark(rgb(0, 0, 0), rgb(255, 255, 255)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="1416" y="2710" width="100" height="40" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 98px; height: 1px; padding-top: 2730px; margin-left: 1417px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">pid=12</div></div></div></foreignObject><text x="1466" y="2737" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">pid=12</text></switch></g></g><g><rect x="1296" y="2745" width="400" height="70" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 398px; height: 1px; padding-top: 2780px; margin-left: 1297px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">group_id=pid//num_pid_in_group=1<div>这个program块在第二组</div></div></div></div></foreignObject><text x="1496" y="2787" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">group_id=pid//num_pid_in_group=1...</text></switch></g></g><g><path d="M 1176 2710 L 1205.14 2496.31" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="stroke" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/><path d="M 1205.85 2491.11 L 1208.37 2498.52 L 1205.14 2496.31 L 1201.44 2497.57 Z" fill="#000000" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="fill: light-dark(rgb(0, 0, 0), rgb(255, 255, 255)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/></g><g><rect x="891" y="2690" width="450" height="100" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 448px; height: 1px; padding-top: 2740px; margin-left: 892px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">first_pid_m=group_id*GROUP_SIZE_M<div>=1*2=2</div><div>本组在m方向的开始下标索引</div></div></div></div></foreignObject><text x="1116" y="2747" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">first_pid_m=group_id*GROUP_SIZE_M...</text></switch></g></g><g><path d="M 1046 2530 L 1686 2530" fill="none" stroke="#6f0000" stroke-width="2" stroke-miterlimit="10" stroke-dasharray="2 6" pointer-events="stroke" style="stroke: light-dark(rgb(111, 0, 0), rgb(255, 197, 197));"/></g><g><rect x="0" y="2490" width="1120" height="100" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 1118px; height: 1px; padding-top: 2540px; margin-left: 1px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">group_size_m=min(num_pid_m-first_pid_m,GROUP_SIZE_M)<br />=min(4-2,2)=2<br />本组m方向的长度。因为有可能整个C矩阵num_pid_m不够最好一个租的GROUP_SIZE_M，可能会截断</div></div></div></foreignObject><text x="560" y="2547" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">group_size_m=min(num_pid_m-first_pid_m,GROUP_SIZE_M)...</text></switch></g></g><g><rect x="906" y="2845" width="520" height="110" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 518px; height: 1px; padding-top: 2900px; margin-left: 907px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; "><div style="font-family: Consolas, &quot;Courier New&quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px; white-space: pre;"><div><span style="">pid_m</span><span style=""> </span><span style="">=</span><span style=""> </span><span style="">first_pid_m</span><span style=""> </span><span style="">+</span><span style=""> ((</span><span style="">pid</span><span style=""> </span><span style="">%</span><span style=""> </span><span style="">num_pid_in_group</span><span style="">) </span><span style="">%</span><span style=""> </span><span style="">group_size_m</span><span style="">)</span></div><div><span style="">pid%num_pid_in_group=12%8=4;含义是这个program在组内的顺序索引<br /></span>((pid % num_pid_in_group) % group_size_m)意思是里组内的m方向偏移。<br />因为组内是列优先，所有求行偏移是用%group_size_m的方式<br />再加上first_pid_m即为全局的m方向下标<span style=""></span></div></div></div></div></div></foreignObject><text x="1166" y="2907" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">pid_m = first_pid_m + ((pid % num_pid_in_gr...</text></switch></g></g><g><rect x="885" y="2980" width="530" height="70" fill="none" stroke="none" pointer-events="all"/></g><g><g transform="translate(-0.5 -0.5)"><switch><foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"><div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 528px; height: 1px; padding-top: 3015px; margin-left: 886px;"><div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; "><div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; "><div style="font-family: Consolas, &quot;Courier New&quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px; white-space: pre;"><div><span style="">pid_m</span><span style=""> </span><span style="">=</span><span style=""> </span><span style="">((</span><span style="">pid</span><span style=""> </span><span style="">%</span><span style=""> </span><span style="">num_pid_in_group</span><span style="">) //</span><span style=""> </span><span style="">group_size_m</span><span style="">)</span></div><div>((pid % num_pid_in_group) // group_size_m)意思是里组内的n方向偏移。<br />因为组内是列优先，所有求列偏移是用//group_size_m的方式<br /><span style=""></span></div></div></div></div></div></foreignObject><text x="1150" y="3022" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">pid_m = ((pid % num_pid_in_group) // group_s...</text></switch></g></g></g><switch><g requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"/><a transform="translate(0,-5)" xlink:href="https://www.drawio.com/doc/faq/svg-export-text-problems" target="_blank"><text text-anchor="middle" font-size="10px" x="50%" y="100%">Text is not SVG - cannot display</text></a></switch></svg>
+<svg host="65bd71144e" xmlns="http://www.w3.org/2000/svg" style="background: transparent; background-color: transparent;" xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1" width="2146px" height="3050px" viewBox="-0.5 -0.5 2146 3050" content="&lt;mxfile&gt;&lt;diagram name=&quot;第 1 页&quot; id=&quot;qTDLFhJpBMYdL5CT5CZy&quot;&gt;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&lt;/diagram&gt;&lt;/mxfile&gt;">
+    <defs/>
+    <g>
+        <g>
+            <rect x="1376" y="630" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1377px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    0
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1416" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        0
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1456" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1457px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    1
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1496" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        1
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1536" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1537px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    2
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1576" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        2
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1616" y="630" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 670px; margin-left: 1617px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    3
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1656" y="677" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        3
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1376" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1456" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1536" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1456" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1536" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1456" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1536" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="630" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1096" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1176" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1256" y="630" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1016" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1096" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1176" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1256" y="710" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1096" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1176" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1256" y="790" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1096" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1176" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1256" y="870" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="270" width="320" height="320" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1616" y="270" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1616" y="350" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1616" y="430" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1616" y="510" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1570" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1610px; margin-left: 1377px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    0
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1416" y="1617" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        0
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1456" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1610px; margin-left: 1457px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    2
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1496" y="1617" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        2
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1536" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1570" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1690px; margin-left: 1377px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    1
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1416" y="1697" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        1
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1456" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 1690px; margin-left: 1457px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    3
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1496" y="1697" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        3
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1536" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1650" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="1570" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1096" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1176" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1256" y="1570" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1016" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1096" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1176" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1256" y="1650" width="80" height="80" fill="#1ba1e2" stroke="#006eaf" pointer-events="all" style="fill: light-dark(rgb(27, 161, 226), rgb(25, 140, 196)); stroke: light-dark(rgb(0, 110, 175), rgb(81, 175, 231));"/>
+        </g>
+        <g>
+            <rect x="1016" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1096" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1176" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1256" y="1730" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1016" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1096" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1176" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1256" y="1810" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1210" width="320" height="320" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1210" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1210" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1210" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1210" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1290" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1290" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1370" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1370" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1376" y="1450" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1456" y="1450" width="80" height="80" fill="#fa6800" stroke="#c73500" pointer-events="all" style="fill: light-dark(rgb(250, 104, 0), rgb(233, 107, 18)); stroke: light-dark(rgb(199, 53, 0), rgb(255, 145, 100));"/>
+        </g>
+        <g>
+            <rect x="1536" y="1450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1616" y="1450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1120" y="0" width="546" height="170" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 85px; margin-left: 1121px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    假如0、1、2、3被调度上了
+                                    <br/>
+                                    那么需要读取20个A/B Tile到SRAM。
+                                    <br/>
+                                    并且B Tile的个数很多，可能导致
+                                    <div>
+                                        L2缓存命中率下降
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1393" y="95" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">
+                        假如0、1、2、3被调度上了...
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1070" y="1000" width="546" height="170" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 1085px; margin-left: 1071px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    如果是这种分组的情况，那么只用读取16个Tile。并且访问更密集，缓存命中可能更优
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1343" y="1095" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">
+                        如果是这种分组的情况，那么只用读取16个Tile。并且访问更密集，缓存命中可能更优
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1106" y="1960" width="546" height="170" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 544px; height: 1px; padding-top: 2045px; margin-left: 1107px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 32px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    但是这只是理论情况。现实中，哪个块被调度上SM是随机的，也可能是离得很远的C Tile。这时候按组排布提升空间也有限。并不能作为完全有效的优化
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1379" y="2055" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="32px" text-anchor="middle">
+                        但是这只是理论情况。现实中，哪个块被调度上SM是随机的，也可能是离得很远的C Tile。这时候按组排布提升空间也有限。并不能作为完全有效的优化
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1206" y="2290" width="320" height="320" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1206" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1207px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    0
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1246" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        0
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1286" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1287px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    2
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1326" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        2
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1366" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1367px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    4
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1406" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        4
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1446" y="2290" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2330px; margin-left: 1447px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    6
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1486" y="2337" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        6
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1206" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1207px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    1
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1246" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        1
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1286" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1287px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    3
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1326" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        3
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1366" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1367px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    5
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1406" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        5
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1446" y="2370" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2410px; margin-left: 1447px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    7
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1486" y="2417" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        7
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1206" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1207px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    8
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1246" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        8
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1286" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1287px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    10
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1326" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        10
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1366" y="2450" width="80" height="80" fill="#a20025" stroke="#6f0000" pointer-events="all" style="fill: light-dark(rgb(162, 0, 37), rgb(255, 173, 205)); stroke: light-dark(rgb(111, 0, 0), rgb(255, 197, 197));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1367px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #ffffff; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#ffffff, #121212); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    12
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1406" y="2497" fill="#ffffff" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        12
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1446" y="2450" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2490px; margin-left: 1447px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    14
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1486" y="2497" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        14
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1206" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1207px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    9
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1246" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        9
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1286" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1287px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    11
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1326" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        11
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1366" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1367px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    13
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1406" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        13
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1446" y="2530" width="80" height="80" fill="#ffffff" stroke="#000000" pointer-events="all" style="fill: light-dark(#ffffff, var(--ge-dark-color, #121212)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 78px; height: 1px; padding-top: 2570px; margin-left: 1447px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    15
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1486" y="2577" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        15
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1186 2290 L 1181 2290 Q 1176 2290 1176 2300 L 1176 2440 Q 1176 2450 1171 2450 L 1168.5 2450 Q 1166 2450 1171 2450 L 1173.5 2450 Q 1176 2450 1176 2460 L 1176 2600 Q 1176 2610 1181 2610 L 1186 2610" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="986" y="2430" width="180" height="40" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 178px; height: 1px; padding-top: 2450px; margin-left: 987px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    num_pid_m=4
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1076" y="2457" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        num_pid_m=4
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1376 2100 L 1371 2100 Q 1366 2100 1366 2110 L 1366 2250 Q 1366 2260 1361 2260 L 1358.5 2260 Q 1356 2260 1361 2260 L 1363.5 2260 Q 1366 2260 1366 2270 L 1366 2410 Q 1366 2420 1371 2420 L 1376 2420" fill="none" stroke="#000000" stroke-miterlimit="10" transform="rotate(90,1366,2260)" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1281" y="2200" width="170" height="40" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 168px; height: 1px; padding-top: 2220px; margin-left: 1282px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    num_pid_n=4
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1366" y="2227" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        num_pid_n=4
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1563 2290 L 1558 2290 Q 1553 2290 1553 2300 L 1553 2360 Q 1553 2370 1548 2370 L 1545.5 2370 Q 1543 2370 1548 2370 L 1550.5 2370 Q 1553 2370 1553 2380 L 1553 2440 Q 1553 2450 1558 2450 L 1563 2450" fill="none" stroke="#000000" stroke-miterlimit="10" transform="translate(1553,0)scale(-1,1)translate(-1553,0)" pointer-events="all" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1566" y="2350" width="240" height="40" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 238px; height: 1px; padding-top: 2370px; margin-left: 1567px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    GROUP_SIZE_M=2
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1686" y="2377" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        GROUP_SIZE_M=2
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1566" y="2400" width="580" height="40" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 578px; height: 1px; padding-top: 2420px; margin-left: 1567px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    num_pid_in_group=GROUP_SIZE_M*num_pid_n=8
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1856" y="2427" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        num_pid_in_group=GROUP_SIZE_M*num_pid_n=8
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1456 2710 L 1407.7 2536.14" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="stroke" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+            <path d="M 1406.3 2531.08 L 1411.55 2536.89 L 1407.7 2536.14 L 1404.8 2538.76 Z" fill="#000000" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="fill: light-dark(rgb(0, 0, 0), rgb(255, 255, 255)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="1416" y="2710" width="100" height="40" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 98px; height: 1px; padding-top: 2730px; margin-left: 1417px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    pid=12
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1466" y="2737" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        pid=12
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="1296" y="2745" width="400" height="70" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 398px; height: 1px; padding-top: 2780px; margin-left: 1297px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    group_id=pid//num_pid_in_group=1
+                                    <div>
+                                        这个program块在第二组
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1496" y="2787" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        group_id=pid//num_pid_in_group=1...
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1176 2710 L 1205.14 2496.31" fill="none" stroke="#000000" stroke-miterlimit="10" pointer-events="stroke" style="stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+            <path d="M 1205.85 2491.11 L 1208.37 2498.52 L 1205.14 2496.31 L 1201.44 2497.57 Z" fill="#000000" stroke="#000000" stroke-miterlimit="10" pointer-events="all" style="fill: light-dark(rgb(0, 0, 0), rgb(255, 255, 255)); stroke: light-dark(rgb(0, 0, 0), rgb(255, 255, 255));"/>
+        </g>
+        <g>
+            <rect x="891" y="2690" width="450" height="100" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 448px; height: 1px; padding-top: 2740px; margin-left: 892px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    first_pid_m=group_id*GROUP_SIZE_M
+                                    <div>
+                                        =1*2=2
+                                    </div>
+                                    <div>
+                                        本组在m方向的开始下标索引
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1116" y="2747" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        first_pid_m=group_id*GROUP_SIZE_M...
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <path d="M 1046 2530 L 1686 2530" fill="none" stroke="#6f0000" stroke-width="2" stroke-miterlimit="10" stroke-dasharray="2 6" pointer-events="stroke" style="stroke: light-dark(rgb(111, 0, 0), rgb(255, 197, 197));"/>
+        </g>
+        <g>
+            <rect x="0" y="2490" width="1120" height="100" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 1118px; height: 1px; padding-top: 2540px; margin-left: 1px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    group_size_m=min(num_pid_m-first_pid_m,GROUP_SIZE_M)
+                                    <br/>
+                                    =min(4-2,2)=2
+                                    <br/>
+                                    本组m方向的长度。因为有可能整个C矩阵num_pid_m不够最后一个组的GROUP_SIZE_M，可能会截断
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="560" y="2547" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        group_size_m=min(num_pid_m-first_pid_m,GROUP_SIZE_M)...
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="906" y="2845" width="520" height="110" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 518px; height: 1px; padding-top: 2900px; margin-left: 907px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    <div style="font-family: Consolas, &quot;Courier New&quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px; white-space: pre;">
+                                        <div>
+                                            <span style="">
+                                                pid_m
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                =
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                first_pid_m
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                +
+                                            </span>
+                                            <span style="">
+                                                ((
+                                            </span>
+                                            <span style="">
+                                                pid
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                %
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                num_pid_in_group
+                                            </span>
+                                            <span style="">
+                                                )
+                                            </span>
+                                            <span style="">
+                                                %
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                group_size_m
+                                            </span>
+                                            <span style="">
+                                                )
+                                            </span>
+                                        </div>
+                                        <div>
+                                            <span style="">
+                                                pid%num_pid_in_group=12%8=4;含义是这个program在组内的顺序索引
+                                                <br/>
+                                            </span>
+                                            ((pid % num_pid_in_group) % group_size_m)意思是里组内的m方向偏移。
+                                            <br/>
+                                            因为组内是列优先，所有求行偏移是用%group_size_m的方式
+                                            <br/>
+                                            再加上first_pid_m即为全局的m方向下标
+                                            <span style=""></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1166" y="2907" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        pid_m = first_pid_m + ((pid % num_pid_in_gr...
+                    </text>
+                </switch>
+            </g>
+        </g>
+        <g>
+            <rect x="885" y="2980" width="530" height="70" fill="none" stroke="none" pointer-events="all"/>
+        </g>
+        <g>
+            <g transform="translate(-0.5 -0.5)">
+                <switch>
+                    <foreignObject style="overflow: visible; text-align: left;" pointer-events="none" width="100%" height="100%" requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility">
+                        <div xmlns="http://www.w3.org/1999/xhtml" style="display: flex; align-items: unsafe center; justify-content: unsafe center; width: 528px; height: 1px; padding-top: 3015px; margin-left: 886px;">
+                            <div style="box-sizing: border-box; font-size: 0; text-align: center; color: #000000; ">
+                                <div style="display: inline-block; font-size: 24px; font-family: &quot;Helvetica&quot;; color: light-dark(#000000, #ffffff); line-height: 1.2; pointer-events: all; white-space: normal; word-wrap: normal; ">
+                                    <div style="font-family: Consolas, &quot;Courier New&quot;, monospace; font-weight: normal; font-size: 14px; line-height: 19px; white-space: pre;">
+                                        <div>
+                                            <span style="">
+                                                pid_m
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                =
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                ((
+                                            </span>
+                                            <span style="">
+                                                pid
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                %
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                num_pid_in_group
+                                            </span>
+                                            <span style="">
+                                                ) //
+                                            </span>
+                                            <span style="">
+                                            </span>
+                                            <span style="">
+                                                group_size_m
+                                            </span>
+                                            <span style="">
+                                                )
+                                            </span>
+                                        </div>
+                                        <div>
+                                            ((pid % num_pid_in_group) // group_size_m)意思是里组内的n方向偏移。
+                                            <br/>
+                                            因为组内是列优先，所有求列偏移是用//group_size_m的方式
+                                            <br/>
+                                            <span style=""></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </foreignObject>
+                    <text x="1150" y="3022" fill="light-dark(#000000, #ffffff)" font-family="&quot;Helvetica&quot;" font-size="24px" text-anchor="middle">
+                        pid_m = ((pid % num_pid_in_group) // group_s...
+                    </text>
+                </switch>
+            </g>
+        </g>
+    </g>
+    <switch>
+        <g requiredFeatures="http://www.w3.org/TR/SVG11/feature#Extensibility"/>
+        <a transform="translate(0,-5)" xlink:href="https://www.drawio.com/doc/faq/svg-export-text-problems" target="_blank">
+            <text text-anchor="middle" font-size="10px" x="50%" y="100%">
+                Text is not SVG - cannot display
+            </text>
+        </a>
+    </switch>
+</svg>
