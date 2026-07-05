@@ -550,6 +550,15 @@ $$
 ```python
 perf = lambda ms: 2 * M * N * K * 1e-12 / (ms * 1e-3)
 ```
+## 测试结果
+
+### FP16
+
+![FP16 Triton和cublas的对比](/blog-assets/gpu-programming/triton-gemm/Figure1.svg)
+
+### FP8
+
+![FP16 Triton性能结果](/blog-assets/gpu-programming/triton-gemm/FP8Figure.png)
 
 ## `triton.testing.Benchmark`
 
