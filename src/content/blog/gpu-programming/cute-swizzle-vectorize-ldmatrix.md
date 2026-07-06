@@ -902,9 +902,8 @@ print_latex(s2r_copy_a);
 
 这张图应该按两个层次读：
 
-- `TiledMMA` 决定 A operand 的整体 `(M,K)` tile 如何分给 warp 内线程和 MMA value。
-- `Copy_Atom` 决定一次 `ldmatrix` copy 的最小原语。
-- `make_tiled_copy_A` 把这两者组合起来，得到“每个线程应该从 shared memory 的哪里读，并写到 register fragment 的哪里”。
+- 左侧图的线程id指的是这一行的行起始位置是由谁提供的，比如第一行的T0代表这一行的行起始位置是T0提供的，具体可看[[cuda-ldmatrix.md]]
+- 右侧图则是拷贝时每个线程的寄存器所负责的位置。也在[[cuda-ldmatrix.md]]讲到过
 
 如果把 `SM75_U32x1_LDSM_N` 换成 `SM75_U32x4_LDSM_N`，copy atom 一次覆盖的 `m8n8.b16` 数量会变多，图里的 copy value 分布也会随之变化。
 
