@@ -4334,3 +4334,320 @@ public:
 - 3742 的历史状态是“当前路径已经花费多少”。
 
 只要额外状态范围可控，就可以直接加到 DP 数组里。这里 `k <= 1000`，所以 `cost` 维度是可以接受的。
+
+## [2684. 矩阵中移动的最大次数 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-number-of-moves-in-a-grid/description/)
+
+### 题目描述
+
+给你一个下标从 `0` 开始、大小为 `m x n` 的矩阵 `grid`，矩阵由若干正整数组成。
+
+你可以从矩阵第一列中的任一单元格出发。当前位置是 `(row, col)` 时，可以移动到右侧相邻列的三个位置之一：
+
+```cpp
+(row - 1, col + 1)
+(row,     col + 1)
+(row + 1, col + 1)
+```
+
+但目标单元格必须满足两个条件：
+
+- 行下标不能越界。
+- 目标单元格的值必须严格大于当前单元格的值。
+
+返回在矩阵中能够移动的最大次数。
+
+示例 1：
+
+```cpp
+输入：grid = [
+    [2, 4, 3, 5],
+    [5, 4, 9, 3],
+    [3, 4, 2, 11],
+    [10, 9, 13, 15]
+]
+输出：3
+```
+
+一种可行路径是：
+
+```cpp
+(0, 0) -> (0, 1) -> (1, 2) -> (2, 3)
+```
+
+示例 2：
+
+```cpp
+输入：grid = [
+    [3, 2, 4],
+    [2, 1, 9],
+    [1, 1, 7]
+]
+输出：0
+```
+
+从第一列的任意单元格出发，都无法走到一个严格更大的右侧相邻单元格。
+
+约束：
+
+- `m == grid.length`
+- `n == grid[i].length`
+- `2 <= m, n <= 1000`
+- `4 <= m * n <= 100000`
+- `1 <= grid[i][j] <= 1000000`
+
+### 思路
+
+这道题的第一反应很容易写成 DFS：从第一列任意格子出发，每次往右上、右、右下走，并且要求下一个格子的值严格更大。
+
+但它其实是一个非常标准的 DP / DAG 最长路问题。原因是：
+
+- 每一步都只能从 `col` 走到 `col + 1`。
+- 列号严格增加，所以路径不可能形成环。
+- “能走多少步”只取决于当前位置 `(row, col)`，不需要记录历史路径。
+
+所以它和前面 3882 / 3418 / 3742 最大的区别是：**这题不需要额外历史状态维度**。
+
+### 递推切入（探索逻辑）
+
+我更喜欢从“当前格子怎么来”这个角度看。
+
+如果当前格子是 `(row, col)`，那么上一步一定来自上一列 `col - 1`，并且只可能来自三种前驱：
+
+```cpp
+(row - 1, col - 1)
+(row,     col - 1)
+(row + 1, col - 1)
+```
+
+也就是：
+
+```cpp
+prev_row = row - 1, row, row + 1
+prev_col = col - 1
+```
+
+但这个前驱必须满足两个条件：
+
+- `(prev_row, col - 1)` 本身可达。
+- `grid[row][col] > grid[prev_row][col - 1]`，也就是当前格子值严格大于前驱格子值。
+
+这样思路就很自然：
+
+```cpp
+dp[row][col] = max(dp[prev_row][col - 1] + 1)
+```
+
+如果三个前驱都不能转移过来，说明 `(row, col)` 不可达。
+
+### 定义定型（规范表达）
+
+```cpp
+dp[row][col] = 从第一列某个起点出发，到达 (row, col) 时的最大移动次数
+```
+
+初始化：
+
+```cpp
+dp[row][0] = 0
+```
+
+因为从第一列任意格子都可以作为起点，起点本身移动次数是 0。
+
+转移：
+
+```cpp
+for (int prev_row = row - 1; prev_row <= row + 1; prev_row++) {
+    if (prev_row 越界) {
+        continue;
+    }
+    if (dp[prev_row][col - 1] == -1) {
+        continue;
+    }
+    if (grid[row][col] <= grid[prev_row][col - 1]) {
+        continue;
+    }
+    dp[row][col] = max(dp[row][col], dp[prev_row][col - 1] + 1);
+}
+```
+
+答案是所有 `dp[row][col]` 的最大值。因为走到第 `col` 列时，移动次数就是 `col`，但不是每一列都一定能到，所以用 `answer` 动态维护最大可达移动次数最直接。
+
+### 维度降级（空间优化）
+
+正向 DP 里，计算第 `col` 列只依赖第 `col - 1` 列：
+
+- `prev[prev_row]` 表示上一列 `col - 1` 中 `prev_row` 这一行的最大移动次数。
+- `current[row]` 表示当前列 `col` 中 `row` 这一行的最大移动次数。
+
+所以不需要保存完整二维数组，只需要：
+
+- `prev[row]`：上一列每一行的状态。
+- `current[row]`：当前列每一行的状态。
+
+每处理完一列，就执行：
+
+```cpp
+prev = current;
+```
+
+如果某一轮 `current` 全部不可达，说明这一列已经没有任何可达格子，后续列也不可能再被到达，可以直接停止。
+
+### 维度互换（本题不需要）
+
+这道题的移动方向强制是从左往右，列就是天然阶段。
+
+即使 `m` 和 `n` 都可以到 `1000`，且 `m * n <= 100000`，按列扫描也是 $O(mn)$。没有必要做行列互换，因为转移关系本身固定依赖 `col + 1`。
+
+### 状态“完备性”自检
+
+- **状态只写 `(row, col)` 够不够？** 够。未来能不能走，只依赖当前位置的值和下一列三个候选格子的值，不依赖过去怎么到达这里。
+- **为什么不用记录起点是哪一行？** 不用。题目只要求最大移动次数，不关心具体路径；到达同一个格子时，移动次数越大越好。
+- **为什么不能按普通最短路 / BFS 想？** 这里没有环，也没有边权变化；列号天然拓扑序，DP 比通用图算法更直接。
+- **为什么答案不是最大到达列数，而是移动次数？** 起点在第 0 列，走到第 `col` 列时移动了 `col` 次。正向 DP 里 `dp` 存的就是移动次数，所以直接取最大值即可。
+
+### dp代码（优化前）
+
+完整 DP 版本最直观：计算 `dp[row][col]` 时，直接枚举上一列的三个前驱 `prev_row`。
+
+```cpp
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 计算从第一列出发可以移动的最大次数。
+     *
+     * dp[row][col] 表示从第一列某个起点出发，到达 (row, col)
+     * 时已经移动的最大次数；-1 表示该格子不可达。
+     *
+     * @param grid m x n 正整数矩阵。
+     * @return 按题目规则能够移动的最大次数。
+     */
+    int maxMoves(vector<vector<int>>& grid) {
+        const int rows = grid.size();
+        const int cols = grid[0].size();
+        vector<vector<int>> dp(rows, vector<int>(cols, -1));
+
+        // 第一列任意格子都可以作为起点，起点移动次数为 0。
+        for (int row = 0; row < rows; row++) {
+            dp[row][0] = 0;
+        }
+
+        int answer = 0;
+        for (int col = 1; col < cols; col++) {
+            for (int row = 0; row < rows; row++) {
+                for (int delta_row = -1; delta_row <= 1; delta_row++) {
+                    const int prev_row = row + delta_row;
+                    const int prev_col = col - 1;
+                    if (prev_row < 0 || prev_row >= rows) {
+                        continue;
+                    }
+                    if (dp[prev_row][prev_col] == -1) {
+                        continue;
+                    }
+                    if (grid[row][col] <= grid[prev_row][prev_col]) {
+                        continue;
+                    }
+
+                    // 当前格子从上一列的合法前驱转移过来。
+                    dp[row][col] = max(dp[row][col], dp[prev_row][prev_col] + 1);
+                    answer = max(answer, dp[row][col]);
+                }
+            }
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$。每个格子最多尝试 3 个转移。
+- 空间复杂度：$O(mn)$。
+
+### 空间优化
+
+因为每一列只依赖上一列，可以把空间压到 $O(m)$。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动数组计算从第一列出发可以移动的最大次数。
+     *
+     * prev[row] 表示上一列 row 这一行的最大移动次数；
+     * current[row] 表示当前列 row 这一行的最大移动次数。
+     *
+     * @param grid m x n 正整数矩阵。
+     * @return 按题目规则能够移动的最大次数。
+     */
+    int maxMoves(vector<vector<int>>& grid) {
+        const int rows = grid.size();
+        const int cols = grid[0].size();
+        vector<int> prev(rows, 0);
+        int answer = 0;
+
+        for (int col = 1; col < cols; col++) {
+            vector<int> current(rows, -1);
+
+            for (int row = 0; row < rows; row++) {
+                for (int delta_row = -1; delta_row <= 1; delta_row++) {
+                    const int prev_row = row + delta_row;
+                    const int prev_col = col - 1;
+                    if (prev_row < 0 || prev_row >= rows) {
+                        continue;
+                    }
+                    if (prev[prev_row] == -1) {
+                        continue;
+                    }
+                    if (grid[row][col] <= grid[prev_row][prev_col]) {
+                        continue;
+                    }
+
+                    // 当前格子从上一列的合法前驱转移过来。
+                    current[row] = max(current[row], prev[prev_row] + 1);
+                    answer = max(answer, current[row]);
+                }
+            }
+
+            // 如果当前列没有任何可达格子，后续列也无法继续到达。
+            if (*max_element(current.begin(), current.end()) == -1) {
+                break;
+            }
+
+            prev = move(current);
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$。
+- 空间复杂度：$O(m)$。
+
+### 这题的核心手感
+
+这道题看到“从第一列任意格子出发”时，不要急着把每个起点都暴力搜一遍。先看移动方向：
+
+> 每一步列号都加 1。
+
+这说明整张图天然按列拓扑有序。于是问题就变成：
+
+- 计算第 `col` 列时，只看第 `col - 1` 列的三个前驱。
+- 当前格子能从合法前驱转移过来，就把前驱移动次数 `+1`。
+- 所有可达状态中的最大值就是答案。
+
+这个写法和普通网格 DP 的手感最一致：**当前状态从前一个阶段递推过来**。
