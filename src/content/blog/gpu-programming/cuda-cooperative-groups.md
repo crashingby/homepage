@@ -405,7 +405,7 @@ cg::thread_block_tile<Size, ParentT> tiled_partition(const ParentT& g);
 - 动态版 `tiled_partition(parent, tilesz)` 返回 `thread_group` 或 `coalesced_group`，大小在运行期确定。
 - 源码注释说明模板版要求父组大小能被 `Size` 整除，否则结果未定义。
 
-## 为什么需要 `tiled_partition`
+## 为什么需要 `tiled_partition` 
 
 如果只写普通 CUDA，其实也可以用 `threadIdx.x / 32` 算出 warp 编号，用 `threadIdx.x % 32` 算出 lane 编号，再手写 `__shfl_sync`、`__syncwarp` 和 mask。问题是：这种写法把“哪些线程在协作”藏在一堆下标和位掩码里了。
 
