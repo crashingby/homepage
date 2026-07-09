@@ -405,6 +405,251 @@ cg::thread_block_tile<Size, ParentT> tiled_partition(const ParentT& g);
 - 动态版 `tiled_partition(parent, tilesz)` 返回 `thread_group` 或 `coalesced_group`，大小在运行期确定。
 - 源码注释说明模板版要求父组大小能被 `Size` 整除，否则结果未定义。
 
+## 为什么需要 `tiled_partition`
+
+如果只写普通 CUDA，其实也可以用 `threadIdx.x / 32` 算出 warp 编号，用 `threadIdx.x % 32` 算出 lane 编号，再手写 `__shfl_sync`、`__syncwarp` 和 mask。问题是：这种写法把“哪些线程在协作”藏在一堆下标和位掩码里了。
+
+`tiled_partition` 做的事情就是把这个协作范围显式化：
+
+```cpp
+cg::thread_block block = cg::this_thread_block();
+cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+```
+
+这两行代码表达的是：
+
+- 父组是当前 `thread_block`。
+- 每 32 个线程切成一个子组。
+- 当前线程拿到的是“自己所属的那个 32 线程 tile”的句柄。
+- 后续 `warp.thread_rank()`、`warp.sync()`、`cg::reduce(warp, ...)` 都只在这个 tile 内发生。
+
+可以把它理解成在一个 CTA 内划分多个“协作小队”：
+
+```mermaid
+flowchart TD
+    B["thread_block<br>128 threads"] --> W0["tile 32 #0<br>rank 0..31"]
+    B --> W1["tile 32 #1<br>rank 0..31"]
+    B --> W2["tile 32 #2<br>rank 0..31"]
+    B --> W3["tile 32 #3<br>rank 0..31"]
+```
+
+这里有两个 rank 容易混：
+
+| 名称 | 含义 |
+| --- | --- |
+| `block.thread_rank()` | 当前线程在整个 block 内的编号，例如 `0..127`。 |
+| `warp.thread_rank()` | 当前线程在自己所属 tile 内的编号，例如每个 tile 都是 `0..31`。 |
+| `warp.meta_group_rank()` | 当前 tile 在父组中的编号，例如 `0..3`。 |
+| `warp.meta_group_size()` | 父组一共被切成多少个 tile，例如 `4`。 |
+
+所以 `thread_block_tile` 不是“另一个 block”，也不是“另一个 kernel”。它只是当前 block 内的一组线程视角。所有线程还是原来的线程，只是你用一个更明确的句柄描述它们的协作边界。
+
+### 为什么不用裸 warp 写法
+
+`thread_block_tile<32>` 最常见的用途确实是表达 warp，但它比裸 `warp_id / lane_id` 多做了几件有价值的事：
+
+- **同步范围清楚**：`warp.sync()` 明确只同步这个 tile，而不是整个 block。
+- **集合操作范围清楚**：`cg::reduce(warp, value, ...)` 不需要手写 mask。
+- **函数边界清楚**：device 函数可以接收一个 group 参数，调用者能看出这个函数需要哪些线程一起进入。
+- **编译期信息更充分**：模板版 `thread_block_tile<Size>` 的大小是编译期常量，编译器能选择更合适的实现。
+- **能表达 sub-warp**：`tiled_partition<8>`、`tiled_partition<16>` 可以把一个 warp 继续拆小，适合每 8 / 16 个线程处理一个小任务。
+
+它不是为了替代所有 `threadIdx.x` 计算。真正写高性能 kernel 时，很多地址计算仍然需要 `threadIdx.x`。但只要逻辑里出现“这几个线程要一起同步 / 规约 / shuffle / scan”，用 group 句柄表达会更稳。
+
+### 一个 block 里多个 warp 各处理一行
+
+这个例子是 `thread_block_tile<32>` 最直观的用法：一个 CTA 有 128 个线程，被切成 4 个 warp tile；每个 warp tile 处理矩阵的一行。
+
+```cpp
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 一个 block 内的每个 warp tile 分别对一行做求和。
+ *
+ * 假设 blockDim.x = 128，因此一个 CTA 内有 4 个 32 线程 tile。
+ * 每个 tile 负责一行，tile 内线程用 stride 方式遍历这一行。
+ *
+ * @param matrix 行主序矩阵，形状为 rows x cols。
+ * @param row_sums 每一行的求和结果。
+ * @param rows 矩阵行数。
+ * @param cols 矩阵列数。
+ */
+__global__ void rowSumByWarpTileKernel(const float* __restrict__ matrix,
+                                       float* __restrict__ row_sums,
+                                       int rows,
+                                       int cols) {
+    // 当前 CTA 作为父组。
+    cg::thread_block block = cg::this_thread_block();
+
+    // 把当前 CTA 切成多个 32 线程 tile。
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // 当前 tile 在 block 内的编号，也就是“本 CTA 的第几个 warp 小队”。
+    const int warp_id_in_block = static_cast<int>(warp.meta_group_rank());
+
+    // 当前 CTA 内 tile 的数量。blockDim.x = 128 时，这里是 4。
+    const int warps_per_block = static_cast<int>(warp.meta_group_size());
+
+    // 每个 tile 负责一行，所以全局行号由 blockIdx.x 和 tile 编号共同决定。
+    const int row = blockIdx.x * warps_per_block + warp_id_in_block;
+    if (row >= rows) {
+        return;
+    }
+
+    // 当前线程在 tile 内的局部编号，范围是 0..31。
+    const int lane = static_cast<int>(warp.thread_rank());
+
+    // tile 内 32 个线程合作遍历同一行。
+    float partial_sum = 0.0F;
+    for (int col = lane; col < cols; col += static_cast<int>(warp.num_threads())) {
+        partial_sum += matrix[row * cols + col];
+    }
+
+    // 只在当前 tile 内规约，不影响同一个 block 中的其他 tile。
+    const float sum = cg::reduce(warp, partial_sum, cg::plus<float>());
+
+    // 每个 tile 只让局部 rank 0 写出对应行的结果。
+    if (warp.thread_rank() == 0) {
+        row_sums[row] = sum;
+    }
+}
+```
+
+如果不用 `tiled_partition`，这段代码就会变成自己维护：
+
+- `warp_id_in_block = threadIdx.x / 32`
+- `lane = threadIdx.x % 32`
+- `mask = 0xffffffff`
+- `__shfl_down_sync(mask, ...)`
+
+这些写法都能跑，但协作关系分散在多个局部变量里。`thread_block_tile<32>` 把它们收束成了一个对象。
+
+### 嵌套划分：先切 warp，再切 sub-warp
+
+`tiled_partition` 也可以对已经切出来的 tile 再划分。比如先把 block 切成 32 线程 tile，再把每个 32 线程 tile 切成 4 个 8 线程 sub-tile：
+
+```mermaid
+flowchart TD
+    B["thread_block<br>128 threads"] --> W0["tile 32 #0"]
+    B --> W1["tile 32 #1"]
+    W0 --> S00["tile 8 #0"]
+    W0 --> S01["tile 8 #1"]
+    W0 --> S02["tile 8 #2"]
+    W0 --> S03["tile 8 #3"]
+    W1 --> S10["tile 8 #0"]
+    W1 --> S11["tile 8 #1"]
+```
+
+代码上就是：
+
+```cpp
+/**
+ * @brief 演示嵌套 tiled_partition：block -> 32 线程 tile -> 8 线程 tile。
+ *
+ * 这种写法适合“一个 warp 里还有多个小任务”的场景，例如每 8 个线程
+ * 处理一个短向量、一个小列块或一个小型规约。
+ */
+__global__ void nestedTileKernel(int* output) {
+    // 当前 CTA 作为最外层父组。
+    cg::thread_block block = cg::this_thread_block();
+
+    // 第一层：每 32 个线程组成一个 warp tile。
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // 第二层：每个 warp tile 再拆成 4 个 8 线程 sub-tile。
+    cg::thread_block_tile<8> subtile = cg::tiled_partition<8>(warp);
+
+    // warp_id 是当前 32 线程 tile 在 block 中的编号。
+    const int warp_id = static_cast<int>(warp.meta_group_rank());
+
+    // subtile_id 是当前 8 线程 tile 在所属 warp tile 中的编号。
+    const int subtile_id = static_cast<int>(subtile.meta_group_rank());
+
+    // lane8 是当前线程在 8 线程 sub-tile 内的编号，范围是 0..7。
+    const int lane8 = static_cast<int>(subtile.thread_rank());
+
+    // 这里只演示编号关系：每个 8 线程小队写一段连续位置。
+    const int index = ((blockIdx.x * warp.meta_group_size() + warp_id) * 4 + subtile_id) * 8 + lane8;
+    output[index] = lane8;
+}
+```
+
+嵌套以后，`meta_group_rank()` 的含义是相对于**当前父组**的：
+
+- `warp.meta_group_rank()`：当前 32 线程 tile 在 block 里的编号。
+- `subtile.meta_group_rank()`：当前 8 线程 tile 在所属 32 线程 tile 里的编号。
+
+这也是 `tiled_partition` 的高级用法核心：不是只能把 block 粗暴切成 warp，而是可以把算法天然需要的协作粒度一层一层表达出来。
+
+### 把 group 作为泛型接口参数
+
+`thread_block_tile` 另一个很实用的点是配合模板函数，让一个 device 函数不绑定固定协作范围。
+
+```cpp
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 在调用者传入的 group 内做求和规约。
+ *
+ * @tparam GroupT 支持 Cooperative Groups 规约的线程组类型。
+ * @param group 当前协作线程组，可以是 thread_block_tile 或 coalesced_group。
+ * @param value 当前线程贡献的值。
+ * @return 当前 group 内所有线程贡献值的和。
+ */
+template <typename GroupT>
+__device__ int reduceSumInGroup(GroupT group, int value) {
+    // 规约范围由 group 决定，函数内部不假设自己运行在整个 block 还是一个 tile。
+    return cg::reduce(group, value, cg::plus<int>());
+}
+
+/**
+ * @brief 同一个规约函数分别作用在 32 线程 tile 和 8 线程 tile 上。
+ */
+__global__ void genericGroupReduceKernel(const int* input, int* output) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    cg::thread_block_tile<8> subtile = cg::tiled_partition<8>(warp);
+
+    const int value = input[blockIdx.x * blockDim.x + threadIdx.x];
+
+    // 这里规约范围是 8 线程 sub-tile。
+    const int sum8 = reduceSumInGroup(subtile, value);
+
+    // 只让每个 8 线程 sub-tile 的 rank 0 写结果。
+    if (subtile.thread_rank() == 0) {
+        const int warp_id = static_cast<int>(warp.meta_group_rank());
+        const int subtile_id = static_cast<int>(subtile.meta_group_rank());
+        const int subtiles_per_block = static_cast<int>(warp.meta_group_size()) * 4;
+        const int output_idx = blockIdx.x * subtiles_per_block + warp_id * 4 + subtile_id;
+        output[output_idx] = sum8;
+    }
+}
+```
+
+这种写法的价值在工程代码里会更明显：一个函数只关心“给我一组线程，我在这组线程里做协作”，而不把自己写死成“必须整个 block 一起调用”。
+
+### 什么时候值得用
+
+比较适合 `tiled_partition` / `thread_block_tile` 的场景：
+
+- 一个 block 内有多个独立小任务，例如每个 warp 处理一行、一个 query、一个小矩阵块。
+- 每个小任务需要 tile 内规约、扫描、shuffle 或同步。
+- 想把 device helper 函数写成“传入 group”的泛型协作函数。
+- 算法天然是 sub-warp 粒度，例如 8 个线程处理一个短向量。
+- 希望少用裸 mask，减少 `__shfl_sync` / `__syncwarp` 的手写错误。
+
+不一定值得用的场景：
+
+- 所有线程本来就必须整个 block 同步，直接 `thread_block` 就够。
+- 只是简单按 `threadIdx.x` 读写，没有 tile 内 collective。
+- 极致性能调优时，需要完全手写特定 mask 和指令序列。这时可以把 Cooperative Groups 当成更清晰的基线版本，再逐步下探到手写 warp primitive。
+
 ## 外层辅助函数
 
 CUDA runtime 会根据 kernel launch 配置隐式创建一些线程组。程序可以通过下面这些接口拿到句柄。
