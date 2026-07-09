@@ -4651,3 +4651,319 @@ public:
 - 所有可达状态中的最大值就是答案。
 
 这个写法和普通网格 DP 的手感最一致：**当前状态从前一个阶段递推过来**。
+
+## [1824. 最少侧跳次数 - 力扣（LeetCode）](https://leetcode.cn/problems/minimum-sideway-jumps/description/)
+
+### 题目描述
+
+给你一个长度为 `n + 1` 的数组 `obstacles`，表示一条有 3 条跑道、点编号从 `0` 到 `n` 的道路。
+
+青蛙从 **点 0 的第 2 条跑道** 出发，目标是到达点 `n` 的任意跑道。每一步有两种移动方式：
+
+- **向前跳**：从点 `i` 的当前跑道跳到点 `i + 1` 的同一跑道，前提是点 `i + 1` 的这条跑道没有障碍。
+- **侧跳**：在同一个点 `i`，从当前跑道跳到另一条跑道，前提是目标跑道在点 `i` 没有障碍。侧跳的目标跑道不要求相邻。
+
+数组含义：
+
+- `obstacles[i] == 0` 表示点 `i` 没有障碍。
+- `obstacles[i] == lane` 表示点 `i` 的第 `lane` 条跑道有障碍。
+- 任意点最多只有一条跑道有障碍。
+
+返回青蛙到达点 `n` 的最少侧跳次数。
+
+示例：
+
+```cpp
+输入：obstacles = [0,1,2,3,0]
+输出：2
+```
+
+约束：
+
+- `obstacles.length == n + 1`
+- `1 <= n <= 500000`
+- `0 <= obstacles[i] <= 3`
+- `obstacles[0] == obstacles[n] == 0`
+
+### 思路
+
+这道题的阶段很清楚：点编号从 `0` 推到 `n`。
+
+真正需要注意的是，侧跳发生在**同一个点**，不是从 `col - 1` 直接斜着跳到 `col`。所以每处理一个点 `pos`，更自然的顺序是：
+
+1. 先从 `pos - 1` 向前走到 `pos`。
+2. 如果当前点某条跑道有障碍，把这条跑道设为不可达。
+3. 在当前点内部做侧跳松弛。
+
+也就是说，状态不是普通网格里“从左上两个方向来”，而是一个很小的三跑道最短路：
+
+```mermaid
+flowchart LR
+    A["点 pos - 1<br>三条跑道状态"] --> B["向前走到点 pos"]
+    B --> C["屏蔽点 pos 的障碍跑道"]
+    C --> D["在点 pos 内部侧跳松弛"]
+    D --> E["得到点 pos 的三条跑道状态"]
+```
+
+图里的“侧跳松弛”就是：如果当前点 `pos` 的某条跑道没有障碍，那么它可以从另外两条没有障碍的跑道侧跳过来，代价额外 `+1`。
+
+### 递归切入（探索逻辑）
+
+如果从递归角度看，可以先定义：
+
+$$
+dfs(pos, lane) = 到达点\ pos\ 的\ lane\ 跑道时，最少需要多少次侧跳
+$$
+
+那么到达 `(pos, lane)` 有两种方式：
+
+- 从 `(pos - 1, lane)` 向前跳过来，不增加侧跳次数。
+- 先到达当前点 `pos` 的其他跑道 `other_lane`，再在点 `pos` 侧跳到 `lane`，增加 `1` 次侧跳。
+
+第一种方式跨点，第二种方式在同一个点内部转移。
+
+所以如果当前点 `pos` 的 `lane` 跑道没有障碍，递归转移可以写成：
+
+$$
+dfs(pos, lane)
+=
+\min\left(
+dfs(pos - 1, lane),
+\min_{other \ne lane}(dfs(pos, other) + 1)
+\right)
+$$
+
+其中 `other` 也必须满足当前点 `pos` 的 `other` 跑道没有障碍。
+
+如果当前点 `pos` 的 `lane` 跑道有障碍，那么这个状态不可达：
+
+$$
+dfs(pos, lane) = +\infty
+$$
+
+这也是这道题最容易写错的地方：不要把侧跳理解成“从上一点的其他跑道直接跳到当前点”。侧跳本身不改变点编号，它只改变跑道。
+
+### 定义定型（规范表达）
+
+$$
+dp[lane][pos] = 到达点\ pos\ 的\ lane\ 跑道时，最少需要多少次侧跳
+$$
+
+这里把跑道从题目的 `1, 2, 3` 转成数组下标 `0, 1, 2`。
+
+初始化：
+
+$$
+dp[0][0] = 1,\quad dp[1][0] = 0,\quad dp[2][0] = 1
+$$
+
+因为青蛙一开始在第 2 条跑道，也就是数组下标 `1`：
+
+- 到达跑道 2 的代价是 `0`。
+- 如果一开始想站到跑道 1 或跑道 3，需要侧跳一次，所以代价是 `1`。
+
+转移分两步。
+
+第一步，先从上一点同跑道向前走：
+
+```cpp
+if (obstacles[pos] != lane + 1) {
+    dp[lane][pos] = dp[lane][pos - 1];
+}
+```
+
+如果当前点 `pos` 的这条跑道有障碍，就不能站在这里，保持不可达。
+
+第二步，在当前点内部侧跳：
+
+```cpp
+dp[lane][pos] = min(dp[lane][pos], dp[other_lane][pos] + 1);
+```
+
+这里要求 `lane` 和 `other_lane` 在当前点都没有障碍。
+
+合在一起，可以把正式 DP 转移写成：
+
+$$
+dp[lane][pos] =
+\begin{cases}
++\infty, & obstacles[pos] = lane + 1 \\
+\min\left(
+dp[lane][pos - 1],
+\min\limits_{other \ne lane}(dp[other][pos] + 1)
+\right), & obstacles[pos] \ne lane + 1
+\end{cases}
+$$
+
+注意这里右侧第二项是 `dp[other][pos] + 1`，不是 `dp[other][pos - 1] + 1`。这正好对应“侧跳发生在当前点”的题意。
+
+### 维度降级（空间优化）
+
+计算点 `pos` 时，只需要上一点的三条跑道状态。由于跑道数固定是 3，所以可以直接用一个长度为 3 的数组：
+
+```cpp
+dp[lane] = 处理到当前点时，停在 lane 跑道的最少侧跳次数
+```
+
+每处理一个新点：
+
+- 先把当前点的障碍跑道设为不可达。
+- 再用当前三条跑道的最小值做侧跳松弛。
+
+因为跑道数量固定，空间复杂度可以从 $O(n)$ 降到 $O(1)$。
+
+### 维度互换（本题不需要）
+
+这道题只有 3 条跑道，点编号最多到 `500000`。阶段天然是从左到右的点编号，跑道只是一个固定小维度。
+
+所以没有必要做维度互换。最适合的扫描方式就是：
+
+```cpp
+for (int pos = 1; pos <= n; pos++)
+```
+
+### 状态“完备性”自检
+
+- **只记录 `(pos, lane)` 够不够？** 够。未来能否前进只取决于当前点、当前跑道和后续障碍，不依赖过去路径。
+- **为什么不需要记录已经侧跳了多少次？** 因为目标是最小侧跳次数，`dp` 的值本身就是已经付出的最小代价。
+- **为什么侧跳要在当前点做松弛？** 因为题目定义侧跳不改变点编号。先到点 `pos`，再在点 `pos` 换跑道，才符合动作语义。
+- **为什么初始化是 `{1, 0, 1}`？** 起点在跑道 2。想从起点切到跑道 1 或跑道 3，只需要在点 0 侧跳一次。
+- **为什么障碍跑道直接设为无穷大？** 有障碍的点不能站立，所以这一条状态必须被屏蔽，不能继续参与后续转移。
+
+### dp代码（优化前）
+
+这个版本完整保存 `dp[lane][pos]`。写法上分成两步：先向前走，再在当前点侧跳。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 计算到达终点的最少侧跳次数。
+     *
+     * dp[lane][pos] 表示处理到点 pos 时，青蛙停在 lane 跑道的最少侧跳次数。
+     * lane 使用 0、1、2 表示题目中的第 1、2、3 条跑道。
+     *
+     * @param obstacles 障碍数组，obstacles[pos] 表示点 pos 上有障碍的跑道编号。
+     * @return 到达点 n 的任意跑道所需的最少侧跳次数。
+     */
+    int minSideJumps(vector<int>& obstacles) {
+        const int n = static_cast<int>(obstacles.size()) - 1;
+        const int kInf = numeric_limits<int>::max() / 4;
+        vector<vector<int>> dp(3, vector<int>(n + 1, kInf));
+
+        // 起点在第 2 条跑道；如果在点 0 切到另外两条跑道，需要一次侧跳。
+        dp[0][0] = 1;
+        dp[1][0] = 0;
+        dp[2][0] = 1;
+
+        for (int pos = 1; pos <= n; pos++) {
+            // 第一步：同跑道从 pos - 1 前进到 pos。
+            for (int lane = 0; lane < 3; lane++) {
+                if (obstacles[pos] == lane + 1) {
+                    dp[lane][pos] = kInf;
+                    continue;
+                }
+                dp[lane][pos] = dp[lane][pos - 1];
+            }
+
+            // 第二步：在当前点 pos 内部做侧跳松弛。
+            for (int lane = 0; lane < 3; lane++) {
+                if (obstacles[pos] == lane + 1) {
+                    continue;
+                }
+
+                for (int other_lane = 0; other_lane < 3; other_lane++) {
+                    if (lane == other_lane || obstacles[pos] == other_lane + 1) {
+                        continue;
+                    }
+                    dp[lane][pos] = min(dp[lane][pos],
+                                        dp[other_lane][pos] + 1);
+                }
+            }
+        }
+
+        return min({dp[0][n], dp[1][n], dp[2][n]});
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n)$。每个点只处理 3 条跑道和常数次侧跳松弛。
+- 空间复杂度：$O(n)$。
+
+### 空间优化
+
+完整 `dp[lane][pos]` 里，当前点只依赖上一点的三条跑道状态，所以可以压成长度为 3 的数组。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动状态计算到达终点的最少侧跳次数。
+     *
+     * dp[lane] 表示处理到当前点时，青蛙停在 lane 跑道的最少侧跳次数。
+     * 每一轮先屏蔽当前点的障碍跑道，再在当前点内部做侧跳松弛。
+     *
+     * @param obstacles 障碍数组，obstacles[pos] 表示点 pos 上有障碍的跑道编号。
+     * @return 到达点 n 的任意跑道所需的最少侧跳次数。
+     */
+    int minSideJumps(vector<int>& obstacles) {
+        const int kInf = numeric_limits<int>::max() / 4;
+        array<int, 3> dp = {1, 0, 1};
+
+        for (int pos = 1; pos < static_cast<int>(obstacles.size()); pos++) {
+            // 当前点的障碍跑道不能站立，必须先屏蔽掉。
+            if (obstacles[pos] != 0) {
+                dp[obstacles[pos] - 1] = kInf;
+            }
+
+            // 在当前点内部侧跳：从另外两条可站立跑道跳过来，代价加 1。
+            for (int lane = 0; lane < 3; lane++) {
+                if (obstacles[pos] == lane + 1) {
+                    continue;
+                }
+
+                for (int other_lane = 0; other_lane < 3; other_lane++) {
+                    if (lane == other_lane || obstacles[pos] == other_lane + 1) {
+                        continue;
+                    }
+                    dp[lane] = min(dp[lane], dp[other_lane] + 1);
+                }
+            }
+        }
+
+        return min({dp[0], dp[1], dp[2]});
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n)$。
+- 空间复杂度：$O(1)$。
+
+### 这题的核心手感
+
+1824 的重点不是“网格 DP”，而是**三条跑道上的最短代价状态转移**。
+
+每个点的处理顺序可以固定记成：
+
+```cpp
+向前继承 -> 屏蔽障碍 -> 当前点侧跳松弛
+```
+
+只要记住侧跳不改变点编号，这道题的状态就很稳定：`dp[lane]` 永远表示“已经处理到当前点，停在这条跑道的最小侧跳次数”。这也是它可以自然压成 $O(1)$ 空间的原因。
