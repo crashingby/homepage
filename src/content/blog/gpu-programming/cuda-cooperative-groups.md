@@ -199,12 +199,12 @@ cg::thread_block this_thread_block();
 
 **重要接口**
 
+`thread_block` 继承自 `thread_group_base<details::thread_block_id>`，因此它具有 `thread_group` 一类的基础组接口，例如 `sync()`、`size()`、`num_threads()` 和 `thread_rank()`。这些接口的语义和基类一致，只是返回类型在源码里更具体，多数是 `unsigned int`。
+
+`thread_block` 额外提供的接口主要是 block / thread 的三维坐标信息：
+
 | 接口 | 原型 | 含义 |
 | --- | --- | --- |
-| `sync` | `static void sync()` | 同步当前 block，底层对应 CTA 同步。 |
-| `size` | `static unsigned int size()` | 返回当前 block 的线程数。 |
-| `num_threads` | `static unsigned int num_threads()` | 返回当前 block 的线程数。 |
-| `thread_rank` | `static unsigned int thread_rank()` | 返回当前线程在 block 内的一维 rank。 |
 | `group_index` | `static dim3 group_index()` | 返回当前 block 在 grid 中的三维 index，语义接近 `blockIdx`。 |
 | `thread_index` | `static dim3 thread_index()` | 返回当前线程在 block 内的三维 index，语义接近 `threadIdx`。 |
 | `group_dim` | `static dim3 group_dim()` | 返回 block 维度，语义接近 `blockDim`。 |
@@ -236,13 +236,13 @@ cg::grid_group this_grid();
 
 **重要接口**
 
+`grid_group` 继承自 `thread_group_base<details::grid_group_id>`，因此也有基础组接口，例如 `size()`、`num_threads()`、`thread_rank()` 和 `sync()`。这里不再重复列这些基础接口。
+
+`grid_group` 额外提供 grid / block / cluster 级别的查询接口：
+
 | 接口 | 原型 | 含义 |
 | --- | --- | --- |
 | `is_valid` | `bool is_valid() const` | 判断当前 `grid_group` 是否有可用的 grid workspace。 |
-| `sync` | `void sync() const` | 同步整个 grid。若 `is_valid() == false`，源码里会 `_CG_ABORT()`。 |
-| `size` | `static unsigned long long size()` | 返回 grid 内线程总数。 |
-| `num_threads` | `static unsigned long long num_threads()` | 返回 grid 内线程总数。 |
-| `thread_rank` | `static unsigned long long thread_rank()` | 返回当前线程在整个 grid 内的一维 rank。 |
 | `group_dim` | `static dim3 group_dim()` | 返回 grid 维度。 |
 | `dim_blocks` | `static dim3 dim_blocks()` | 返回 grid 中 block 的三维数量。 |
 | `num_blocks` | `static unsigned long long num_blocks()` | 返回 grid 中 block 总数。 |
@@ -256,6 +256,7 @@ cg::grid_group this_grid();
 **副作用 / 约束**
 
 - 如果要调用 `grid.sync()`，kernel 必须通过 `cudaLaunchCooperativeKernel` 或等价 cooperative launch 发射。
+- 如果 `grid_group::is_valid() == false`，源码里调用 `grid.sync()` 会触发 `_CG_ABORT()`。
 - 设备必须支持 cooperative launch。
 - 普通 kernel launch 下构造 `this_grid()` 不等于可以安全做 grid 同步。
 
@@ -279,9 +280,12 @@ cg::cluster_group this_cluster();
 
 **重要接口**
 
+`cluster_group` 继承自 `thread_group_base<details::cluster_group_id>`，所以也具备基础组接口，例如 `sync()`、`size()`、`num_threads()` 和 `thread_rank()`。这些基础接口表示的是**整个 cluster 范围**，不是单个 block 范围。
+
+`cluster_group` 真正新增的是 cluster barrier、distributed shared memory 和 block-in-cluster 查询接口：
+
 | 接口 | 原型 | 含义 |
 | --- | --- | --- |
-| `sync` | `static void sync()` | 同步当前 cluster 内所有线程。 |
 | `barrier_arrive` | `static arrival_token barrier_arrive()` | 到达 cluster barrier，返回一个 `arrival_token`。 |
 | `barrier_wait` | `static void barrier_wait()` | 等待 cluster barrier。 |
 | `barrier_wait` | `static void barrier_wait(arrival_token&&)` | 消费 `barrier_arrive()` 返回的 token 并等待。 |
@@ -289,12 +293,9 @@ cg::cluster_group this_cluster();
 | `map_shared_rank` | `template <typename T> static T* map_shared_rank(T* addr, int rank)` | 把本 block 的 shared memory 地址映射到 cluster 内指定 block rank 的对应地址。 |
 | `block_index` | `static dim3 block_index()` | 当前 block 在 cluster 内的三维 index。 |
 | `block_rank` | `static unsigned int block_rank()` | 当前 block 在 cluster 内的一维 rank。 |
-| `thread_rank` | `static unsigned int thread_rank()` | 当前线程在 cluster 内的一维 rank。 |
 | `dim_blocks` | `static dim3 dim_blocks()` | cluster 内 block 的三维数量。 |
 | `num_blocks` | `static unsigned int num_blocks()` | cluster 内 block 总数。 |
 | `dim_threads` | `static dim3 dim_threads()` | cluster 内线程的三维维度。 |
-| `num_threads` | `static unsigned int num_threads()` | cluster 内线程总数。 |
-| `size` | `static unsigned int size()` | `num_threads()` 的旧别名。 |
 
 **注意点**
 
@@ -330,14 +331,14 @@ coalesced_group coalesced_threads() {
 
 **重要接口**
 
+`coalesced_group` 继承自 `thread_group_base<details::coalesced_group_id>`，因此有基础组接口：`size()` / `num_threads()` 返回活跃线程集合大小，`thread_rank()` 返回当前线程在活跃集合内的 rank，`sync()` 对该集合做 warp 级同步。
+
+它额外提供的是当前活跃 warp 线程集合上的 shuffle、vote 和 match 类接口：
+
 | 接口 | 原型 | 含义 |
 | --- | --- | --- |
-| `num_threads` | `unsigned int num_threads() const` | 返回当前活跃线程集合大小。 |
-| `size` | `unsigned int size() const` | 返回当前活跃线程集合大小。 |
-| `thread_rank` | `unsigned int thread_rank() const` | 返回当前线程在活跃集合内的 rank。 |
 | `meta_group_rank` | `unsigned int meta_group_rank() const` | 当前 subgroup 在父分组中的编号。 |
 | `meta_group_size` | `unsigned int meta_group_size() const` | 父组被切出的 subgroup 数量。 |
-| `sync` | `void sync() const` | 对 mask 内线程执行 `__syncwarp(mask)`。 |
 | `shfl` | `template <typename T> T shfl(T&& elem, int srcRank) const` | 从组内 `srcRank` 广播值。 |
 | `shfl_down` | `template <typename T> T shfl_down(T&& elem, unsigned int delta) const` | 从组内 rank 增加 `delta` 的线程取值。 |
 | `shfl_up` | `template <typename T> T shfl_up(T&& elem, int delta) const` | 从组内 rank 减少 `delta` 的线程取值。 |
@@ -382,12 +383,12 @@ cg::thread_block_tile<Size, ParentT> tiled_partition(const ParentT& g);
 
 **重要接口**
 
+`thread_block_tile<Size, ParentT>` 是固定大小的子组句柄。它也有基础组接口：`thread_rank()`、`num_threads()`、`size()` 和 `sync()`。因为 `Size` 是模板参数，`num_threads()` / `size()` 可以是编译期常量。
+
+它额外提供 tile 在父组中的位置，以及 tile 内 warp 风格的 collective 接口：
+
 | 接口 | 原型 | 含义 |
 | --- | --- | --- |
-| `thread_rank` | `static unsigned int thread_rank()` | 当前线程在 tile 内的 rank。 |
-| `num_threads` | `static constexpr unsigned int num_threads()` | tile 的静态线程数。 |
-| `size` | `static constexpr unsigned int size()` | `num_threads()` 的别名。 |
-| `sync` | `void sync() const` 或 `static void sync()` | 同步 tile 内线程。 |
 | `meta_group_rank` | `unsigned int meta_group_rank() const` | 当前 tile 在父组划分中的编号。 |
 | `meta_group_size` | `unsigned int meta_group_size() const` | 父组被切成多少个 tile。 |
 | `shfl` | `template <typename T> T shfl(T&& elem, int srcRank) const` | tile 内 shuffle。 |
@@ -805,24 +806,29 @@ struct bit_or;
 namespace cg = cooperative_groups;
 
 /**
- * @brief 使用 Cooperative Groups 做 block 级求和规约。
+ * @brief 使用 Cooperative Groups 做 warp tile 级求和规约。
  *
  * @param input device 输入数组，每个线程读取一个元素。
- * @param block_sums device 输出数组，每个 block 输出一个求和结果。
+ * @param warp_sums device 输出数组，每个 warp 输出一个求和结果。
  */
-__global__ void block_reduce_sum_kernel(const int* input, int* block_sums) {
-    // 当前 thread block 作为规约范围。
+__global__ void warp_reduce_sum_kernel(const int* input, int* warp_sums) {
+    // 当前 thread block 是父组。
     cg::thread_block block = cg::this_thread_block();
+
+    // 把 block 划分成多个 32 线程 tile，每个 tile 对应一个 warp 级协作组。
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
     // 每个线程提供一个待规约的输入值。
     const int value = input[blockIdx.x * blockDim.x + threadIdx.x];
 
-    // 对整个 block 的 value 做求和规约。
-    const int sum = cg::reduce(block, value, cg::plus<int>());
+    // 对当前 warp tile 内的 value 做求和规约。
+    const int sum = cg::reduce(warp, value, cg::plus<int>());
 
-    // 只让组内 rank 为 0 的线程写出规约结果。
-    if (block.thread_rank() == 0) {
-        block_sums[blockIdx.x] = sum;
+    // 只让每个 warp tile 的 rank 0 写一次结果。
+    if (warp.thread_rank() == 0) {
+        const int warp_id_in_block = block.thread_rank() / warp.num_threads();
+        const int warps_per_block = block.num_threads() / warp.num_threads();
+        warp_sums[blockIdx.x * warps_per_block + warp_id_in_block] = sum;
     }
 }
 ```
@@ -1059,6 +1065,210 @@ __global__ void async_copy_kernel(const int* input, int* output) {
 
 - `memcpy_async` 只有在 **源地址是 global memory、目标地址是 shared memory**，并且两者至少 **4 字节对齐**时才是异步的。
 - 为了获得更好的性能，官方推荐 global memory 和 shared memory 地址都满足 **16 字节对齐**。
+
+## 基础使用练习
+
+这一节不追求复杂优化，只用几个小 kernel 练习 Cooperative Groups 的基础用法。
+
+### 练习一：用 `thread_block` 替代裸 `__syncthreads()`
+
+这个例子做一件很简单的事：每个 block 把一段数据搬进 shared memory，然后反向写回。重点不是算法，而是练习 `cg::this_thread_block()` 和 `cg::sync(block)`。
+
+```cpp
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 使用 thread_block 句柄做 block 级同步，并反转每个 block 内的数据。
+ *
+ * 一个 CTA 处理 `blockDim.x` 个连续元素；每个线程负责一个元素。
+ *
+ * @param input device 输入数组。
+ * @param output device 输出数组。
+ * @param n 数组元素总数。
+ */
+__global__ void reverseWithinBlockKernel(const int* __restrict__ input,
+                                         int* __restrict__ output,
+                                         int n) {
+    extern __shared__ int shared_data[];
+
+    // 获取当前 block 的协作组句柄。
+    cg::thread_block block = cg::this_thread_block();
+
+    // 当前线程在整个 grid 中的一维编号。
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 当前线程在 block 内的一维编号，也可以写成 block.thread_rank()。
+    const int local_idx = static_cast<int>(block.thread_rank());
+
+    // 每个线程都必须参与后续同步；越界线程写入哨兵值即可。
+    shared_data[local_idx] = (global_idx < n) ? input[global_idx] : 0;
+
+    // 等待整个 block 的 shared memory 写入完成。
+    cg::sync(block);
+
+    // 从 shared memory 中反向读取，实现 block 内局部反转。
+    const int reverse_idx = static_cast<int>(block.num_threads()) - 1 - local_idx;
+    if (global_idx < n) {
+        output[global_idx] = shared_data[reverse_idx];
+    }
+}
+```
+
+这个练习里，`cg::sync(block)` 的角色和 `__syncthreads()` 类似，但它把同步范围显式写成了 `block`。以后如果函数参数里传入的是 `thread_block_tile<32>`，同一个 `cg::sync(group)` 写法就可以变成 tile 级同步。
+
+为了让反转语义最干净，练习时可以先让 `n` 是 `blockDim.x` 的整数倍。上面的代码保留了尾块边界保护，重点是演示：**只要后面要做 group 同步，就不要让 group 内部分线程提前 return**。
+
+### 练习二：用 `thread_block_tile<32>` 做 warp 级规约
+
+这个例子把一个 block 划成多个 32 线程 tile，每个 tile 内做一次求和。它适合练习：
+
+- `cg::tiled_partition<32>(block)`
+- `warp.thread_rank()`
+- `cg::reduce(warp, value, cg::plus<int>())`
+
+```cpp
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 每个 warp tile 对输入数组的一段数据求和。
+ *
+ * 一个 CTA 被切成多个 32 线程 tile；每个 tile 输出一个 sum。
+ *
+ * @param input device 输入数组。
+ * @param warp_sums device 输出数组，每个 warp tile 写一个求和结果。
+ * @param n 输入元素总数。
+ */
+__global__ void warpTileReduceKernel(const int* __restrict__ input,
+                                     int* __restrict__ warp_sums,
+                                     int n) {
+    // 当前 block 作为父组。
+    cg::thread_block block = cg::this_thread_block();
+
+    // 每 32 个线程组成一个静态 tile。
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    // 当前线程负责读取一个元素，越界时贡献 0。
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int value = (global_idx < n) ? input[global_idx] : 0;
+
+    // 在当前 32 线程 tile 内做求和规约。
+    const int sum = cg::reduce(warp, value, cg::plus<int>());
+
+    // 每个 tile 只让 rank 0 线程写出结果。
+    if (warp.thread_rank() == 0) {
+        const int warps_per_block = blockDim.x / warp.num_threads();
+        const int warp_id_in_block = static_cast<int>(block.thread_rank()) / warp.num_threads();
+        const int output_idx = blockIdx.x * warps_per_block + warp_id_in_block;
+        warp_sums[output_idx] = sum;
+    }
+}
+```
+
+这里的 `warp` 是一个 `thread_block_tile<32>`，不是传统意义上直接操作 `threadIdx.x / 32` 的裸 warp。好处是后续调用 `warp.thread_rank()`、`warp.num_threads()`、`cg::reduce(warp, ...)` 时，协作范围都很明确。
+
+### 练习三：用 `coalesced_group` 处理分支内活跃线程
+
+`coalesced_group` 适合在分支内部获取“当前实际活跃的线程集合”。下面这个例子只让偶数值线程进入分支，然后统计这个分支里有多少活跃线程。
+
+```cpp
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 演示 coalesced_group 只描述当前调用点的活跃线程集合。
+ *
+ * @param input device 输入数组。
+ * @param active_counts device 输出数组，每个进入分支的线程写出当前活跃集合大小。
+ * @param n 输入元素总数。
+ */
+__global__ void coalescedGroupKernel(const int* __restrict__ input,
+                                     int* __restrict__ active_counts,
+                                     int n) {
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (global_idx >= n) {
+        return;
+    }
+
+    // 只有满足条件的线程会进入这个分支。
+    if ((input[global_idx] & 1) == 0) {
+        // 获取当前 warp 中已经收敛且活跃的线程集合。
+        cg::coalesced_group active = cg::coalesced_threads();
+
+        // active.num_threads() 不是固定 32，而是当前调用点活跃线程数量。
+        active_counts[global_idx] = static_cast<int>(active.num_threads());
+    }
+}
+```
+
+这个练习的重点是：`coalesced_threads()` 不是“创建一个固定 warp”，而是捕获当前分支位置的活跃线程集合。因此它非常适合处理 warp divergence（warp 分支发散）后的局部协作。
+
+### 练习四：把 group 作为函数参数
+
+Cooperative Groups 一个很实用的写法是：把 group 显式传进 device 函数。这样函数的同步范围不会藏在实现里，调用者一眼能看出“哪些线程必须一起调用这个函数”。
+
+```cpp
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+/**
+ * @brief 对传入 group 做一次简单的共享内存交换。
+ *
+ * @tparam GroupT 支持 `thread_rank()`、`num_threads()` 和 `sync()` 的 group 类型。
+ * @param group 当前参与协作的线程组。
+ * @param shared_data shared memory 指针，至少包含 group.num_threads() 个 int。
+ * @param value 当前线程要写入 shared memory 的值。
+ * @return group 内反向位置线程写入的值。
+ */
+template <typename GroupT>
+__device__ int exchangeReverse(GroupT group, int* shared_data, int value) {
+    const int rank = static_cast<int>(group.thread_rank());
+    const int size = static_cast<int>(group.num_threads());
+
+    // 每个线程把自己的 value 写到 group 内 rank 对应位置。
+    shared_data[rank] = value;
+
+    // 只同步传入的 group，而不是默认同步整个 block。
+    group.sync();
+
+    // 读取 group 内反向 rank 对应的值。
+    return shared_data[size - 1 - rank];
+}
+
+/**
+ * @brief 演示把 thread_block 作为函数参数传入。
+ *
+ * @param input device 输入数组。
+ * @param output device 输出数组。
+ * @param n 数组元素总数。
+ */
+__global__ void groupAsArgumentKernel(const int* __restrict__ input,
+                                      int* __restrict__ output,
+                                      int n) {
+    extern __shared__ int shared_data[];
+
+    cg::thread_block block = cg::this_thread_block();
+    const int global_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // 即使当前线程越界，也要参与 exchangeReverse 内部的 group.sync()。
+    const int value = (global_idx < n) ? input[global_idx] : 0;
+
+    // 函数内部不会偷偷假设同步范围是整个 block，而是使用调用方传入的 block。
+    const int exchanged = exchangeReverse(block, shared_data, value);
+
+    if (global_idx < n) {
+        output[global_idx] = exchanged;
+    }
+}
+```
+
+这个写法很适合封装小工具函数。相比在函数内部直接写 `__syncthreads()`，显式传入 `group` 的好处是：调用者必须意识到这个函数是 collective operation（集合操作），需要 group 内所有线程共同调用。
 
 ## 大范围线程组和 `cudaLaunchCooperativeKernel`
 
