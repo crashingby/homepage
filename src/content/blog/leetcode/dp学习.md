@@ -4967,3 +4967,408 @@ public:
 ```
 
 只要记住侧跳不改变点编号，这道题的状态就很稳定：`dp[lane]` 永远表示“已经处理到当前点，停在这条跑道的最小侧跳次数”。这也是它可以自然压成 $O(1)$ 空间的原因。
+
+## [1594. 矩阵的最大非负积 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-non-negative-product-in-a-matrix/description/)
+
+给你一个大小为 `m x n` 的矩阵 `grid`。最初位于左上角 `(0, 0)`，每一步只能向右或向下移动。
+
+在所有从左上角到右下角的路径中，找出路径乘积最大的**非负积**。如果最大乘积是负数，返回 `-1`；否则返回最大非负积对 $10^9 + 7$ 取余的结果。
+
+注意：**取余是在得到最大积之后执行的**，不能在 DP 过程中为了防溢出提前取余。因为乘积的正负号和大小关系都会被取余破坏。
+
+示例：
+
+```cpp
+grid = [[1,-2,1],
+        [1,-2,1],
+        [3,-4,1]]
+
+输出：8
+```
+
+一条最优路径的乘积是：
+
+$$
+1 \times 1 \times (-2) \times (-4) \times 1 = 8
+$$
+
+这道题可以看成 `152. 乘积最大子数组` 的网格拓展版。核心仍然是：**负数会让最大值和最小值互换**。
+
+### 递归切入（探索逻辑）
+
+如果只记录“到达某个格子的最大乘积”，会出问题。
+
+比如当前格子是负数：
+
+- 前面路径的最大正积乘上负数，会变成很小的负数。
+- 前面路径的最小负积乘上负数，反而会变成很大的正数。
+
+所以和 152 一样，必须同时记录两个状态：
+
+$$
+dfsMax(i, j) = 到达格子\ (i, j)\ 时，路径乘积的最大值
+$$
+
+$$
+dfsMin(i, j) = 到达格子\ (i, j)\ 时，路径乘积的最小值
+$$
+
+到达 `(i, j)` 只能来自上方 `(i - 1, j)` 或左方 `(i, j - 1)`。
+
+设：
+
+$$
+x = grid[i][j]
+$$
+
+那么所有候选值来自：
+
+$$
+dfsMax(i - 1, j) \times x,\quad dfsMin(i - 1, j) \times x
+$$
+
+以及：
+
+$$
+dfsMax(i, j - 1) \times x,\quad dfsMin(i, j - 1) \times x
+$$
+
+因此递归关系可以写成：
+
+$$
+dfsMax(i, j) =
+\max(candidates)
+$$
+
+$$
+dfsMin(i, j) =
+\min(candidates)
+$$
+
+其中 `candidates` 是所有能从上方或左方转移过来的乘积候选。
+
+### 定义定型（规范表达，处理偏移）
+
+这里继续使用 `+1` 安全垫写法。原网格 `grid[i][j]` 对应 DP 坐标：
+
+$$
+dp[i + 1][j + 1]
+$$
+
+定义两个 DP 数组：
+
+$$
+maxDp[i + 1][j + 1] = 从\ (0,0)\ 走到\ grid[i][j]\ 的最大路径乘积
+$$
+
+$$
+minDp[i + 1][j + 1] = 从\ (0,0)\ 走到\ grid[i][j]\ 的最小路径乘积
+$$
+
+安全垫初始化：
+
+- 第 0 行和第 0 列作为安全垫，初始化为不可达状态。
+- `maxDp` 的不可达值用负无穷，`minDp` 的不可达值用正无穷。
+- 设置 `maxDp[0][1] = minDp[0][1] = 1` 作为虚拟入口。
+
+为什么虚拟入口是 `1`？
+
+因为这道题是乘积 DP，进入起点前的“空路径乘积”应该是乘法单位元 `1`。这样起点 `(0, 0)` 可以通过统一转移算出来：
+
+$$
+maxDp[1][1] = minDp[1][1] = 1 \times grid[0][0]
+$$
+
+转移时，只看两个方向：
+
+- 上方：`maxDp[i][j + 1]` / `minDp[i][j + 1]`
+- 左方：`maxDp[i + 1][j]` / `minDp[i + 1][j]`
+
+设：
+
+$$
+x = grid[i][j]
+$$
+
+所有候选来自：
+
+$$
+maxDp[i][j + 1] \times x,\quad minDp[i][j + 1] \times x
+$$
+
+以及：
+
+$$
+maxDp[i + 1][j] \times x,\quad minDp[i + 1][j] \times x
+$$
+
+也就是：
+
+正式写成：
+
+$$
+candidates =
+\left\{
+maxDp[i][j + 1] \times x,\ 
+minDp[i][j + 1] \times x,\ 
+maxDp[i + 1][j] \times x,\ 
+minDp[i + 1][j] \times x
+\right\}
+$$
+
+其中不可达安全垫不参与候选计算。
+
+然后：
+
+$$
+maxDp[i + 1][j + 1] = \max(candidates)
+$$
+
+$$
+minDp[i + 1][j + 1] = \min(candidates)
+$$
+
+最后看右下角：
+
+```cpp
+if (maxDp[m][n] < 0) {
+    return -1;
+}
+return maxDp[m][n] % mod;
+```
+
+### 维度降级（空间优化）
+
+计算第 `i` 行时，只依赖：
+
+- 当前行左边的状态。
+- 上一行同列的状态。
+
+所以可以把二维 `maxDp` / `minDp` 压成两个一维数组：
+
+```cpp
+max_dp[col] = 当前处理到这一行时，走到 col 的最大乘积
+min_dp[col] = 当前处理到这一行时，走到 col 的最小乘积
+```
+
+更新 `(row, col)` 时：
+
+- `max_dp[col + 1]` / `min_dp[col + 1]` 更新前是上方状态。
+- `max_dp[col]` / `min_dp[col]` 是左方状态，因为当前行已经更新过 `col`。
+
+这和普通网格 DP 的滚动数组思路一致，只是每个格子要维护一对最大 / 最小乘积。
+
+### 维度互换（本题不需要）
+
+题目限制：
+
+$$
+1 \le m,n \le 15
+$$
+
+网格很小，二维 DP 已经足够清楚。虽然可以根据较短维度做滚动数组优化，但这道题的重点不是空间极限，而是**最大积和最小积同时维护**。
+
+### 状态“完备性”自检
+
+- **只记录最大积够不够？** 不够。当前值为负数时，之前的最小负积可能翻成最大正积。
+- **为什么要记录最小积？** 因为乘法遇到负数会反转大小关系，这是本题和普通路径和 DP 最大的区别。
+- **为什么不能提前取模？** 取模会破坏数值大小和正负号，DP 比较就不再可靠。只能在最终最大非负积确定后取模。
+- **为什么起点不用单独特判？** `maxDp[0][1] = minDp[0][1] = 1` 是乘法单位元入口，起点可以通过统一转移得到。
+- **为什么不可达安全垫不能直接参与乘法？** 负无穷乘负数会变成巨大的正数，正无穷乘负数会变成巨大的负数，会污染答案，所以代码里要检查前驱是否可达。
+- **为什么不需要记录路径？** 未来转移只关心到当前格子的最大 / 最小乘积，不关心具体经过哪些格子。
+- **遇到 0 怎么办？** `0` 会让候选乘积变成 `0`。它可能是答案，因为最大非负积允许为 `0`。
+
+### dp代码（优化前）
+
+这个版本完整保存每个格子的最大乘积和最小乘积，并使用 `+1` 安全垫处理边界。
+
+因为矩阵元素范围是 `[-4, 4]`，路径长度最多 `29`，乘积绝对值最多约为 $4^{29}$，需要使用 `long long`。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 计算从左上角到右下角的最大非负路径乘积。
+     *
+     * max_dp[row + 1][col + 1] 表示到达 grid[row][col] 时的最大路径乘积。
+     * min_dp[row + 1][col + 1] 表示到达 grid[row][col] 时的最小路径乘积。
+     * 第 0 行和第 0 列是安全垫，dp[0][1] = 1 表示进入起点前的虚拟入口。
+     * 需要同时维护最大值和最小值，因为当前格子为负数时二者会互换角色。
+     *
+     * @param grid 输入矩阵，每次只能向右或向下移动。
+     * @return 最大非负路径乘积对 1e9+7 取模；如果不存在非负积，返回 -1。
+     */
+    int maxProductPath(vector<vector<int>>& grid) {
+        constexpr long long kMod = 1000000007LL;
+        constexpr long long kNegInf = numeric_limits<long long>::min() / 4;
+        constexpr long long kPosInf = numeric_limits<long long>::max() / 4;
+        const int rows = static_cast<int>(grid.size());
+        const int cols = static_cast<int>(grid[0].size());
+
+        vector<vector<long long>> max_dp(rows + 1, vector<long long>(cols + 1, kNegInf));
+        vector<vector<long long>> min_dp(rows + 1, vector<long long>(cols + 1, kPosInf));
+
+        // 乘法单位元入口：进入起点之前，路径乘积视为 1。
+        max_dp[0][1] = 1;
+        min_dp[0][1] = 1;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const long long value = grid[row][col];
+                long long best_max = kNegInf;
+                long long best_min = kPosInf;
+
+                /**
+                 * @brief 用一个可达前驱更新当前格子的最大积和最小积。
+                 *
+                 * @param prev_max 前驱格子的最大路径乘积。
+                 * @param prev_min 前驱格子的最小路径乘积。
+                 */
+                auto relax = [&](long long prev_max, long long prev_min) {
+                    if (prev_max == kNegInf) {
+                        return;
+                    }
+
+                    const long long candidate_a = prev_max * value;
+                    const long long candidate_b = prev_min * value;
+                    best_max = max({best_max, candidate_a, candidate_b});
+                    best_min = min({best_min, candidate_a, candidate_b});
+                };
+
+                // 上方：原网格 (row - 1, col)，在安全垫坐标里是 [row][col + 1]。
+                relax(max_dp[row][col + 1], min_dp[row][col + 1]);
+
+                // 左方：原网格 (row, col - 1)，在安全垫坐标里是 [row + 1][col]。
+                relax(max_dp[row + 1][col], min_dp[row + 1][col]);
+
+                max_dp[row + 1][col + 1] = best_max;
+                min_dp[row + 1][col + 1] = best_min;
+            }
+        }
+
+        const long long answer = max_dp[rows][cols];
+        if (answer < 0) {
+            return -1;
+        }
+        return static_cast<int>(answer % kMod);
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$。
+- 空间复杂度：$O(mn)$。
+
+### 空间优化
+
+滚动数组版本只保留当前行状态，也继续使用 `+1` 安全垫：
+
+- `max_dp[col + 1]` / `min_dp[col + 1]` 更新前表示上方。
+- `max_dp[col]` / `min_dp[col]` 表示当前行左方。
+- `max_dp[1] = min_dp[1] = 1` 是虚拟入口。
+
+```cpp
+#include <algorithm>
+#include <limits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用滚动数组计算最大非负路径乘积。
+     *
+     * max_dp[col + 1] 表示当前行处理到原网格 col 时的最大路径乘积。
+     * min_dp[col + 1] 表示当前行处理到原网格 col 时的最小路径乘积。
+     * 更新当前格子时，dp[col + 1] 是上方状态，dp[col] 是左方状态。
+     *
+     * @param grid 输入矩阵，每次只能向右或向下移动。
+     * @return 最大非负路径乘积对 1e9+7 取模；如果不存在非负积，返回 -1。
+     */
+    int maxProductPath(vector<vector<int>>& grid) {
+        constexpr long long kMod = 1000000007LL;
+        constexpr long long kNegInf = numeric_limits<long long>::min() / 4;
+        constexpr long long kPosInf = numeric_limits<long long>::max() / 4;
+        const int rows = static_cast<int>(grid.size());
+        const int cols = static_cast<int>(grid[0].size());
+
+        vector<long long> max_dp(cols + 1, kNegInf);
+        vector<long long> min_dp(cols + 1, kPosInf);
+
+        // 乘法单位元入口：进入起点之前，路径乘积视为 1。
+        max_dp[1] = 1;
+        min_dp[1] = 1;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const long long value = grid[row][col];
+                long long best_max = kNegInf;
+                long long best_min = kPosInf;
+
+                /**
+                 * @brief 用一个可达前驱更新当前格子的最大积和最小积。
+                 *
+                 * @param prev_max 前驱格子的最大路径乘积。
+                 * @param prev_min 前驱格子的最小路径乘积。
+                 */
+                auto relax = [&](long long prev_max, long long prev_min) {
+                    if (prev_max == kNegInf) {
+                        return;
+                    }
+
+                    const long long candidate_a = prev_max * value;
+                    const long long candidate_b = prev_min * value;
+                    best_max = max({best_max, candidate_a, candidate_b});
+                    best_min = min({best_min, candidate_a, candidate_b});
+                };
+
+                // 上方：更新前的 dp[col + 1]。
+                relax(max_dp[col + 1], min_dp[col + 1]);
+
+                // 左方：当前行已经更新好的 dp[col]。
+                relax(max_dp[col], min_dp[col]);
+
+                max_dp[col + 1] = best_max;
+                min_dp[col + 1] = best_min;
+            }
+        }
+
+        const long long answer = max_dp[cols];
+        if (answer < 0) {
+            return -1;
+        }
+        return static_cast<int>(answer % kMod);
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$。
+- 空间复杂度：$O(n)$。
+
+### 这题的核心手感
+
+1594 的本质就是把 `152. 乘积最大子数组` 从一维搬到二维网格：
+
+```cpp
+只维护最大值不够 -> 同时维护最大积和最小积
+```
+
+普通路径和 DP 里，状态值越大越好；但乘积 DP 里，**最小负数也可能是未来最大正数的种子**。
+
+所以这题最重要的不是取模，也不是边界，而是这个状态对：
+
+$$
+(maxDp, minDp)
+$$
+
+只要看到“路径乘积 + 负数”，就应该立刻想到：最大值和最小值要一起走。
