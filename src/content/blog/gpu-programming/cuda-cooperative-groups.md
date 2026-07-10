@@ -303,6 +303,95 @@ cg::cluster_group this_cluster();
 - `map_shared_rank()` 和 `query_shared_rank()` 是 cluster / distributed shared memory 相关接口，普通 block 内 shared memory 代码通常用不到。
 - `this_cluster()` 需要硬件和 launch 配置支持。官方文档说明非 cluster launch 会按 `1x1x1` cluster 处理。
 
+### DSMEM 相关接口展开
+
+`map_shared_rank` 和 `query_shared_rank` 都属于 `cluster_group` 的 distributed shared memory（分布式 shared memory）接口。源码里它们是 `static` 成员函数，但 C++ 允许通过对象调用静态成员，所以实际代码里常见写法是：
+
+```cpp
+cg::cluster_group cluster = cg::this_cluster();
+int* remote_ptr = cluster.map_shared_rank(&local_value, rank);
+```
+
+#### `cluster_group::map_shared_rank`
+
+**用途**
+
+把一个 shared memory 地址映射到同一个 cluster 内指定 block rank 的 shared memory 地址。
+
+更具体地说：你传入的是**当前 block 的某个 shared memory 地址**，再指定目标 `rank`，CUDA 会返回“目标 block 中对应 shared memory 位置”的指针。
+
+**原型**
+
+```cpp
+template <typename T>
+static T* map_shared_rank(T* addr, int rank);
+```
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `addr` | `T*` | shared memory 指针，通常是当前 block 内 `__shared__` 对象或 shared memory 数组中某个元素的地址。这个地址提供“要映射哪一段 shared memory”的局部偏移。 |
+| `rank` | `int` | 目标 block 在当前 cluster 内的一维 rank，合法范围通常是 `[0, cluster.num_blocks())`。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `T*` | 指向目标 block 对应 shared memory 位置的指针。返回指针的元素类型保持为 `T*`，所以后续可以像普通指针一样读写。 |
+
+**副作用 / 约束**
+
+- 这个接口**不分配新内存**，只是把一个 shared memory 地址转换成目标 block 的 DSMEM 地址。
+- `addr` 应该来自 shared memory。传入 global memory、local memory 或普通 host 指针都不符合这个接口的语义。
+- `rank` 必须指向当前 cluster 内存在的 block。
+- 远端 block 的 shared memory 生命周期仍然绑定到那个 block。访问前后通常需要 `cluster.sync()`，保证远端 block 已经写完，并且在访问结束前不会退出。
+- 从源码可以看到它最终调用底层 intrinsic：`__cluster_map_shared_rank(addr, rank)`。
+
+**使用场景**
+
+- 一个 cluster 内多个 block 各自产生局部结果，然后由某个 block 直接读取其他 block 的 shared memory 做汇总。
+- block 之间交换小块中间数据，避免先写 global memory 再读回来。
+- 构造 cluster 级共享数据结构，例如分布式 histogram、分布式 scratch buffer。
+
+#### `cluster_group::query_shared_rank`
+
+**用途**
+
+查询一个 shared memory / DSMEM 地址属于当前 cluster 内哪个 block rank。
+
+这个接口可以理解成 `map_shared_rank` 的辅助查询：如果你拿到一个 DSMEM 指针，想知道它指向 cluster 内哪个 block 的 shared memory，就可以用它。
+
+**原型**
+
+```cpp
+static unsigned int query_shared_rank(const void* addr);
+```
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `addr` | `const void*` | 要查询的 shared memory / DSMEM 地址。参数是 `void*`，表示这个查询不关心元素类型，只关心地址归属。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `unsigned int` | `addr` 所属 shared memory segment 对应的 cluster 内 block rank。 |
+
+**副作用 / 约束**
+
+- 这是查询接口，不会修改 `addr` 指向的数据。
+- `addr` 应该是 cluster DSMEM 地址空间里的 shared memory 地址。
+- 从源码可以看到它最终调用底层 intrinsic：`__cluster_query_shared_rank(addr)`。
+
+**使用场景**
+
+- 调试或验证 DSMEM 指针映射是否符合预期。
+- 写泛型 DSMEM helper 时，根据指针反查它属于哪个 block。
+- 处理远端 shared memory 指针时，区分“本 block 地址”和“其他 block 地址”。
+
 ## `coalesced_group`
 
 **用途**
@@ -1952,14 +2041,111 @@ void cluster_arrive_wait_kernel(int* output) {
 
 Hopper thread block cluster 的一个关键能力是 distributed shared memory（分布式 shared memory）。每个 block 仍然有自己的 shared memory，但同一个 cluster 内的 block 可以通过 `map_shared_rank()` 把“本 block 的 shared memory 地址”映射到其他 block 的对应 shared memory 地址。
 
-核心接口：
+#### `map_shared_rank`
+
+**用途**
+
+把本 block 的 shared memory 地址映射到 cluster 内指定 block rank 的对应 shared memory 地址。
+
+**原型**
 
 ```cpp
 template <typename T>
-T* cluster.map_shared_rank(T* addr, int rank);
-
-unsigned int cluster.query_shared_rank(const void* addr);
+static T* cluster_group::map_shared_rank(T* addr, int rank);
 ```
+
+实际代码里通常写成：
+
+```cpp
+T* remote_addr = cluster.map_shared_rank(addr, rank);
+```
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `addr` | `T*` | 当前 block 内的 shared memory 地址。这个地址提供 shared memory 段内偏移，例如 `&local_value` 或 `shared_buffer + offset`。 |
+| `rank` | `int` | 目标 block 在当前 cluster 内的一维编号。通常来自 `cluster.block_rank()` 或循环变量，范围应在 `[0, cluster.num_blocks())`。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `T*` | 指向目标 block 对应 shared memory 位置的指针。类型保持为 `T*`，可以用 `*remote_addr` 或 `remote_addr[index]` 访问。 |
+
+**副作用 / 约束**
+
+- 不会分配内存，只做 DSMEM 地址映射。
+- `addr` 必须是 shared memory 地址；它描述的是“同一份 shared memory 布局里的哪个位置”。
+- 返回的是远端 block 的 shared memory 地址，访问前要确保远端 block 已经完成写入。
+- 访问结束前也要确保远端 block 不会退出，否则远端 shared memory 生命周期结束，指针就不再安全。
+
+#### `query_shared_rank`
+
+**用途**
+
+查询一个 shared memory / DSMEM 地址属于当前 cluster 内哪个 block rank。
+
+**原型**
+
+```cpp
+static unsigned int cluster_group::query_shared_rank(const void* addr);
+```
+
+实际代码里通常写成：
+
+```cpp
+unsigned int owner_rank = cluster.query_shared_rank(remote_addr);
+```
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `addr` | `const void*` | 需要查询归属的 shared memory / DSMEM 地址。使用 `void*` 是因为查询只关心地址属于哪个 block，不关心元素类型。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `unsigned int` | 该地址所属 shared memory segment 的 cluster 内 block rank。 |
+
+**副作用 / 约束**
+
+- 只查询地址归属，不读写 `addr` 指向的数据。
+- `addr` 应该来自 cluster DSMEM 地址空间。
+- 常用于调试、验证映射结果，或者在封装 DSMEM helper 时做地址归属判断。
+
+#### 两个接口怎么配合
+
+如果当前 block 有一个 shared memory 变量：
+
+```cpp
+__shared__ int local_value;
+```
+
+那么：
+
+```cpp
+int* ptr0 = cluster.map_shared_rank(&local_value, 0);
+int* ptr1 = cluster.map_shared_rank(&local_value, 1);
+```
+
+可以理解成：
+
+| 表达式 | 指针含义 |
+| --- | --- |
+| `&local_value` | 当前 block 自己的 `local_value` 地址。 |
+| `cluster.map_shared_rank(&local_value, 0)` | cluster 内 rank 0 block 的 `local_value` 地址。 |
+| `cluster.map_shared_rank(&local_value, 1)` | cluster 内 rank 1 block 的 `local_value` 地址。 |
+
+如果再查询：
+
+```cpp
+unsigned int owner = cluster.query_shared_rank(ptr1);
+```
+
+那么 `owner` 应该表示 `ptr1` 所属的 block rank。也就是说，`query_shared_rank` 查的是“这个 DSMEM 指针指向谁家的 shared memory”。
 
 一个最小示例：
 
@@ -2002,13 +2188,23 @@ void distributed_shared_memory_kernel(int* cluster_sums) {
         for (unsigned int rank = 0; rank < cluster.num_blocks(); rank++) {
             // 把本 block 的 &local_value 映射到 cluster 内 rank 号 block 的 local_value 地址。
             int* remote_value = cluster.map_shared_rank(&local_value, rank);
-            sum += *remote_value;
+
+            // 可选调试：验证这个 DSMEM 指针确实属于目标 block rank。
+            const unsigned int owner_rank = cluster.query_shared_rank(remote_value);
+
+            // 示例里不提前 return，因为 kernel 末尾还有 cluster.sync()。
+            // 部分线程提前退出会破坏 cluster 级同步语义。
+            if (owner_rank == rank) {
+                sum += *remote_value;
+            }
         }
 
         // 一个 cluster 有 num_blocks 个 block，这里用 blockIdx.x / num_blocks 得到 cluster 编号。
         const unsigned int cluster_id = blockIdx.x / cluster.num_blocks();
         cluster_sums[cluster_id] = sum;
     }
+    //这里必须也做同步，非常重要，不然其他的block可能会退出，再访问它们的共享内存就会出错
+    cluster.sync();
 }
 ```
 
@@ -2017,6 +2213,8 @@ void distributed_shared_memory_kernel(int* cluster_sums) {
 - `block.sync()` 保证本 block 内线程都看见 `local_value` 已初始化。
 - `cluster.sync()` 保证 cluster 内所有 block 都已经初始化各自的 `local_value`。
 - `map_shared_rank(&local_value, rank)` 不是分配新内存，而是把本 block 的 shared memory 地址映射成另一个 block 的 shared memory 地址。
+- `query_shared_rank(remote_value)` 可以反查 `remote_value` 属于 cluster 内哪个 block。它更偏查询 / 调试 / 封装 helper，不是每次访问 DSMEM 都必须调用。
+- `cluster.sync()` 最后的同步，防止不工作的block提前退出，导致访问它们的shared memory出错。
 
 ### 查询 occupancy
 
