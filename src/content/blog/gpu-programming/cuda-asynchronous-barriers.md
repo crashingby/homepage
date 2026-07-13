@@ -550,13 +550,37 @@ __shared__ barrier_t bar;
 
 从 compute capability 9.0 开始，shared memory 中 thread-block 或 cluster scope 的异步屏障可以显式跟踪 asynchronous transaction（异步事务）。这类屏障通常和 TMA（Tensor Memory Accelerator）等异步搬运机制配合使用。
 
-普通 barrier 只关心一件事：
+先把模型讲清楚：普通 `cuda::barrier` 的 phase 完成条件只有一个计数器。
 
 - **arrival count**：参与线程是否都已经 arrive。
 
-transaction barrier 额外关心：
+初始化时：
+
+```cpp
+init(&bar, expected);
+```
+
+可以理解成当前 phase 的 arrival count 从 `expected` 开始。每次：
+
+```cpp
+bar.arrive(update);
+```
+
+都会让 arrival count 减少 `update`。当 arrival count 变成 0，本 phase 完成，barrier 自动进入下一 phase。
+
+transaction barrier 在这个基础上又多跟踪一个东西：
 
 - **transaction count**：绑定到该 phase 的异步事务是否完成，单位由具体异步操作决定，常见是字节数。
+
+所以 SM90+ 上可以把 phase 完成条件理解成：
+
+```text
+arrival count == 0
+并且
+当前 phase 预期的 transaction 都完成
+```
+
+这就是它解决的问题：普通 barrier 只能回答“线程都到了吗”，transaction barrier 还要回答“线程发起的异步内存事务也完成了吗”。
 
 CUDA C++ 里相关接口包括：
 
@@ -565,11 +589,45 @@ cuda::device::barrier_arrive_tx(bar, arrive_count_update, transaction_count_upda
 cuda::device::barrier_expect_tx(bar, transaction_count_update);
 ```
 
+二者的区别可以先记成：
+
+| 接口 | 对 arrival count 的影响 | 对 transaction count 的影响 | 典型用途 |
+| --- | --- | --- | --- |
+| `bar.arrive(update)` | 减少 `update` | 不改变 | 只同步线程到达。 |
+| `cuda::device::barrier_arrive_tx(bar, arrive_update, tx_update)` | 减少 `arrive_update` | 增加 `tx_update` | 当前线程 arrive，同时声明本 phase 还要等一批异步事务。 |
+| `cuda::device::barrier_expect_tx(bar, tx_update)` | 不改变 | 增加 `tx_update` | 只声明本 phase 还要等一批异步事务，线程之后再用普通 `arrive()` 到达。 |
+
 ### `cuda::device::barrier_arrive_tx`
 
 **用途**
 
-在 arrive 的同时增加当前 phase 需要跟踪的 transaction count。
+在 arrive 的同时增加当前 phase 需要跟踪的 transaction count。它等价于把下面两件事做成一次原子更新：
+
+```text
+arrival count -= arrive_count_update
+expected transaction count += transaction_count_update
+```
+
+注意这里的方向刚好相反：
+
+- `arrive_count_update` 是 **减 arrival count**，表示“我到了”。
+- `transaction_count_update` 是 **加 expected transaction count**，表示“这个 phase 还要额外等这么多异步事务”。
+
+所以：
+
+```cpp
+auto token = cuda::device::barrier_arrive_tx(bar, 1, 1024);
+```
+
+可以读成：
+
+```text
+当前线程到达屏障：arrival count 减 1
+同时声明本 phase 还要等待 1024 个 transaction 单位完成
+返回当前 phase 的 arrival_token
+```
+
+如果这个 transaction 单位来自异步内存搬运，`1024` 常见含义就是“等待 1024 字节对应的异步事务完成”。具体单位由发起事务的异步原语定义；在常见异步搬运协议里，它就是字节数。
 
 **原型**
 
@@ -587,7 +645,82 @@ cuda::device::barrier_arrive_tx(
 | --- | --- | --- |
 | `bar` | `cuda::barrier<cuda::thread_scope_block>&` | 要更新的屏障对象。 |
 | `arrive_count_update` | `cuda::std::ptrdiff_t` | 本次 arrive 对 arrival count 的减少量。 |
-| `transaction_count_update` | `cuda::std::ptrdiff_t` | 本 phase 新增要等待的事务数量，常见理解是要等待的异步搬运字节数。 |
+| `transaction_count_update` | `cuda::std::ptrdiff_t` | 本 phase 新增要等待的 transaction 数量。常见异步搬运场景中可理解为要等待的字节数。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `arrival_token` | 和当前 phase 绑定的 token，后续传给 `bar.wait(cuda::std::move(token))`。 |
+
+**副作用 / 约束**
+
+- `bar` 必须位于 shared memory 中。
+- 只支持 compute capability 9.0 或更高。
+- `arrive_count_update` 至少为 1。
+- `transaction_count_update` 可以为 0；为 0 时，这次调用就退化成“带 token 的 arrive”。
+- `arrive_count_update` 和 `transaction_count_update` 都有实现上限，文档给出的上限是 `(1 << 20) - 1`。
+- 这个函数原子执行，并且这次调用 strongly happens-before 当前 phase 的 completion step 开始。
+
+最后一点很关键：如果一个线程既要让 arrival count 减少，又要为本 phase 增加 expected transaction count，把两件事合在 `barrier_arrive_tx` 里可以避免竞态。
+
+### 计数器怎么变化
+
+假设一个 block 有 4 个参与线程：
+
+```cpp
+init(&bar, 4);
+```
+
+当前 phase 初始状态可以理解成：
+
+| 状态 | 值 |
+| --- | --- |
+| `arrival_count` | 4 |
+| `expected_transaction_count` | 0 |
+
+现在 thread 0 发起一批异步事务，并调用：
+
+```cpp
+auto token0 = cuda::device::barrier_arrive_tx(bar, 1, 1024);
+```
+
+状态变成：
+
+| 状态 | 值 | 解释 |
+| --- | --- | --- |
+| `arrival_count` | 3 | thread 0 已经 arrive，所以从 4 减到 3。 |
+| `expected_transaction_count` | 1024 | 当前 phase 还要等待 1024 个 transaction 单位完成。 |
+
+随后其他三个线程调用：
+
+```cpp
+auto token = bar.arrive();
+```
+
+当三个普通 arrive 都完成后：
+
+| 状态 | 值 | phase 是否完成 |
+| --- | --- | --- |
+| `arrival_count` | 0 | 还不一定完成 |
+| `expected_transaction_count` | 1024 | 还要等异步事务完成 |
+
+这时线程已经“到齐”，但 phase 仍不能完成。只有当绑定到这个 phase 的异步事务也完成，transaction 部分被清掉后，等待这个 phase 的 `bar.wait(token)` 才会返回。
+
+可以画成：
+
+```mermaid
+flowchart LR
+    A["init(&bar, 4)<br>arrival=4, tx=0"] --> B["thread 0<br>barrier_arrive_tx(bar, 1, 1024)"]
+    B --> C["arrival=3<br>tx=1024"]
+    C --> D["thread 1/2/3<br>arrive()"]
+    D --> E["arrival=0<br>tx=1024"]
+    E --> F{"异步事务完成了吗？"}
+    F -- "否" --> G["wait(token) 继续阻塞"]
+    F -- "是" --> H["phase 完成<br>barrier 进入下一 phase"]
+```
+
+这就是 `transaction_count_update` 的直观含义：**它不是另一个 arrival decrement，而是给当前 phase 增加一笔“未来必须完成的异步事务账单”**。
 
 **示例**
 
@@ -607,17 +740,152 @@ __global__ void track_transaction_kernel()
     }
     block.sync();
 
-    // 这里 tx 更新为 0，只展示接口形状；真实 TMA 场景会传入待跟踪事务量。
+    // transaction_count_update = 0：
+    // 只展示接口形状，语义接近普通 arrive。
     auto token = cuda::device::barrier_arrive_tx(bar, 1, 0);
     bar.wait(cuda::std::move(token));
 }
 ```
+
+如果要展示 transaction 语义，可以写成下面这种抽象骨架：
+
+```cpp
+__global__ void track_async_transaction_kernel()
+{
+    using barrier_t = cuda::barrier<cuda::thread_scope_block>;
+
+    __shared__ barrier_t bar;
+
+    if (threadIdx.x == 0) {
+        init(&bar, blockDim.x);
+    }
+    __syncthreads();
+
+    barrier_t::arrival_token token;
+
+    if (threadIdx.x == 0) {
+        constexpr cuda::std::ptrdiff_t transaction_bytes = 1024;
+
+        // 这里代表“发起一批会在完成时通知 bar 的异步内存事务”。
+        // 具体事务可以来自某个异步搬运原语；本节只关心 barrier 计数模型。
+        launch_async_memory_transaction_associated_with(bar, transaction_bytes);
+
+        // 当前线程 arrive，同时声明本 phase 要额外等待 transaction_bytes。
+        token = cuda::device::barrier_arrive_tx(
+            bar,
+            1,
+            transaction_bytes);
+    } else {
+        // 其他线程只表达普通到达。
+        token = bar.arrive();
+    }
+
+    // wait 会同时等待：
+    // 1. arrival count 归零；
+    // 2. 当前 phase 的 transaction 完成。
+    bar.wait(cuda::std::move(token));
+}
+```
+
+这个例子里的 `launch_async_memory_transaction_associated_with()` 是概念占位，不是 CUDA 标准 API。它只是强调：transaction barrier 的关键不是普通线程多 arrive 一次，而是把某个异步内存事务的完成条件挂到当前 phase 上。
+
+### `cuda::device::barrier_expect_tx`
+
+**用途**
+
+只增加当前 phase 的 expected transaction count，不执行 arrive。
+
+可以把它理解成：
+
+```text
+expected transaction count += transaction_count_update
+arrival count 不变
+```
+
+它适合把“声明要等多少事务”和“线程 arrive”拆开写的场景。
+
+**原型**
+
+```cpp
+void cuda::device::barrier_expect_tx(
+    cuda::barrier<cuda::thread_scope_block>& bar,
+    cuda::std::ptrdiff_t transaction_count_update);
+```
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `bar` | `cuda::barrier<cuda::thread_scope_block>&` | 要更新 expected transaction count 的屏障对象。 |
+| `transaction_count_update` | `cuda::std::ptrdiff_t` | 当前 phase 新增要等待的 transaction 数量。可以为 0，常见上限是 `(1 << 20) - 1`。 |
+
+**示例**
+
+```cpp
+#include <cuda/barrier>
+
+__global__ void expect_then_arrive_kernel()
+{
+    using barrier_t = cuda::barrier<cuda::thread_scope_block>;
+
+    __shared__ barrier_t bar;
+
+    if (threadIdx.x == 0) {
+        init(&bar, blockDim.x);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        constexpr cuda::std::ptrdiff_t transaction_bytes = 1024;
+
+        // 先声明当前 phase 还要等一批异步事务。
+        cuda::device::barrier_expect_tx(bar, transaction_bytes);
+
+        // 再发起会通知该 barrier 的异步事务。
+        launch_async_memory_transaction_associated_with(bar, transaction_bytes);
+    }
+
+    // 所有线程按普通方式 arrive。
+    auto token = bar.arrive();
+    bar.wait(cuda::std::move(token));
+}
+```
+
+这里的重点是顺序：`barrier_expect_tx()` 必须在当前 phase 可能完成之前执行。否则 arrival count 可能已经归零，phase 已经进入下一轮，你再增加 transaction count 就不是你想要的同步协议了。
+
+### 两个接口怎么选
+
+| 写法 | 推荐场景 |
+| --- | --- |
+| `barrier_arrive_tx(bar, arrive_update, tx_update)` | 同一个线程既要 arrive，又要声明本 phase 要等待的异步事务。它把两个更新原子合并，最不容易写错。 |
+| `barrier_expect_tx(bar, tx_update)` + `bar.arrive()` | 声明 transaction 和线程 arrive 分属不同位置，或者需要先登记事务量、后面再按普通协议 arrive。 |
+| `bar.arrive()` | 只需要同步线程，不需要跟踪异步事务。 |
+
+一个实用判断是：
+
+- 如果“发起异步事务的线程”也正好要代表自己到达屏障，用 `barrier_arrive_tx()`。
+- 如果你要先登记一批事务，但线程到达逻辑在后面统一处理，用 `barrier_expect_tx()`。
+
+### 常见误解
+
+- **误解 1：`transaction_count_update` 会让 arrival count 再减一次。**  
+  不会。arrival count 只由 `arrive_count_update` 减少；`transaction_count_update` 增加的是 expected transaction count。
+
+- **误解 2：arrival count 归零就一定放行。**  
+  对普通 barrier 是这样；对 transaction barrier，还要等当前 phase 的 transaction 完成。
+
+- **误解 3：`transaction_count_update` 一定表示事务个数。**  
+  不一定。它的单位由异步操作定义。常见异步搬运场景里，它通常按字节数理解，所以会看到 `sizeof(smem_tile)` 这类写法。
+
+- **误解 4：`barrier_expect_tx()` 可以随便晚点调用。**  
+  不行。它必须在当前 phase 完成前发生。否则它可能更新到错误 phase，或者破坏同步协议。
 
 **注意点**
 
 - transaction barrier 是 Hopper / SM90 之后更重要的能力，老架构上不能按这个模型做测试。
 - 它解决的是“人到了，数据也到了吗”的问题，特别适合异步 global-to-shared 或 TMA 搬运。
 - 普通 `arrive()` 只能表达线程到达，不能表达异步事务完成。
+- `barrier_arrive_tx()` 的可用性可以用 `__cccl_lib_local_barrier_arrive_tx` 这类 feature flag 检查。
 
 ## 生产者-消费者模式
 
