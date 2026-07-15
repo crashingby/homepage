@@ -2150,6 +2150,156 @@ flowchart LR
 
 这里先只记调用顺序：`start_load_kv()` 在模型 forward 之前；`wait_for_layer_load()` 和 `save_kv_layer()` 在每个 attention layer 的 forward 前后；`wait_for_save()` 和 `get_finished()` 在模型 forward 之后。
 
+
+#### `maybe_transfer_kv_layer` 这个 hook 是在哪注册的
+
+这里的“注册”不是 `KVConnectorFactory` 那种 registry 注册，也不是 connector 初始化时动态把 hook 塞进去。它是更朴素的 Python decorator：attention 函数定义时，`@maybe_transfer_kv_layer` 直接把原始 attention forward 包成了一个 wrapper。
+
+也就是说，这个 hook 的挂载点在模型 attention 算子本身：
+
+源码位置：vllm/model_executor/layers/attention/attention.py；接口位置：`unified_attention_with_output()`。
+
+```python
+from vllm.model_executor.layers.attention.kv_transfer_utils import (
+    maybe_transfer_kv_layer,
+)
+
+
+@eager_break_during_capture
+@maybe_transfer_kv_layer
+def unified_attention_with_output(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    output_scale: torch.Tensor | None = None,
+    output_block_scale: torch.Tensor | None = None,
+    kv_cache_dummy_dep: torch.Tensor | None = None,
+) -> None:
+    # 这个参数不参与计算。
+    # 它的作用是给 torch.compile 制造数据依赖，保证 KV cache update
+    # 和 attention forward 的顺序不会被编译器重排。
+    del kv_cache_dummy_dep
+
+    # 根据 layer_name 找到当前 attention 层的上下文。
+    # 这里会拿到：
+    # - attn_metadata：本轮 attention 的调度元数据；
+    # - self：当前 Attention layer；
+    # - kv_cache：当前层对应的 paged KV cache；
+    # - layer_slot_mapping：KV 写入 slot 映射，这里没有直接用。
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+
+    # 真正执行 attention backend。
+    # 如果本轮是 prefill，K/V 会在前面的 KV cache update 路径写入
+    # paged KV buffer；attention forward 使用同一份 kv_cache。
+    self.impl.forward(
+        self,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+    )
+```
+
+MLA attention 也用同一个 hook：
+
+源码位置：vllm/model_executor/layers/attention/mla_attention.py；接口位置：`unified_mla_attention_with_output()`。
+
+```python
+@eager_break_during_capture
+@maybe_transfer_kv_layer
+def unified_mla_attention_with_output(
+    q: torch.Tensor,
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: LayerNameType,
+    ...
+) -> None:
+    # 和普通 attention 一样，先通过 layer_name 找到当前层上下文。
+    layer_name = _resolve_layer_name(layer_name)
+    attn_metadata, layer, kv_cache, _ = get_attention_context(layer_name)
+
+    # 再进入 MLA attention 的具体实现。
+    layer.forward_impl(
+        q,
+        kv_c_normed,
+        k_pe,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        ...
+    )
+```
+
+Python decorator 的执行时机是函数定义时。模块 import 到这里时，解释器会先创建原始 `unified_attention_with_output` 函数，然后把它传给 `maybe_transfer_kv_layer(func)`，返回的 `wrapper` 会替换原来的函数名。所以下游代码再调用 `unified_attention_with_output(...)` 时，实际先进入的是 `maybe_transfer_kv_layer` 生成的 wrapper。
+
+可以把它理解成手写了这句：
+
+```python
+unified_attention_with_output = eager_break_during_capture(
+    maybe_transfer_kv_layer(unified_attention_with_output)
+)
+```
+
+因此它不是在某个 P/D connector 里注册的，而是在 attention op 层静态挂好的。connector 只决定这个 wrapper 运行时是否真的做事。
+
+#### `maybe_transfer_kv_layer` 什么时候会调用
+
+只要模型 forward 走到这些统一 attention 函数，wrapper 就会被调用一次。因为每个 transformer layer 都会调用自己的 attention，所以它天然就是“每层调用一次”的 hook。
+
+但 wrapper 被调用不等于一定会传 KV。它有三层开关：
+
+| 条件 | 不满足时会怎样 | 含义 |
+| --- | --- | --- |
+| `has_kv_transfer_group()` | 直接执行原 attention forward | 当前 worker 进程没有初始化 KV connector。 |
+| `is_v1_kv_transfer_group()` | 直接执行原 attention forward | 只有 v1 connector 使用这一套逐层 hook。 |
+| `connector.has_connector_metadata()` | 直接执行原 attention forward | 本轮 scheduler 没有给 worker 绑定 KV transfer metadata。 |
+
+第三个条件最容易漏。它对应前面 worker 半边的：
+
+```python
+kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+kv_connector.start_load_kv(get_forward_context())
+```
+
+也就是说，`maybe_transfer_kv_layer` 真正开始调用 `wait_for_layer_load()` / `save_kv_layer()` 的前提是：
+
+1. worker 进程已经通过 `ensure_kv_transfer_initialized()` 创建了全局 connector；
+2. scheduler 本轮在 `SchedulerOutput.kv_connector_metadata` 里带了 connector metadata；
+3. model runner 在 forward 前调用 `bind_connector_metadata()` 把这份 metadata 绑定到 worker connector；
+4. attention forward 进入被 decorator 包过的 `unified_attention_with_output()` 或 `unified_mla_attention_with_output()`。
+
+所以完整时序是：
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler
+    participant W as Worker ModelRunner
+    participant C as Worker Connector
+    participant A as Attention Function
+
+    S->>S: build_connector_meta()
+    S-->>W: SchedulerOutput.kv_connector_metadata
+    W->>C: bind_connector_metadata()
+    W->>C: start_load_kv()
+    W->>A: unified_attention_with_output()
+    A->>C: wait_for_layer_load(layer_name)
+    A->>A: original attention forward
+    A->>C: save_kv_layer(layer_name, kv_cache, attn_metadata)
+    W->>C: wait_for_save()
+    W->>C: get_finished()
+    W->>C: clear_connector_metadata()
+```
+
+这也解释了为什么 hook 要挂在 attention 函数上，而不是挂在整个 model forward 上：KV cache 是按 layer 组织的，很多 connector 可以一边算前面的层，一边异步搬后面的层；到某一层真正要用 KV 时，再 `wait_for_layer_load(layer_name)` 精确等待这一层。
+
 ### NIXL 对这些接口的具体实现
 
 上面讲的是“谁调用这些接口”。下面再看你当前用的 `NixlConnector`，也就是 `NixlPullConnector`，这些接口具体落到哪里。
