@@ -5757,3 +5757,435 @@ $$
 左边格子的“向右离开”会成为当前格子的 `fromLeft`，上边格子的“向下离开”会成为当前格子的 `fromTop`。
 
 空格会合并来源，并把路径同时分发到两个方向；镜子不合并来源，而是把方向交叉反射。只要抓住这一点，连续反射、越界失效、终点统计都会自然落到同一套安全垫转移里。
+
+## 基础 0-1 背包
+
+0-1 背包没有固定题目链接，可以把它当作背包类 DP 的**最基础地基**。
+
+给定 `n` 个物品和一个容量为 `capacity` 的背包。第 `i` 个物品有重量 `weight[i]` 和价值 `value[i]`，每个物品**最多只能选择一次**。请问在不超过背包容量的前提下，最多能获得多少总价值？
+
+示例：
+
+```text
+输入：
+capacity = 4
+weight = [1, 3, 4]
+value  = [15, 20, 30]
+
+输出：
+35
+
+解释：
+选择重量为 1 和 3 的两个物品，总重量为 4，总价值为 35。
+```
+
+不要先急着背模板，而是先把**状态是什么**、**来源从哪里来**、**当前格子如何更新**想清楚。
+
+### 递归切入（探索逻辑）
+
+先不要急着写 `dp` 数组。按照前面的 DP 学习方法，先问自己：**当前这个物品，我到底选不选？**
+
+定义 `dfs(index, cap)` 表示：从下标 `index` 开始考虑物品，当前背包剩余容量为 `cap` 时，最多还能获得多少价值。
+
+站在第 `index` 个物品面前，只有两个选择：
+
+- **不选当前物品**：直接跳到下一个物品，价值为 `dfs(index + 1, cap)`。
+- **选当前物品**：前提是 `cap >= weight[index]`，价值为 `value[index] + dfs(index + 1, cap - weight[index])`。
+
+递归边界也很自然：
+
+- 如果 `index == n`，说明所有物品都看完了，返回 0。
+- 如果 `cap == 0`，说明背包已经没有容量了，返回 0。
+
+所以递归表达式可以写成：
+
+$$
+dfs(index, cap) =
+\max(
+dfs(index + 1, cap),\
+value[index] + dfs(index + 1, cap - weight[index])
+)
+$$
+
+其中第二项只有在 `cap >= weight[index]` 时才能选择。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用暴力递归探索基础 0-1 背包的决策结构。
+     *
+     * @param weight 每个物品的重量，weight[i] 对应第 i 个物品。
+     * @param value 每个物品的价值，value[i] 对应第 i 个物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int knapsack01(const vector<int>& weight, const vector<int>& value, int capacity) {
+        return dfs(weight, value, 0, capacity);
+    }
+
+private:
+    int dfs(const vector<int>& weight, const vector<int>& value, int index, int cap) {
+        if (index == static_cast<int>(weight.size()) || cap == 0) {
+            return 0;
+        }
+
+        // 不选当前物品。
+        int best_value = dfs(weight, value, index + 1, cap);
+
+        if (cap >= weight[index]) {
+            // 选当前物品。index 向后移动，保证每个物品最多选一次。
+            best_value = max(
+                best_value,
+                value[index] + dfs(weight, value, index + 1, cap - weight[index]));
+        }
+
+        return best_value;
+    }
+};
+```
+
+这个递归会出现大量重复状态。例如多个路径都可能走到同一个 `(index, cap)`，所以可以加 `memo[index][cap]` 做记忆化。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求解基础 0-1 背包最大价值。
+     *
+     * @param weight 每个物品的重量，weight[i] 对应第 i 个物品。
+     * @param value 每个物品的价值，value[i] 对应第 i 个物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int knapsack01(const vector<int>& weight, const vector<int>& value, int capacity) {
+        const int n = static_cast<int>(weight.size());
+        vector<vector<int>> memo(n, vector<int>(capacity + 1, -1));
+        return dfs(weight, value, memo, 0, capacity);
+    }
+
+private:
+    int dfs(
+        const vector<int>& weight,
+        const vector<int>& value,
+        vector<vector<int>>& memo,
+        int index,
+        int cap) {
+        if (index == static_cast<int>(weight.size()) || cap == 0) {
+            return 0;
+        }
+
+        int& cached = memo[index][cap];
+        if (cached != -1) {
+            return cached;
+        }
+
+        cached = dfs(weight, value, memo, index + 1, cap);
+        if (cap >= weight[index]) {
+            cached = max(
+                cached,
+                value[index] + dfs(weight, value, memo, index + 1, cap - weight[index]));
+        }
+
+        return cached;
+    }
+};
+```
+
+到这里再翻译成 DP 就很自然了：
+
+- 递归里的 `index` 对应 DP 中“考虑到第几个物品”。
+- 递归里的 `cap` 对应 DP 中“当前容量”。
+- 递归里的“不选 / 选”两条分支，对应 DP 转移中的两个来源。
+
+### 状态定义
+
+**思考过程**：为了求“前若干个物品，在某个容量限制下能拿到的最大价值”，我需要记录什么？
+
+- **物品维度**：当前考虑到第几个物品。
+- **容量维度**：当前背包容量还允许放多少重量。
+- **状态定义**：设 `dp[i][j]` 表示只考虑前 `i` 个物品，背包容量不超过 `j` 时能获得的最大价值。
+
+这里的状态是完备的：当我站在 `dp[i][j]`，只需要知道“前 `i - 1` 个物品在不同容量下的最优结果”，不需要知道这些结果具体选了哪些物品，因此满足无后效性。
+
+### 状态转移
+
+**思考过程**：看第 `i` 个物品的最后决策。它只有两种选择：
+
+- **不选第 `i` 个物品**：答案继承 `dp[i - 1][j]`。
+- **选第 `i` 个物品**：前提是 `j >= weight[i - 1]`，此时答案来自 `dp[i - 1][j - weight[i - 1]] + value[i - 1]`。
+
+所以转移方程是：
+
+$$
+dp[i][j] =
+\begin{cases}
+dp[i - 1][j], & j < weight[i - 1] \\
+\max(dp[i - 1][j],\ dp[i - 1][j - weight[i - 1]] + value[i - 1]), & j \ge weight[i - 1]
+\end{cases}
+$$
+
+和 3665 类似，这里的关键也是识别来源：
+
+- 3665 中，当前格子的来源是左边和上边。
+- 0-1 背包中，当前状态的来源是“不选当前物品”和“选当前物品”。
+
+只要来源拆清楚，转移就不会凭空出现。
+
+### 初始化
+
+- `dp[0][j] = 0`：不考虑任何物品时，无论容量多大，最大价值都是 0。
+- `dp[i][0] = 0`：背包容量为 0 时，无法放入任何正重量物品，最大价值也是 0。
+
+这两个边界相当于给 DP 表铺好“安全垫”，后面的状态都能用统一公式自然推出来。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `i = 1` 到 `n`，逐个加入物品。
+- 内层从 `j = 0` 到 `capacity`，枚举当前容量。
+
+因为 `dp[i][j]` 只依赖上一行 `dp[i - 1][...]`，所以上一行必须先算好。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求解基础 0-1 背包最大价值。
+     *
+     * @param weight 每个物品的重量，weight[i] 对应第 i 个物品。
+     * @param value 每个物品的价值，value[i] 对应第 i 个物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int knapsack01(const vector<int>& weight, const vector<int>& value, int capacity) {
+        const int n = static_cast<int>(weight.size());
+        vector<vector<int>> dp(n + 1, vector<int>(capacity + 1, 0));
+
+        for (int item = 1; item <= n; item++) {
+            const int item_weight = weight[item - 1];
+            const int item_value = value[item - 1];
+
+            for (int cap = 0; cap <= capacity; cap++) {
+                // 不选当前物品：直接继承上一行结果。
+                dp[item][cap] = dp[item - 1][cap];
+
+                if (cap >= item_weight) {
+                    // 选当前物品：只能从上一行转移，保证每个物品最多选一次。
+                    dp[item][cap] = max(
+                        dp[item][cap],
+                        dp[item - 1][cap - item_weight] + item_value);
+                }
+            }
+        }
+
+        return dp[n][capacity];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times capacity)$。
+- 空间复杂度：$O(n \times capacity)$。
+
+### 空间优化
+
+观察二维转移：
+
+$$
+dp[i][j] \leftarrow dp[i - 1][j]
+$$
+
+$$
+dp[i][j] \leftarrow dp[i - 1][j - weight[i - 1]] + value[i - 1]
+$$
+
+当前行只依赖上一行，所以可以压成一维：
+
+- `dp[j]` 表示当前已经处理过的物品中，容量不超过 `j` 时的最大价值。
+- 处理一个新物品时，尝试用它更新各个容量。
+
+**关键点：0-1 背包的一维容量必须逆序遍历。**
+
+这不是一个单纯的代码写法，而是 0-1 背包一维优化最核心的约束。
+
+先回到二维转移：
+
+$$
+dp[i][j] = \max(dp[i - 1][j],\ dp[i - 1][j - weight[i - 1]] + value[i - 1])
+$$
+
+注意右边两项都来自**上一行** `i - 1`，含义是：在决定第 `i` 个物品选不选时，之前的状态里还没有用过第 `i` 个物品。
+
+压成一维之后，`dp[j]` 既要表示上一行，又要原地更新成当前行。问题就来了：
+
+- 更新前的 `dp[j]`：表示还没处理当前物品时，容量 `j` 的最优值，也就是二维里的 `dp[i - 1][j]`。
+- 更新后的 `dp[j]`：表示处理完当前物品后，容量 `j` 的最优值，也就是二维里的 `dp[i][j]`。
+
+因此，当我们计算：
+
+$$
+dp[j] = \max(dp[j],\ dp[j - weight] + value)
+$$
+
+这里的 `dp[j - weight]` 必须还是**上一行的旧值**。只有这样，`dp[j - weight] + value` 才表示“在没有选过当前物品的基础上，再选一次当前物品”。
+
+### 为什么正序遍历会错？
+
+用最小例子看最清楚：
+
+```text
+capacity = 4
+weight = [2]
+value  = [10]
+```
+
+只有一个物品，重量为 2，价值为 10。因为是 0-1 背包，这个物品最多只能选一次，所以正确答案应该是 10。
+
+如果容量正序遍历：
+
+```cpp
+for (int cap = item_weight; cap <= capacity; cap++) {
+    dp[cap] = max(dp[cap], dp[cap - item_weight] + item_value);
+}
+```
+
+初始状态：
+
+```text
+dp = [0, 0, 0, 0, 0]
+```
+
+处理这个物品时：
+
+- `cap = 2`：`dp[2] = max(dp[2], dp[0] + 10) = 10`。
+- `cap = 3`：`dp[3] = max(dp[3], dp[1] + 10) = 10`。
+- `cap = 4`：`dp[4] = max(dp[4], dp[2] + 10) = 20`。
+
+问题出在 `cap = 4`：此时 `dp[2]` 已经在本轮被当前物品更新成了 10。再用 `dp[2] + 10` 更新 `dp[4]`，就等于把同一个重量为 2 的物品又选了一次。
+
+于是正序遍历得到：
+
+```text
+dp = [0, 0, 10, 10, 20]
+```
+
+`dp[4] = 20` 明显不合法，因为只有一个物品，不可能拿到两份价值 10。
+
+### 为什么逆序遍历就对？
+
+还是同一个例子，如果容量逆序遍历：
+
+```cpp
+for (int cap = capacity; cap >= item_weight; cap--) {
+    dp[cap] = max(dp[cap], dp[cap - item_weight] + item_value);
+}
+```
+
+初始状态仍然是：
+
+```text
+dp = [0, 0, 0, 0, 0]
+```
+
+处理这个物品时：
+
+- `cap = 4`：读取的是旧的 `dp[2] = 0`，所以 `dp[4] = max(0, 0 + 10) = 10`。
+- `cap = 3`：读取的是旧的 `dp[1] = 0`，所以 `dp[3] = 10`。
+- `cap = 2`：读取的是旧的 `dp[0] = 0`，所以 `dp[2] = 10`。
+
+逆序遍历得到：
+
+```text
+dp = [0, 0, 10, 10, 10]
+```
+
+这就符合 0-1 背包的含义：容量为 2、3、4 时，都最多只能选这一个物品，因此最大价值都是 10。
+
+### 逆序遍历的本质
+
+逆序遍历不是为了“防止数组覆盖”这么简单，而是为了在一维数组中模拟二维 DP 的**上一行依赖**：
+
+- 二维 DP 中，`dp[i][j]` 必须从 `dp[i - 1][...]` 转移。
+- 一维 DP 中，逆序遍历保证 `dp[j - weight]` 还没被当前物品更新，所以它仍然等价于二维里的 `dp[i - 1][j - weight]`。
+- 如果正序遍历，`dp[j - weight]` 可能已经变成当前行 `dp[i][j - weight]`，这就会把 0-1 背包悄悄改成“当前物品可以重复选”的效果。
+
+所以这句代码：
+
+```cpp
+for (int cap = capacity; cap >= item_weight; cap--)
+```
+
+真正表达的是：**当前物品只能基于上一轮物品集合的结果来转移，不能基于本轮已经更新过的结果继续转移。**
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维滚动 DP 求解基础 0-1 背包最大价值。
+     *
+     * @param weight 每个物品的重量，weight[i] 对应第 i 个物品。
+     * @param value 每个物品的价值，value[i] 对应第 i 个物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int knapsack01(const vector<int>& weight, const vector<int>& value, int capacity) {
+        const int n = static_cast<int>(weight.size());
+        vector<int> dp(capacity + 1, 0);
+
+        for (int item = 0; item < n; item++) {
+            const int item_weight = weight[item];
+            const int item_value = value[item];
+
+            // 逆序遍历容量，避免当前物品在同一轮中被重复使用。
+            for (int cap = capacity; cap >= item_weight; cap--) {
+                dp[cap] = max(dp[cap], dp[cap - item_weight] + item_value);
+            }
+        }
+
+        return dp[capacity];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times capacity)$。
+- 空间复杂度：$O(capacity)$。
+
+### 这题的核心手感
+
+0-1 背包的核心不是背代码模板，而是牢牢记住这个状态含义：
+
+$$
+dp[j] = \text{当前已处理物品中，容量不超过 } j \text{ 时的最大价值}
+$$
+
+每个物品来到面前时，只有两个动作：
+
+- 不选它：`dp[j]` 保持不变。
+- 选它：尝试用 `dp[j - weight] + value` 更新 `dp[j]`。
+
+二维 DP 里，“上一行”天然保证当前物品只用一次；压成一维后，就必须通过**逆序遍历容量**保留这个约束。这就是 0-1 背包和完全背包最重要的分水岭，也是后续所有背包变体的地基。
