@@ -6189,3 +6189,388 @@ $$
 - 选它：尝试用 `dp[j - weight] + value` 更新 `dp[j]`。
 
 二维 DP 里，“上一行”天然保证当前物品只用一次；压成一维后，就必须通过**逆序遍历容量**保留这个约束。这就是 0-1 背包和完全背包最重要的分水岭，也是后续所有背包变体的地基。
+
+## [416. 分割等和子集 - 力扣（LeetCode）](https://leetcode.cn/problems/partition-equal-subset-sum/description/)
+
+给你一个只包含正整数的非空数组 `nums`。请你判断是否可以将这个数组分割成两个子集，使得两个子集的元素和相等。
+
+示例 1：
+
+```text
+输入：nums = [1,5,11,5]
+输出：true
+解释：数组可以分割成 [1, 5, 5] 和 [11]。
+```
+
+示例 2：
+
+```text
+输入：nums = [1,2,3,5]
+输出：false
+解释：数组不能分割成两个元素和相等的子集。
+```
+
+提示：
+
+- `1 <= nums.length <= 200`
+- `1 <= nums[i] <= 100`
+
+这题就是 0-1 背包的第一个典型变形：**不是问最大价值，而是问能不能刚好装满背包**。
+
+### 题目如何转成 0-1 背包？
+
+如果数组能被分成两个和相等的子集，设数组总和为 `sum`，那么两个子集的和都必须是：
+
+$$
+target = \frac{sum}{2}
+$$
+
+所以第一步先判断：
+
+- 如果 `sum` 是奇数，直接返回 `false`，因为不可能平分。
+- 如果 `sum` 是偶数，问题就变成：**能不能从 `nums` 中选出若干个数，使它们的和刚好等于 `target`？**
+
+这时就和基础 0-1 背包完全对上了：
+
+- **物品**：数组里的每个数 `nums[i]`。
+- **重量**：这个数本身，也就是 `nums[i]`。
+- **价值 / 目标**：这里不再关心最大价值，只关心某个容量能否被凑出来。
+- **背包容量**：`target`。
+- **0-1 约束**：每个数只能用一次，要么选，要么不选。
+
+也就是说，416 的本质是：
+
+> 给你一堆物品，每个物品的重量是 `nums[i]`，每个物品只能选一次，问能不能刚好装满容量为 `target` 的背包。
+
+### 递归切入（探索逻辑）
+
+仍然先从递归想，不要直接背一维 `dp`。
+
+定义 `dfs(index, remain)` 表示：从下标 `index` 开始考虑数字，当前还需要凑出 `remain`，最后能不能成功。
+
+站在 `nums[index]` 面前，还是只有两个选择：
+
+- **不选当前数字**：继续看下一个数，状态变成 `dfs(index + 1, remain)`。
+- **选当前数字**：前提是 `remain >= nums[index]`，状态变成 `dfs(index + 1, remain - nums[index])`。
+
+递归边界：
+
+- 如果 `remain == 0`，说明已经刚好凑出目标和，返回 `true`。
+- 如果 `index == nums.size()`，说明数字都看完了还没凑出来，返回 `false`。
+- 如果 `remain < 0`，说明当前选择超出了目标，返回 `false`。在正整数数组里，也可以通过选择前判断避免进入这个状态。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+dfs(index + 1, remain)\ \lor\ dfs(index + 1, remain - nums[index])
+$$
+
+第二项只有在 `remain >= nums[index]` 时才成立。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用暴力递归判断数组能否分割成两个等和子集。
+     *
+     * @param nums 输入数组，只包含正整数。
+     * @return 如果可以分割成两个和相等的子集，返回 true；否则返回 false。
+     */
+    bool canPartition(vector<int>& nums) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (total_sum % 2 != 0) {
+            return false;
+        }
+
+        return dfs(nums, 0, total_sum / 2);
+    }
+
+private:
+    bool dfs(const vector<int>& nums, int index, int remain) {
+        if (remain == 0) {
+            return true;
+        }
+        if (index == static_cast<int>(nums.size())) {
+            return false;
+        }
+
+        // 不选当前数字。
+        if (dfs(nums, index + 1, remain)) {
+            return true;
+        }
+
+        // 选当前数字。index 向后移动，保证每个数字最多使用一次。
+        if (remain >= nums[index]) {
+            return dfs(nums, index + 1, remain - nums[index]);
+        }
+
+        return false;
+    }
+};
+```
+
+这个递归会重复计算大量 `(index, remain)` 状态，所以可以加记忆化。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索判断数组能否分割成两个等和子集。
+     *
+     * @param nums 输入数组，只包含正整数。
+     * @return 如果可以分割成两个和相等的子集，返回 true；否则返回 false。
+     */
+    bool canPartition(vector<int>& nums) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (total_sum % 2 != 0) {
+            return false;
+        }
+
+        const int target = total_sum / 2;
+        vector<vector<int>> memo(nums.size(), vector<int>(target + 1, -1));
+        return dfs(nums, memo, 0, target);
+    }
+
+private:
+    bool dfs(const vector<int>& nums, vector<vector<int>>& memo, int index, int remain) {
+        if (remain == 0) {
+            return true;
+        }
+        if (index == static_cast<int>(nums.size())) {
+            return false;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != -1) {
+            return cached == 1;
+        }
+
+        bool can_make = dfs(nums, memo, index + 1, remain);
+        if (!can_make && remain >= nums[index]) {
+            can_make = dfs(nums, memo, index + 1, remain - nums[index]);
+        }
+
+        cached = can_make ? 1 : 0;
+        return can_make;
+    }
+};
+```
+
+到这里可以看到，416 和基础 0-1 背包的思考骨架是一模一样的：
+
+- 递归里的 `index` 对应“考虑到第几个数字”。
+- 递归里的 `remain` 对应“还剩多少容量需要填满”。
+- 每个数字都有“不选 / 选”两条分支。
+- 因为每个数字只能用一次，所以递归里一旦处理 `nums[index]`，下一步必须去 `index + 1`。
+
+### 状态定义
+
+把递归翻译成 DP 时，可以定义：
+
+`dp[i][j]` 表示只考虑前 `i` 个数字时，能否凑出和 `j`。
+
+这里的 `dp` 值不是最大价值，而是一个布尔值：
+
+- `true`：可以从前 `i` 个数字中选出若干个，刚好凑出 `j`。
+- `false`：无法凑出 `j`。
+
+最终答案就是：
+
+$$
+dp[n][target]
+$$
+
+### 状态转移
+
+仍然看当前数字 `nums[item]`。因为 `dp` 多开了一行安全垫，所以 `dp[item]` 表示还没处理 `nums[item]` 之前的状态，`dp[item + 1]` 表示处理完 `nums[item]` 之后的状态。
+
+- **不选当前数字**：如果处理当前数字之前已经能凑出 `sum`，那么处理完当前数字后也能凑出 `sum`。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前数字**：如果处理当前数字之前能凑出 `sum - nums[item]`，那么再加上当前数字，就能凑出 `sum`。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum - nums[item]]
+$$
+
+合起来就是：
+
+$$
+dp[item + 1][sum] =
+dp[item][sum]\ \lor\ dp[item][sum - nums[item]]
+$$
+
+第二项需要满足 `sum >= nums[item]`。
+
+### 初始化
+
+- `dp[0][0] = true`：不选任何数字，可以凑出和 0。
+- `dp[0][j] = false`，其中 `j > 0`：不选任何数字，不可能凑出正数和。
+
+这和基础 0-1 背包里的 `dp[0][j] = 0` 很像，都是给第一行打底。只不过这题的状态是“能不能凑出”，所以初始化要表达可达性。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `n - 1`，逐个处理真实数字 `nums[item]`。
+- 内层从 `sum = 0` 到 `target`，枚举当前要凑出的和。
+
+因为 `dp[item + 1][sum]` 只依赖上一行 `dp[item][...]`，所以二维写法里容量正序或逆序都可以，关键是来源必须是上一行。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 0-1 背包判断数组能否分割成两个等和子集。
+     *
+     * @param nums 输入数组，只包含正整数。
+     * @return 如果可以分割成两个和相等的子集，返回 true；否则返回 false。
+     */
+    bool canPartition(vector<int>& nums) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (total_sum % 2 != 0) {
+            return false;
+        }
+
+        const int n = static_cast<int>(nums.size());
+        const int target = total_sum / 2;
+        vector<vector<char>> dp(n + 1, vector<char>(target + 1, 0));
+        dp[0][0] = 1;
+
+        for (int item = 0; item < n; item++) {
+            const int num = nums[item];
+
+            for (int sum = 0; sum <= target; sum++) {
+                // 不选当前数字：继承上一行的可达性。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= num) {
+                    // 选当前数字：只能从上一行转移，保证每个数字最多使用一次。
+                    dp[item + 1][sum] = dp[item + 1][sum] || dp[item][sum - num];
+                }
+            }
+        }
+
+        return dp[n][target];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times target)$。
+- 空间复杂度：$O(n \times target)$。
+
+### 空间优化
+
+二维转移里，当前行只依赖上一行，所以可以压成一维：
+
+`dp[j]` 表示当前已经处理过的数字中，能否凑出和 `j`。
+
+更新当前数字 `num` 时：
+
+$$
+dp[j] = dp[j]\ \lor\ dp[j - num]
+$$
+
+这和基础 0-1 背包的一维优化完全一样，容量必须逆序遍历：
+
+```cpp
+for (int sum = target; sum >= num; sum--)
+```
+
+原因仍然是 0-1 约束：当前数字只能用一次。逆序遍历保证 `dp[sum - num]` 还是处理当前数字之前的旧状态，也就是二维 DP 里的上一行。
+
+如果正序遍历，就可能在同一轮里反复使用当前数字。比如 `nums = [2]`，`target = 4`：
+
+- 正序到 `sum = 2` 时，`dp[2]` 会被当前数字 `2` 更新成 `true`。
+- 继续正序到 `sum = 4` 时，又会用刚刚更新过的 `dp[2]` 推出 `dp[4] = true`。
+- 这就等于把同一个 `2` 用了两次，但 0-1 背包不允许这样做。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 0-1 背包判断数组能否分割成两个等和子集。
+     *
+     * @param nums 输入数组，只包含正整数。
+     * @return 如果可以分割成两个和相等的子集，返回 true；否则返回 false。
+     */
+    bool canPartition(vector<int>& nums) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (total_sum % 2 != 0) {
+            return false;
+        }
+
+        const int target = total_sum / 2;
+        vector<char> dp(target + 1, 0);
+        dp[0] = 1;
+
+        for (const int num : nums) {
+            // 逆序遍历，保证当前数字不会在同一轮中被重复使用。
+            for (int sum = target; sum >= num; sum--) {
+                dp[sum] = dp[sum] || dp[sum - num];
+            }
+        }
+
+        return dp[target];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times target)$。
+- 空间复杂度：$O(target)$。
+
+### 这题的核心手感
+
+416 的关键，是把“分成两个等和子集”翻译成一个更熟悉的问题：
+
+> 能不能从数组里选出若干个数，使它们刚好凑出 `sum / 2`？
+
+一旦翻译成这个问题，它就是标准 0-1 背包：
+
+- 每个 `nums[i]` 是一个物品。
+- 物品重量就是 `nums[i]`。
+- 背包容量是 `target = sum / 2`。
+- 每个物品只能选一次，所以一维优化时必须逆序遍历。
+
+和基础 0-1 背包不同的是，基础题常写成“最大价值”，而 416 写成“可达性”：
+
+$$
+dp[j] = \text{当前已处理数字中，能否凑出和 } j
+$$
+
+所以转移从 `max` 变成了逻辑或：
+
+$$
+dp[j] = dp[j]\ \lor\ dp[j - num]
+$$
+
+但它们的骨架完全一样：**不选当前物品，状态保持；选当前物品，从上一轮的剩余容量转移过来**。理解这一点，416 就不是新题，而是 0-1 背包地基上的第一块砖。
