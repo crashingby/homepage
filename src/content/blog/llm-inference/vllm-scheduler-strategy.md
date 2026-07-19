@@ -468,6 +468,125 @@ stateDiagram-v2
 
 `running` 优先的原因是：普通 decode 的欠账通常只有一个 token，先混入 batch 能改善 ITL；长 prefill 则通过 `long_prefill_token_threshold` 与全局 `token_budget` 被切块，不能独占 batch。实际控制流是：`running` 推进（KV 不足时可能抢占）→ 无抢占且未暂停时接纳 `waiting` → 封装输出 → 乐观推进本地前沿。
 
+### `Scheduler` 的全局账本：读 `schedule()` 前必须认识的成员
+
+`Request` 保存单请求的前沿：目标长度 `T`、已计算前沿 `C`、欠账 `T - C`。`Scheduler` 保存跨请求共享的上限、队列与开关。对普通 running 请求，代码先得到：
+
+    candidate = request.num_tokens_with_spec
+                + request.num_output_placeholders
+                - request.num_computed_tokens
+
+随后依次用长 prefill 阈值、batch 剩余预算、模型长度、encoder、Mamba 对齐和 KV 容量截断。换言之，`num_new_tokens` 是“请求欠账”被全局约束后的结果；它不是一个独立配置。
+
+#### 数值、长度与预算成员
+
+| 成员 | 来源 / 单位 | 在 `schedule()` 中的含义与影响 |
+| --- | --- | --- |
+| `max_num_scheduled_tokens` | 每 batch 最大调度 token 数；未单设时回退到 `max_num_batched_tokens`。单位 token。 | 初始化 `token_budget`。每提交一个 request 就减去其 `num_new_tokens`；限制整个 forward 的 query token 总量，不是用户的 `max_tokens`。 |
+| `max_num_running_reqs` | `scheduler_config.max_num_seqs`。单位 request。 | waiting admission 前检查 `len(self.running) == max_num_running_reqs`；满了以后即使 token / KV 尚有余量也不能接纳。 |
+| `max_model_len` | 模型最大上下文长度。单位逻辑 token 位置。 | 单请求长度约束：`num_new_tokens <= max_model_len - C - num_sampled_tokens_per_step`。 |
+| `num_sampled_tokens_per_step` | 普通自回归模型为 `1`；diffusion denoising step 为 `0`。单位 token。 | 为本轮 forward 之后 sampler 产生的 token 预留位置。普通 decode 即使只输入一个 token，也不能把前沿正好推进到 `max_model_len`。 |
+| `scheduler_config.long_prefill_token_threshold` | 可选单请求 prefill chunk 上限。单位 token。 | 当 `0 < threshold < num_new_tokens` 时截断长请求；改善 fairness / ITL，但会增加长 prompt 的轮数。 |
+| `scheduler_config.enable_chunked_prefill` | 是否允许 waiting 请求的长 prefill 切块。布尔值。 | 关闭且队首请求剩余长度超过 `token_budget` 时，waiting admission 直接 `break`；它不能只拿一部分预算。因此该开关只在 waiting admission 显式出现。 |
+| `max_num_encoder_input_tokens` | `MultiModalBudget.encoder_compute_budget`。单位 encoder embedding token。 | 初始化 `encoder_compute_budget`；多模态 feature 需本地 encoder 重算时扣减。它与 decoder 的 `token_budget` 是两本账。 |
+| `num_lookahead_tokens` | speculative config 推导的预留 KV slot 数。单位 token / slot。 | 传给 `allocate_slots()`；EAGLE / draft model 通常等于 speculative K，DFlash 为 `K + 1`。它不是当前 target model 的 query 长度。 |
+| `num_spec_tokens` | 配置的默认 speculative K。单位 draft token。 | 写进 `SchedulerOutput.num_spec_tokens_to_schedule`，指导下一步 proposer 产生多少 draft；不是当前 request 已验证的 draft 数。 |
+| `dynamic_sd_lookup` | `batch_size -> K` 查表；未启用为 `None`。 | 若存在，根据 `len(num_scheduled_tokens)` 替代固定 `num_spec_tokens`，令 K 随 batch 请求数变化。 |
+| `scheduler_reserve_full_isl` | `scheduler_config.scheduler_reserve_full_isl` 布尔开关。 | 作为 `full_sequence_must_fit` 传给 waiting 的 `allocate_slots()`；打开时 admission 要求整个输入序列可容纳，减少中途 KV 压力但降低接纳率。 |
+
+这些关键上界在构造函数中的原始赋值如下。`max_num_scheduled_tokens` 的 fallback 与 `num_sampled_tokens_per_step` 的 diffusion 特例，正是只读 `schedule()` 时最容易遗漏的来源：
+
+```python
+# 同时处于 RUNNING 的请求数上限；限制 request 数而非 token 数。
+self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+
+# 优先使用显式 max_num_scheduled_tokens；未配置时回退到
+# max_num_batched_tokens。两者在这里都是单个调度 batch 的 token 预算。
+self.max_num_scheduled_tokens = (
+    self.scheduler_config.max_num_scheduled_tokens
+    if self.scheduler_config.max_num_scheduled_tokens is not None
+    else self.scheduler_config.max_num_batched_tokens
+)
+
+# 模型可接受的最大逻辑序列长度；每个 request 都受它约束。
+self.max_model_len = vllm_config.model_config.max_model_len
+
+# 标准自回归模型会在 forward 后 sample 一个 token；diffusion denoising step 不会。
+self.num_sampled_tokens_per_step = (
+    1 if not vllm_config.model_config.is_diffusion else 0
+)
+
+# 多模态 / encoder-decoder 每 batch 可实际计算的 encoder embedding 总预算。
+self.max_num_encoder_input_tokens = (
+    mm_budget.encoder_compute_budget if mm_budget else 0
+)
+```
+
+speculative 与 Mamba 相关成员则由下面的构造逻辑派生。注意 `num_spec_tokens` 是配置目标，`num_lookahead_tokens` 才是 KV manager 实际需要预留的 slot 数：
+
+```python
+# 默认 speculative K，以及默认不为 proposer 预留额外 slot。
+self.use_eagle = False
+self.num_spec_tokens = vllm_config.num_speculative_tokens
+self.num_lookahead_tokens = 0
+self.dynamic_sd_lookup: list[int] | None = None
+
+if speculative_config is not None:
+    # 配置了“batch 请求数 -> K”时，建立动态 speculative schedule 查表。
+    if speculative_config.num_speculative_tokens_per_batch_size:
+        self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
+            speculative_config.num_speculative_tokens_per_batch_size,
+            vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+            vllm_num_speculative_tokens=self.num_spec_tokens,
+        )
+
+    # EAGLE 和普通 draft model 都需要为 K 个候选位置预留 KV slot。
+    if speculative_config.use_eagle():
+        self.use_eagle = True
+        self.num_lookahead_tokens = self.num_spec_tokens
+    if speculative_config.uses_draft_model():
+        self.num_lookahead_tokens = self.num_spec_tokens
+
+    # DFlash 的 in-fill 语义还需要最后一个 sampled token 的额外 query / slot。
+    if speculative_config.use_dflash():
+        self.num_lookahead_tokens = self.num_spec_tokens + 1
+
+# Mamba 对齐只在模型确有 Mamba 层且 cache mode 选择 align 时开启。
+self.has_mamba_layers = kv_cache_config.has_mamba_layers
+self.need_mamba_block_aligned_split = (
+    self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
+)
+```
+
+#### 状态、策略与功能门控成员
+
+| 成员 | 含义 | 具体影响的判断 |
+| --- | --- | --- |
+| `running`、`waiting`、`skipped_waiting` | 三个请求容器。 | `running` 先扫描；`len(running)` 受并发上限约束；后两个队列决定 admission 候选。 |
+| `policy` | `FCFS` 或 `PRIORITY`。 | 决定队列顺序，也决定 KV 不足时从队尾抢占还是按 `(priority, arrival_time)` 选牺牲者。 |
+| `_pause_state` | `UNPAUSED`、暂停新请求、暂停全部请求等状态。 | 暂停全部时令 `token_budget = 0`；非 `UNPAUSED` 时不进入 waiting admission，但已有 running 请求可继续。 |
+| `current_step` | scheduler 逻辑步号，从 0 逐轮加一。 | V2 + PP + async 比较 `request.next_decode_eligible_step`；step 太早则跳过该 request，等待 worker 通信槽位轮转。 |
+| `lora_config` | 含 `max_loras` 的 LoRA 配置，或 `None`。 | 用 `scheduled_loras` 限制一批不同 adapter id 数；不满足时请求进入 `skipped_waiting`，不代表 KV 不够。 |
+| `use_eagle` | 当前 speculative proposer 是否为 EAGLE。 | encoder helper 以一 token 偏移检查窗口；影响 Mamba 对齐；与 P/D async 同时出现时还限制 lookahead。 |
+| `need_mamba_block_aligned_split` | `has_mamba_layers and mamba_cache_mode == "align"`。 | 两条路径调用 `_mamba_block_aligned_split()`，可能把本轮 `num_new_tokens` 缩至 0。 |
+| `has_mamba_layers` | KV cache config 是否含 Mamba 层。 | admission 的 prefix hit 可能改用按 KV group 的 hybrid coordinator，且读取公共前缀提示。 |
+| `is_encoder_decoder` | 模型是否含 encoder-decoder cross attention。 | encoder inputs 被安排后计算 `num_encoder_tokens`，并请求额外 cross-attention blocks。 |
+| `use_v2_model_runner` | worker 是否使用 V2 状态格式。 | 不改变可否调度；只改变 output 编码：V2 将 resumed 合到 new，并附完整 token ids。 |
+| `needs_kv_cache_zeroing` | attention backend 是否要求先清零新 block。 | 不改变 admission；决定是否取 `new_block_ids_to_zero` 交给 worker。 |
+| `log_stats` | 是否记录调度 / prefix 统计。 | 只开关 event 和指标记录，不改变 token、KV 或队列的调度可行性。 |
+
+#### 资源管理器与跨轮输出状态
+
+| 成员 | 在 `schedule()` 中承担的职责 |
+| --- | --- |
+| `kv_cache_manager` | 查 prefix blocks、申请 / 释放 slots、计算公共前缀、取回待清零的新 blocks；最终判定“给定 N 是否有足够 KV”。 |
+| `encoder_cache_manager` | 为本地计算或外部载入的 encoder feature 申请 cache；waiting admission 失败时撤销可能触碰的 encoder 状态。 |
+| `connector` 与 `ec_connector` | 分别协调 KV 和 encoder cache 的外部 load / save；它们增加外部命中长度、blocked 状态与 metadata。 |
+| `_inflight_prefills` | 未结束的 chunked prefill 与 async KV load 集合；其剩余 block reservation 会限制新的 async load admission。 |
+| `prev_step_scheduled_req_ids` | 本步结束时被当前 `num_scheduled_tokens` 覆盖；供下一轮 / async 协议识别上轮实际调度过谁。 |
+| `finished_req_ids` | 两个调度 step 之间完成的 request id；放进 output 通知 worker 清理缓存，不是本轮新选出的请求。 |
+| `kv_cache_config` | 提供 KV group 数及 Mamba / 清零能力信息；`schedule()` 用它初始化 `num_common_prefix_blocks`。 |
+
 
 ## KV cache：调度器使用哪些接口
 
