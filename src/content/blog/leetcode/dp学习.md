@@ -6574,3 +6574,414 @@ dp[j] = dp[j]\ \lor\ dp[j - num]
 $$
 
 但它们的骨架完全一样：**不选当前物品，状态保持；选当前物品，从上一轮的剩余容量转移过来**。理解这一点，416 就不是新题，而是 0-1 背包地基上的第一块砖。
+
+## [494. 目标和 - 力扣（LeetCode）](https://leetcode.cn/problems/target-sum/description/)
+
+给你一个非负整数数组 `nums` 和一个整数 `target`。
+
+向数组中的每个整数前添加 `+` 或 `-`，然后串联起所有整数，可以构造一个表达式。返回可以通过上述方法构造的、运算结果等于 `target` 的不同表达式数目。
+
+示例 1：
+
+```text
+输入：nums = [1,1,1,1,1], target = 3
+输出：5
+解释：一共有 5 种方法让最终目标和为 3。
+-1 + 1 + 1 + 1 + 1 = 3
++1 - 1 + 1 + 1 + 1 = 3
++1 + 1 - 1 + 1 + 1 = 3
++1 + 1 + 1 - 1 + 1 = 3
++1 + 1 + 1 + 1 - 1 = 3
+```
+
+示例 2：
+
+```text
+输入：nums = [1], target = 1
+输出：1
+```
+
+提示：
+
+- `1 <= nums.length <= 20`
+- `0 <= nums[i] <= 1000`
+- `0 <= sum(nums[i]) <= 1000`
+- `-1000 <= target <= 1000`
+
+这题看起来是“给每个数前面放正负号”，但它也可以转成 0-1 背包。和 416 很像，不过 416 问的是**能不能凑出某个和**，494 问的是**有多少种方法凑出某个和**。
+
+### 题目如何转成 0-1 背包？
+
+先把所有被加 `+` 的数字放进集合 `P`，所有被加 `-` 的数字放进集合 `N`。
+
+设：
+
+- `positive_sum` 表示集合 `P` 的元素和。
+- `negative_sum` 表示集合 `N` 的元素和。
+- `total_sum` 表示整个数组的元素和。
+
+题目要求表达式结果等于 `target`，也就是：
+
+$$
+positive\_sum - negative\_sum = target
+$$
+
+同时所有数字都必须被分到 `P` 或 `N` 中：
+
+$$
+positive\_sum + negative\_sum = total\_sum
+$$
+
+两式相加：
+
+$$
+2 \times positive\_sum = total\_sum + target
+$$
+
+所以：
+
+$$
+positive\_sum = \frac{total\_sum + target}{2}
+$$
+
+于是问题变成：
+
+> 从 `nums` 中选出若干个数作为正号集合 `P`，让它们的和刚好等于 `positive_sum`，问一共有多少种选法。
+
+这时就和 0-1 背包对上了：
+
+- **物品**：数组里的每个数 `nums[i]`。
+- **重量**：这个数本身，也就是 `nums[i]`。
+- **背包容量**：`positive_sum`。
+- **0-1 约束**：每个数只能决定一次，要么放进正号集合，要么不放进正号集合。
+- **目标**：不是最大价值，也不是能否可达，而是统计“刚好装满背包”的方案数。
+
+转换前需要先处理两个不可能情况：
+
+- 如果 `target > total_sum` 或 `target < -total_sum`，说明目标值超出了所有数字能构造出的范围，直接返回 0。
+- 如果 `total_sum + target` 是奇数，说明 `positive_sum` 不是整数，也直接返回 0。
+
+### 递归切入（探索逻辑）
+
+先从原题直觉看递归：每个数字前面只能放 `+` 或 `-`。
+
+定义 `dfs(index, current_sum)` 表示：已经处理到下标 `index`，当前表达式和为 `current_sum`，后面继续放符号，最终能得到 `target` 的表达式数量。
+
+站在 `nums[index]` 面前，有两个选择：
+
+- 给它放 `+`：状态变成 `dfs(index + 1, current_sum + nums[index])`。
+- 给它放 `-`：状态变成 `dfs(index + 1, current_sum - nums[index])`。
+
+递归边界：
+
+- 如果 `index == nums.size()`，说明所有数字都放完符号。
+- 此时如果 `current_sum == target`，说明得到一种合法表达式，返回 1。
+- 否则返回 0。
+
+递归表达式：
+
+$$
+dfs(index, current\_sum) =
+dfs(index + 1, current\_sum + nums[index]) +
+dfs(index + 1, current\_sum - nums[index])
+$$
+
+这个递归能解决原题，但它还不像 0-1 背包。要找到背包思想，关键是把“放正号的数”单独看成一个要选择的集合。
+
+转换成背包后，定义 `dfs(index, remain)` 表示：从下标 `index` 开始考虑数字，还需要凑出 `remain`，一共有多少种选法。
+
+站在 `nums[index]` 面前，变成标准 0-1 背包的两个选择：
+
+- **不选当前数字进入正号集合**：`dfs(index + 1, remain)`。
+- **选当前数字进入正号集合**：前提是 `remain >= nums[index]`，状态变成 `dfs(index + 1, remain - nums[index])`。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+dfs(index + 1, remain) + dfs(index + 1, remain - nums[index])
+$$
+
+第二项需要满足 `remain >= nums[index]`。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索统计目标和表达式数量。
+     *
+     * @param nums 输入数组，包含非负整数。
+     * @param target 目标表达式结果。
+     * @return 可以构造出 target 的不同表达式数量。
+     */
+    int findTargetSumWays(vector<int>& nums, int target) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (target > total_sum || target < -total_sum) {
+            return 0;
+        }
+        if ((total_sum + target) % 2 != 0) {
+            return 0;
+        }
+
+        const int positive_sum = (total_sum + target) / 2;
+        vector<vector<int>> memo(nums.size(), vector<int>(positive_sum + 1, -1));
+        return dfs(nums, memo, 0, positive_sum);
+    }
+
+private:
+    int dfs(const vector<int>& nums, vector<vector<int>>& memo, int index, int remain) {
+        if (index == static_cast<int>(nums.size())) {
+            return remain == 0 ? 1 : 0;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != -1) {
+            return cached;
+        }
+
+        // 不选当前数字进入正号集合。
+        cached = dfs(nums, memo, index + 1, remain);
+
+        if (remain >= nums[index]) {
+            // 选当前数字进入正号集合。index 向后移动，保证每个数字只决策一次。
+            cached += dfs(nums, memo, index + 1, remain - nums[index]);
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归里，`remain` 就是背包剩余容量，返回值不是 `bool`，而是**方案数**。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][j]` 表示只考虑前 `i` 个数字时，凑出和 `j` 的方案数。
+
+注意这里和 416 的区别：
+
+- 416 的 `dp[i][j]` 是布尔值，表示能不能凑出 `j`。
+- 494 的 `dp[i][j]` 是整数，表示凑出 `j` 有多少种方法。
+
+最终答案是：
+
+$$
+dp[n][positive\_sum]
+$$
+
+### 状态转移
+
+仍然使用安全垫写法，处理真实数字 `nums[item]`。
+
+`dp[item]` 表示还没处理 `nums[item]` 之前的状态，`dp[item + 1]` 表示处理完 `nums[item]` 之后的状态。
+
+- **不选当前数字进入正号集合**：凑出 `sum` 的方案数继承自上一行。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前数字进入正号集合**：如果上一行能凑出 `sum - nums[item]`，那么加上当前数字后就能凑出 `sum`。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum - nums[item]]
+$$
+
+因为这里统计的是方案数，所以两个来源要相加：
+
+$$
+dp[item + 1][sum] =
+dp[item][sum] + dp[item][sum - nums[item]]
+$$
+
+第二项需要满足 `sum >= nums[item]`。
+
+这就是 494 和 416 最关键的差异：
+
+- 416 是可达性：`dp[item + 1][sum] = dp[item][sum] || dp[item][sum - nums[item]]`。
+- 494 是方案数：`dp[item + 1][sum] = dp[item][sum] + dp[item][sum - nums[item]]`。
+
+### 初始化
+
+- `dp[0][0] = 1`：不选任何数字，凑出和 0 有 1 种方法，也就是“什么都不选”。
+- `dp[0][j] = 0`，其中 `j > 0`：不选任何数字，不可能凑出正数和。
+
+这里的 `dp[0][0] = 1` 非常重要。如果它写成 0，后面所有方案数都会推不出来。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `n - 1`，逐个处理真实数字 `nums[item]`。
+- 内层从 `sum = 0` 到 `positive_sum`，枚举当前要凑出的和。
+
+因为 `dp[item + 1][sum]` 只依赖上一行 `dp[item][...]`，所以二维写法里内层正序或逆序都可以。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 0-1 背包统计目标和表达式数量。
+     *
+     * @param nums 输入数组，包含非负整数。
+     * @param target 目标表达式结果。
+     * @return 可以构造出 target 的不同表达式数量。
+     */
+    int findTargetSumWays(vector<int>& nums, int target) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (target > total_sum || target < -total_sum) {
+            return 0;
+        }
+        if ((total_sum + target) % 2 != 0) {
+            return 0;
+        }
+
+        const int positive_sum = (total_sum + target) / 2;
+        const int n = static_cast<int>(nums.size());
+        vector<vector<int>> dp(n + 1, vector<int>(positive_sum + 1, 0));
+        dp[0][0] = 1;
+
+        for (int item = 0; item < n; item++) {
+            const int num = nums[item];
+
+            for (int sum = 0; sum <= positive_sum; sum++) {
+                // 不选当前数字进入正号集合。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= num) {
+                    // 选当前数字进入正号集合。来源必须是上一行，保证每个数字只决策一次。
+                    dp[item + 1][sum] += dp[item][sum - num];
+                }
+            }
+        }
+
+        return dp[n][positive_sum];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times positive\_sum)$。
+- 空间复杂度：$O(n \times positive\_sum)$。
+
+### 空间优化
+
+二维转移只依赖上一行，所以可以压成一维：
+
+`dp[sum]` 表示当前已经处理过的数字中，凑出和 `sum` 的方案数。
+
+处理当前数字 `num` 时：
+
+$$
+dp[sum] = dp[sum] + dp[sum - num]
+$$
+
+这仍然是 0-1 背包，所以一维优化必须逆序遍历：
+
+```cpp
+for (int sum = positive_sum; sum >= num; sum--)
+```
+
+逆序遍历保证 `dp[sum - num]` 还是处理当前数字之前的旧状态，也就是二维 DP 中的上一行。否则正序遍历会把当前数字重复使用。
+
+这一题还要特别注意 `0`：
+
+- 如果 `num = 0`，那么放 `+0` 和放 `-0` 得到的数值一样，但题目认为它们是两种不同表达式。
+- 在一维转移里，当 `num = 0` 时，`dp[sum] += dp[sum - 0]`，也就是 `dp[sum] += dp[sum]`，刚好会把方案数翻倍。
+- 所以不要特殊跳过 `0`，正常按转移做即可。
+
+```cpp
+#include <numeric>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 0-1 背包统计目标和表达式数量。
+     *
+     * @param nums 输入数组，包含非负整数。
+     * @param target 目标表达式结果。
+     * @return 可以构造出 target 的不同表达式数量。
+     */
+    int findTargetSumWays(vector<int>& nums, int target) {
+        const int total_sum = accumulate(nums.begin(), nums.end(), 0);
+        if (target > total_sum || target < -total_sum) {
+            return 0;
+        }
+        if ((total_sum + target) % 2 != 0) {
+            return 0;
+        }
+
+        const int positive_sum = (total_sum + target) / 2;
+        vector<int> dp(positive_sum + 1, 0);
+        dp[0] = 1;
+
+        for (const int num : nums) {
+            // 逆序遍历，保证当前数字不会在同一轮中被重复使用。
+            // 当 num 为 0 时，sum 会从 positive_sum 遍历到 0，方案数自然翻倍。
+            for (int sum = positive_sum; sum >= num; sum--) {
+                dp[sum] += dp[sum - num];
+            }
+        }
+
+        return dp[positive_sum];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times positive\_sum)$。
+- 空间复杂度：$O(positive\_sum)$。
+
+### 这题的核心手感
+
+494 的关键是先把“每个数前面放 `+` 或 `-`”翻译成“哪些数被放进正号集合”。
+
+一旦设出：
+
+$$
+positive\_sum - negative\_sum = target
+$$
+
+$$
+positive\_sum + negative\_sum = total\_sum
+$$
+
+就能推出：
+
+$$
+positive\_sum = \frac{total\_sum + target}{2}
+$$
+
+于是题目变成标准 0-1 背包计数：
+
+> 从 `nums` 中选若干个数，使它们的和刚好等于 `positive_sum`，问有多少种选法。
+
+它和 416 的关系非常紧：
+
+- 416：能不能凑出 `target`，所以 `dp` 存 `bool`，转移用逻辑或。
+- 494：有多少种方法凑出 `positive_sum`，所以 `dp` 存方案数，转移用加法。
+
+但它们的背包骨架完全一样：
+
+- 不选当前数字：继承上一轮方案。
+- 选当前数字：从上一轮的 `sum - num` 转移过来。
+- 每个数字只能决策一次：一维优化时必须逆序遍历。
+
+所以 494 不是凭空多出来的新模型，而是 0-1 背包从“可达性”升级到“方案计数”的版本。
