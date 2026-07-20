@@ -3631,42 +3631,157 @@ if ((warp_idx == 0) && lane_predicate) {
 }
 ```
 
-### `ClusterBarrier`
+### `ClusterBarrier`：先分清本 CTA barrier 和远端 CTA barrier
 
-`ClusterBarrier` 是普通 mbarrier，只看 arrival count 和 phase：
+`ClusterBarrier` 不是一个“整个 cluster 只有一份的 barrier”。每个 CTA 都在**自己的 shared memory** 中放一份 64 位 `mbarrier` 对象；它之所以叫 cluster barrier，是因为一个 CTA 可以对 cluster 内另一个 CTA 的那一份 barrier 执行 `arrive`。但是 `wait` 只能等待本 CTA 自己 shared memory 里的 barrier。
+
+下面是 `cutlass/arch/barrier.h` 的关键接口，补上了参数的实际语义：
 
 ```cpp
 /**
- * @brief cluster-aware mbarrier 封装。
+ * @brief 允许 remote arrive 的 shared-memory mbarrier 封装。
  *
  * @details
- * 可以初始化 arrival count，本 CTA arrive，也可以对 cluster 内远端 CTA 的
- * barrier 执行 arrive。`wait(phase)` 会等待对应 parity phase 完成。
+ * barrier 对象实际位于调用 CTA 的 shared memory。`wait` 只等待本地对象；
+ * 带 `cta_id` 的 `arrive` 会把同一个 shared-memory 偏移映射到 cluster 中
+ * 指定 CTA 的 shared memory，再对远端对象执行 arrive。
  */
 struct ClusterBarrier {
-    using ValueType = uint64_t;
+  using ValueType = uint64_t;
 
-    static void init(ValueType const* smem_ptr, uint32_t arrive_count);
-    static void wait(ValueType const* smem_ptr, uint32_t phase);
-    static bool try_wait(ValueType const* smem_ptr, uint32_t phase);
-    static bool test_wait(ValueType const* smem_ptr,
-                          uint32_t phase,
-                          uint32_t pred);
-    static void arrive(ValueType const* smem_ptr);
-    static void arrive(ValueType const* smem_ptr,
-                       uint32_t cta_id,
-                       uint32_t pred);
-    static void invalidate(ValueType const* smem_ptr);
+  /**
+   * @brief 初始化本 CTA 的 barrier。
+   *
+   * @param smem_ptr 本 CTA shared memory 中 8 字节对齐的 mbarrier 地址。
+   * @param arrive_count 每一个 phase 需要多少次 arrive 才能完成。
+   */
+  static void init(ValueType const* smem_ptr, uint32_t arrive_count);
+
+  /**
+   * @brief 阻塞等待指定 parity 的那一代 barrier 完成。
+   *
+   * @param phase 只能是 0 或 1，等于目标 mbarrier phase 的奇偶性，而不是 pipe 下标。
+   */
+  static void wait(ValueType const* smem_ptr, uint32_t phase);
+
+  /**
+   * @brief 非阻塞地检查指定 parity 的 phase 是否完成。
+   *
+   * @param pred 为真才执行实际的 test-wait 探测；它不改变 barrier 的 arrival count。
+   *             教程不使用此接口，通常传 true。
+   */
+  static bool test_wait(ValueType const* smem_ptr,
+                        uint32_t phase,
+                        uint32_t pred = true);
+
+  /**
+   * @brief 等待指定 parity 的 phase；底层可短暂挂起并重试。
+   */
+  static bool try_wait(ValueType const* smem_ptr, uint32_t phase);
+
+  /**
+   * @brief 对本 CTA 的 barrier arrive 一次。
+   */
+  static void arrive(ValueType const* smem_ptr);
+
+  /**
+   * @brief 有条件地对 cluster 内另一个 CTA 的同偏移 barrier arrive 一次。
+   *
+   * @param cta_id cluster 内的线性 CTA rank，不是全局 `blockIdx.x`。
+   * @param pred 为真才真的执行 arrive；为假时没有副作用，也不会计入 arrival count。
+   */
+  static void arrive(ValueType const* smem_ptr,
+                     uint32_t cta_id,
+                     uint32_t pred = true);
 };
 ```
 
-教程里 consumer barrier 的初始化是：
+#### `phase`：不是 pipe 下标，而是同一个 barrier 的第几代
+
+PTX 的 `mbarrier` 初始化后从第 0 代开始：`pending arrival count = arrive_count`。当这一代的 pending arrival 减到 0（transaction barrier 还要求 `tx-count` 也归零）时，barrier 自动进入下一代，并把 pending count 恢复成 `arrive_count`。因此同一个 `consumer_mbar[0]` 可以循环用于 `K0`、`K_PIPE_MAX`、`2 * K_PIPE_MAX` 等多次 tile 消费。
+
+`ClusterBarrier::wait` 的底层指令是：
 
 ```cpp
-ConsumerBarType::init(&consumer_mbar[pipe], 128);
+/**
+ * @brief CUTLASS 的 wait 最终使用 mbarrier parity wait。
+ *
+ * @details
+ * `phase` 不是完整的代次编号，只传入代次的奇偶性：偶数代为 0，奇数代为 1。
+ */
+mbarrier.try_wait.parity.shared::cta.b64 P1, [smem_addr], phase, ticks;
 ```
 
-因为一个 warpgroup 有 128 个线程。GMMA 消费完一个 pipe 后，每个相关线程 arrive，表示这一 stage 的 shared memory 可以被 producer 重用。
+所以 API 参数虽然叫 `phase`，在这份 CUTLASS 封装里实际只能是 `0` 或 `1`：
+
+| 要等的完整 mbarrier 代次 | 传给 `wait` 的 `phase` | 意义 |
+| ---: | ---: | --- |
+| 0 | 0 | 等第 0 代完成。 |
+| 1 | 1 | 等第 1 代完成。 |
+| 2 | 0 | 同一物理 barrier 被再次复用，等第 2 代完成。 |
+| 3 | 1 | 再下一次复用。 |
+
+换句话说，`wait(&consumer_mbar[0], 0)` 并不是“等 pipe 0”，而是“我已经通过数组下标选中 pipe 0；现在等它的偶数代使用完成”。数组下标选哪块 shared memory，`phase` 区分同一块 shared memory 的旧一代和新一代。PTX 文档把 phase 定义为 mbarrier 被使用的次数，并规定 parity wait 只接受该代次的奇偶性。[PTX ISA 的 mbarrier phase 说明](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)
+
+#### `pred`：是否让当前线程产生这次操作
+
+`pred` 不是 phase，也不是“有多少线程参与 barrier”。它只是当前调用的条件开关：
+
+- `arrive(smem_ptr, cta_id, pred)`：`pred == false` 时，这个线程**不**对远端 barrier 执行 arrive；arrival count 不变。它常用于 128 个 consumer thread 中只挑一个 signaling thread，避免 128 次重复 remote arrive。
+- `arrive_and_expect_tx(bytes, cta_id, pred)`：同理，`pred == false` 时既不远端 arrive，也不增加该远端 barrier 的 expected transaction bytes。
+- `test_wait(smem_ptr, phase, pred)`：`pred` 只控制是否发出非阻塞 test-wait 探测；教程没有用它，读这份教程时可以先把它当作 `true`。
+
+教程的本地 consumer barrier 不需要这个参数：
+
+```cpp
+// 128 个 WGMMA consumer thread 都执行一次本地 arrive。
+// 刚好凑齐 init(..., 128) 设定的第 0 代 arrival count。
+ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+```
+
+而较完整的 cluster / multicast pipeline 经常写成：
+
+```cpp
+// 所有 consumer 都走到这里，但只有被选中的一个线程向 producer CTA 的
+// empty barrier 发送 remote arrive；dst_cta_id 是 cluster 内的线性 rank。
+empty_barrier[stage].arrive(dst_cta_id, is_signaling_thread);
+```
+
+#### `cta_id`：远端 CTA 的 cluster 内线性 rank
+
+带 `cta_id` 的重载在源码中先执行 `mapa.shared::cluster.u32`，把本 CTA 的 `smem_ptr` 所表示的**相同 shared-memory 偏移**映射到目标 CTA；随后发出 `mbarrier.arrive.shared::cluster`：
+
+```cpp
+/**
+ * @brief 对目标 CTA 的同偏移 mbarrier 执行远端 arrive。
+ *
+ * @param smem_addr 本 CTA 中 barrier 的 shared-memory 地址偏移。
+ * @param cta_id cluster 内目标 CTA 的线性 rank。
+ * @param pred 为真才发出远端 arrive。
+ */
+if (pred) {
+  asm volatile(
+      "{\n\t"
+      ".reg .b32 remAddr32;\n\t"
+      "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+      "mbarrier.arrive.shared::cluster.b64 _, [remAddr32];\n\t"
+      "}"
+      :
+      : "r"(smem_addr), "r"(cta_id)
+      : "memory");
+}
+```
+
+因此 `cta_id` 应来自 `cute::block_rank_in_cluster()` 或根据 cluster layout 算出的同一套 rank；不能把全局的 `blockIdx.x` 直接传进去。并且没有 `wait(cta_id, phase)` 重载：**远端 CTA 可以替本 CTA 的 barrier arrive，但真正等待该 barrier 的仍是本 CTA 的线程。**
+
+教程里只使用：
+
+```cpp
+ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], bytes);
+ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+```
+
+它们都是本 CTA 的本地操作；`cta_id` / `pred` 的 cluster 特性在这个 non-multicast 教程中没有被用到。
 
 ### `ClusterTransactionBarrier`
 
@@ -3751,7 +3866,9 @@ cluster_sync();
 
 ### `PipelineState`
 
-多 stage pipeline 需要同时追踪当前 pipe index 和 phase。CUTLASS 用 `PipelineState<Stages>`：
+`PipelineState` 不是 barrier 本身，也不保存 TMA 是否完成。它只是 producer / consumer 手里的一个很小的**环形游标**：告诉调用方“这次该用第几个 stage，以及该等这块 stage 的第 0 代还是第 1 代”。
+
+源码实现比名字更直白：
 
 ```cpp
 /**
@@ -3777,34 +3894,81 @@ struct PipelineState {
     /**
      * @brief 前进到下一个 stage；如果绕回 0，则翻转 phase。
      */
-    void operator++();
-
-    /**
-     * @brief 一次前进多个 stage，并按跨越次数更新 phase。
-     */
-    PipelineState& advance(uint32_t num_iterations);
+    void operator++() {
+        ++index_;
+        ++count_;
+        if (index_ == Stages) {
+            index_ = 0;
+            phase_ ^= 1;
+        }
+    }
 };
 ```
 
-示例中有两个 state：
+对默认初始状态 `(index=0, phase=0, count=0)`，它等价于：
+
+\[
+\text{index} = \text{count} \bmod \text{Stages}, \qquad
+\text{phase} = \left\lfloor \frac{\text{count}}{\text{Stages}} \right\rfloor \bmod 2
+\]
+
+以 `K_PIPE_MAX = 3` 为例：
+
+| `count` | `index()` | `phase()` | 表示 |
+| ---: | ---: | ---: | --- |
+| 0 | 0 | 0 | pipe 0 的第 0 代。 |
+| 1 | 1 | 0 | pipe 1 的第 0 代。 |
+| 2 | 2 | 0 | pipe 2 的第 0 代。 |
+| 3 | 0 | 1 | 又回到 pipe 0，但已是第 1 代，绝不能再用 phase 0 等它。 |
+| 4 | 1 | 1 | pipe 1 的第 1 代。 |
+| 6 | 0 | 0 | pipe 0 的第 2 代；parity 再回到 0。 |
+
+教程中有两个 state：
 
 ```cpp
 auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // TMA writes
 auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // MMA reads
 ```
 
-- `write_state` 是 producer 视角：下一次 TMA 写哪个 pipe。
-- `read_state` 是 consumer 视角：下一次 GMMA 读哪个 pipe。
+- `read_state` 是 consumer 视角：选择要读取的 `read_pipe`，并把 `read_state.phase()` 传给 **producer/full barrier**。它问的是：“这块 pipe 的这一代 TMA 写完了吗？”
+- `write_state` 是 producer 视角：选择要覆盖写入的 `pipe`，并把 `write_state.phase()` 传给 **consumer/empty barrier**。它问的是：“这块 pipe 的上一代 WGMMA 已经读完、可以重用了吗？”
+- 两个 state 都是 `(index, phase)`，但它们等待的是**不同的 barrier 数组**：`read_state` 等 `producer_mbar[]`，`write_state` 等 `consumer_mbar[]`。不能把它们理解成同一份计数器的别名。
+
+#### 为什么这个教程的两个 state 都从 `(0, 0)` 开始
+
+教程没有用 CUTLASS 通用 pipeline 的 `producer_acquire()` 做初始填充，而是先手写一个 prologue：
+
+```cpp
+// 先异步提交 pipe 0、1、2 的 TMA，不等待它们完成。
+for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
+  ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
+                                        tma_transaction_bytes);
+  copy(tma_a.with(producer_mbar[pipe]), tAgA(_, k_tile), tAsA(_, pipe));
+  copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tBsB(_, pipe));
+  ++k_tile;
+}
+
+// prologue 完成后才创建游标；下一次重用的是 pipe 0 的第 0 代。
+auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
+auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
+```
+
+此时：
+
+- `read_state = (0, 0)` 正确，因为消费者下一步要等 `producer_mbar[0]` 的第 0 代 TMA 完成，然后消费 `K0`。
+- `write_state = (0, 0)` 也正确，因为 producer 下一次不是继续填 pipe 1，而是要在 `K0` 被消费后**重用** pipe 0；它要等的是 `consumer_mbar[0]` 的第 0 代完成。
+
+这和完整 CUTLASS pipeline 常见的 `make_producer_start_state()` 不同。后者会把 producer 初值设成 `(0, 1)`，以表达“empty barrier 刚初始化、还没有 consumer 的第 0 代 release，因此 producer 的第一次 acquire 不应等一个不存在的旧 release”。那个初值服务 `producer_acquire()` 协议；不要把它机械搬到这个手写 prologue 的教程中。
 
 ### 主循环的时序
 
-主循环可以拆成这几步：
+主循环可以拆成这几步。这里最容易误读的是两个 `phase()`：它们分别描述当前 `read_pipe` 的 full barrier 代次，和当前 `write pipe` 的 empty barrier 代次。
 
 ```cpp
 while (k_tile_count > -K_PIPE_MAX) {
     int read_pipe = read_state.index();
 
-    // 1. consumer 等 TMA producer 完成该 pipe 的数据写入。
+    // 1. consumer 等 TMA producer 完成 read_pipe 的 read_state.phase() 这一代写入。
     ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
 
     // 2. GMMA / WGMMA 消费该 pipe。
@@ -3813,15 +3977,18 @@ while (k_tile_count > -K_PIPE_MAX) {
     warpgroup_commit_batch();
     warpgroup_wait<0>();
 
-    // 3. consumer 通知 producer：这个 pipe 已经消费完，可以复用了。
+    // 3. 128 个 WGMMA consumer 都到达 consumer barrier。
+    //    这使 read_pipe 的这一代 empty barrier 完成，producer 以后可以重用这个 pipe。
     ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
     ++read_state;
 
-    // 4. producer 如果还有新 tile，就等 consumer 释放目标 pipe，然后发下一次 TMA。
+    // 4. producer 如果还有新 tile，就等 write_state.phase() 这一代消费结束，
+    //    才能覆盖写入 pipe。
     if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0)) {
         int pipe = write_state.index();
         ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
 
+        // 此时 producer_mbar[pipe] 已进入下一代；为该下一代登记 TMA bytes。
         ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
                                               tma_transaction_bytes);
         copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
@@ -3834,6 +4001,31 @@ while (k_tile_count > -K_PIPE_MAX) {
     ++k_tile;
 }
 ```
+
+#### 用 `K_PIPE_MAX = 3` 逐轮跟一次 `index` 和 `phase`
+
+假设 K 方向足够长，下面只写一份 A/B tile 对应的 K 编号。`F0` 表示 `producer_mbar[0]`，`E0` 表示 `consumer_mbar[0]`。
+
+| 时刻 | WGMMA 消费 | TMA 提交 | `read_state` / 等待 | `write_state` / 等待 | pipe 0 的代次变化 |
+| --- | --- | --- | --- | --- | --- |
+| prologue | 尚未开始 | `K0 -> pipe0`、`K1 -> pipe1`、`K2 -> pipe2` | 新建后为 `(0,0)` | 新建后为 `(0,0)` | `F0` 正在完成第 0 代 TMA。 |
+| loop 0 | 等 `F0` phase 0，计算 `K0` | 等 `E0` phase 0，提交 `K3 -> pipe0` | 结束后 `(1,0)` | 结束后 `(1,0)` | WGMMA 的 128 次 arrive 完成 `E0` 第 0 代；新 TMA 开始 `F0` 第 1 代。 |
+| loop 1 | 等 `F1` phase 0，计算 `K1` | 提交 `K4 -> pipe1` | 结束后 `(2,0)` | 结束后 `(2,0)` | pipe 1 进入第 1 代。 |
+| loop 2 | 等 `F2` phase 0，计算 `K2` | 提交 `K5 -> pipe2` | 结束后 `(0,1)` | 结束后 `(0,1)` | 两个游标都绕回 pipe 0，所以 parity 从 0 翻成 1。 |
+| loop 3 | 等 `F0` phase 1，计算 `K3` | 等 `E0` phase 1，提交 `K6 -> pipe0` | 结束后 `(1,1)` | 结束后 `(1,1)` | 这次等待 / 重用的是 pipe 0 的第 1 代，而不是旧的第 0 代。 |
+
+这张表也解释了为什么少传或错传 phase 会出错：如果 loop 3 还传 `phase=0`，wait 看到的是 pipe 0 很早以前已经完成的第 0 代，于是可能让 WGMMA 读到尚未写好的 `K3`，或者让 TMA 过早覆盖数据。
+
+#### TMA 是不是完整领先 WGMMA `K_PIPE_MAX` 个 K tile？
+
+**不是“已经完整搬完 K_PIPE_MAX 个 tile”**。更准确地说：
+
+- prologue 会先**提交**最多 `K_PIPE_MAX` 个 TMA load；以 3 stage 为例，是 `K0`、`K1`、`K2`。它们全是异步的，代码没有在 prologue 等待 `K0/K1/K2` 全部完成。
+- WGMMA 一开始只等 `K0` 所在 pipe 的 full barrier。`K1` / `K2` 此时可能已经完成，也可能仍在 TMA 飞行中；它们会在后续轮次各自被 wait。
+- 从“buffer 中已经被 producer 占用、尚未被 consumer 消费的 stage 数”看，稳态最多是 `K_PIPE_MAX` 个；从“相对当前正在消费的 K tile 还领先多少个未来 tile”看，是 `K_PIPE_MAX - 1` 个。例如 WGMMA 正在算 `K0` 时，`K1`、`K2` 是两个未来 tile。
+- WGMMA 消费一个 stage 后，producer 才能重用这个 stage 提交下一个 tile。因此这是一个容量为 `K_PIPE_MAX` 的有界环形队列，而不是 TMA 可以无限制地跑在 WGMMA 前面。
+
+这个教程没有做 warp specialization：发 TMA 的 warp 0 也会参与同一个 WGMMA warpgroup。它的重叠来自“**TMA 已提交后在硬件中异步运行**”，而不是另有一组常驻 producer warp 在 WGMMA 执行期间持续发指令。更复杂的 CUTLASS mainloop 才会用专门的 producer warpgroup 和 `PipelineTmaAsync` 把这件事进一步重叠。
 
 这个协议里有两个方向的依赖：
 
