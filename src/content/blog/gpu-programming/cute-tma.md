@@ -3723,6 +3723,37 @@ mbarrier.try_wait.parity.shared::cta.b64 P1, [smem_addr], phase, ticks;
 
 换句话说，`wait(&consumer_mbar[0], 0)` 并不是“等 pipe 0”，而是“我已经通过数组下标选中 pipe 0；现在等它的偶数代使用完成”。数组下标选哪块 shared memory，`phase` 区分同一块 shared memory 的旧一代和新一代。PTX 文档把 phase 定义为 mbarrier 被使用的次数，并规定 parity wait 只接受该代次的奇偶性。[PTX ISA 的 mbarrier phase 说明](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)
 
+#### 为什么 `cuda::barrier` 看起来没有 `phase` 参数？
+
+`phase` 没有消失，只是被高层 API 藏进了 `arrival_token`。普通 `cuda::barrier` 的使用者不必自己保存 `0/1`：
+
+```cpp
+// 高层 cuda::barrier：token 绑定本次 arrive 所在的那一代。
+auto token = bar.arrive();
+do_independent_work();
+bar.wait(cuda::std::move(token));
+```
+
+而 CUTLASS 的 `ClusterBarrier` 更接近 PTX 的 `mbarrier` 原语。它的 `wait` 直接对应 `mbarrier.try_wait.parity`，因此调用者必须明确给出目标代次的 parity：
+
+```cpp
+// CUTLASS：TMA pipeline 用 PipelineState 保存并传递 parity。
+uint32_t phase = consumer_state.phase();  // 只会是 0 或 1
+ClusterBarrier::wait(&consumer_mbar[read_pipe], phase);
+```
+
+这两段代码问的是同一件事：“我要等哪一代 barrier？”区别仅在于谁保存答案：前者是库返回的 opaque token，后者是调用者维护的 `PipelineState::phase()`。因此本节的 `phase` 与前一篇 `cuda::barrier` 笔记中的 `arrival_token` 是一一对应的概念，不是 TMA 额外创造的一套状态。
+
+| 对比项 | `cuda::barrier` 高层接口 | CUTLASS `ClusterBarrier` |
+| --- | --- | --- |
+| 目标代次怎么传递 | `arrive()` 返回的 `arrival_token` 隐式绑定该代 | 调用者显式传入 `phase` parity（`0` 或 `1`） |
+| 等待形式 | `bar.wait(std::move(token))` | `ClusterBarrier::wait(ptr, phase)` |
+| 贴近的层次 | C++ 对象和 block-scope 同步协议 | shared-memory `mbarrier` 的轻量封装 |
+| cluster 能力 | 常规接口没有“向指定 CTA 远端 arrive”的参数 | `arrive(ptr, cta_id, pred)` 可向 cluster 内另一 CTA 的同偏移 barrier 到达 |
+| TMA 事务计数 | 普通 `arrive()` / `wait()` 不显式管理字节事务 | 派生的 `ClusterTransactionBarrier` 提供 `arrive_and_expect_tx(bytes)`，把 TMA 完成计入同一代 |
+
+所以更准确的对应关系是：`ClusterBarrier` 对应上一节文章里的**显式 phase tracking / PTX mbarrier**；`cuda::barrier` 则是在其上提供了 token 式的、更不容易手动传错代次的接口。二者不是两种无关的硬件 barrier。
+
 #### `pred`：是否让当前线程产生这次操作
 
 `pred` 不是 phase，也不是“有多少线程参与 barrier”。它只是当前调用的条件开关：

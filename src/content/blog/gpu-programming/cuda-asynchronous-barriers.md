@@ -298,6 +298,32 @@ void wait(arrival_token&& token) const;
 - 如果 token 对应的 phase 已经完成，`wait()` 会直接返回。
 - 如果 phase 尚未完成，`wait()` 会阻塞到 phase 推进。
 
+## 为什么 `cuda::barrier` 的接口里看不见 `phase` 参数？
+
+`phase` 一直都在；高层 `cuda::barrier` 只是把它封装进 `arrival_token`，不让调用者手写 `0` 或 `1`。
+
+```cpp
+auto token = bar.arrive();
+// token 绑定这一次 arrive 所在的 phase。
+
+do_independent_work();
+bar.wait(cuda::std::move(token));
+// wait 根据 token 知道自己要等哪一代。
+```
+
+也就是说，`arrival_token` 不是普通的“我到过这里”的布尔标记；它是“我在第几代 barrier 到达”的不透明凭证。因而高层接口的正确用法是把 token 交回 `wait()`，而不是自行推导 phase。
+
+只有降到 `cuda::ptx::mbarrier_try_wait_parity()` 这类底层接口时，phase 才会重新作为显式的 `0/1` parity 参数出现：
+
+```cpp
+// 低层 mbarrier：调用者自己维护每轮的 parity。
+while (!cuda::ptx::mbarrier_try_wait_parity(native_handle, parity)) {
+}
+parity ^= 1;
+```
+
+因此后面“显式阶段跟踪”一节并不是另一套机制，而是把 `arrival_token` 在高层 API 中替你保存的那部分状态拿出来手动管理。CUTLASS 的 `ClusterBarrier::wait(ptr, phase)` 也属于这一层：它直接包装 `mbarrier` 的 parity wait；同时还能让 cluster 内其他 CTA 对目标 CTA 的 barrier 执行远端 `arrive`。
+
 ## Phase 使用规则
 
 异步屏障最容易出错的地方不是 API 调用本身，而是 phase 规则。可以把每个 phase 看成一个严格的批次：
