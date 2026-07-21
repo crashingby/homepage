@@ -6985,3 +6985,346 @@ $$
 - 每个数字只能决策一次：一维优化时必须逆序遍历。
 
 所以 494 不是凭空多出来的新模型，而是 0-1 背包从“可达性”升级到“方案计数”的版本。
+
+## [2915. 和为目标值的最长子序列的长度 - 力扣（LeetCode）](https://leetcode.cn/problems/length-of-the-longest-subsequence-that-sums-to-target/description/)
+
+给你一个下标从 0 开始的整数数组 `nums` 和一个整数 `target`。
+
+返回和为 `target` 的 `nums` 子序列中，子序列长度的最大值。如果不存在和为 `target` 的子序列，返回 `-1`。
+
+子序列指的是从原数组中删除一些或者不删除任何元素后，剩余元素保持原来的顺序构成的数组。
+
+示例 1：
+
+```text
+输入：nums = [1,2,3,4,5], target = 9
+输出：3
+解释：总共有 3 个子序列的和为 9：[4,5]、[1,3,5] 和 [2,3,4]。
+最长的子序列是 [1,3,5] 和 [2,3,4]，所以答案为 3。
+```
+
+示例 2：
+
+```text
+输入：nums = [4,1,3,2,1,5], target = 7
+输出：4
+解释：最长子序列为 [1,3,2,1]，所以答案为 4。
+```
+
+示例 3：
+
+```text
+输入：nums = [1,1,5,4,5], target = 3
+输出：-1
+解释：无法得到和为 3 的子序列。
+```
+
+提示：
+
+- `1 <= nums.length <= 1000`
+- `1 <= nums[i] <= 1000`
+- `1 <= target <= 1000`
+
+这题也是 0-1 背包变形。它和 416、494 放在一起看最清楚：
+
+- 416：问能不能凑出某个和，`dp` 存 `bool`。
+- 494：问有多少种方法凑出某个和，`dp` 存方案数。
+- 2915：问凑出某个和时最多能选几个数，`dp` 存最大长度。
+
+### 题目如何转成 0-1 背包？
+
+题目说的是“子序列”，但因为这里只关心元素和与长度，并不要求输出具体子序列，所以本质仍然是对每个元素做一次选择：
+
+- 选 `nums[i]`：它会让当前和增加 `nums[i]`，长度增加 1。
+- 不选 `nums[i]`：当前和与长度不变。
+
+这正是 0-1 背包：
+
+- **物品**：数组里的每个数 `nums[i]`。
+- **重量**：这个数本身，也就是 `nums[i]`。
+- **价值**：选中一个数贡献的长度，也就是 1。
+- **背包容量**：`target`。
+- **0-1 约束**：每个数只能选一次，要么选进子序列，要么不选。
+- **目标**：在总和刚好等于 `target` 的前提下，让选中数量最大。
+
+所以它可以看成：
+
+> 有一堆物品，每个物品重量为 `nums[i]`，价值为 1，每个物品最多选一次。问刚好装满容量 `target` 时，最大价值是多少。
+
+如果无法刚好装满 `target`，返回 `-1`。
+
+### 递归切入（探索逻辑）
+
+先从递归想：站在 `nums[index]` 面前，仍然只有两个选择，选或不选。
+
+定义 `dfs(index, remain)` 表示：从下标 `index` 开始考虑数字，还需要凑出 `remain`，最多还能选出多少个数。
+
+递归边界：
+
+- 如果 `remain == 0`，说明已经刚好凑出目标和，后面不能再选正整数，否则一定会超过目标，所以返回 0。
+- 如果 `index == nums.size()`，说明数字都看完了还没凑出目标，返回一个无效值。
+
+这里需要一个无效值，例如 `kInvalid = -1000000000`，表示“这个状态无法凑出目标”。不能直接返回 0，因为 0 是合法长度：比如目标已经被凑出来时，后面确实还能贡献 0 个数字。
+
+站在当前数字 `nums[index]` 面前：
+
+- **不选当前数字**：答案来自 `dfs(index + 1, remain)`。
+- **选当前数字**：前提是 `remain >= nums[index]`，答案来自 `dfs(index + 1, remain - nums[index]) + 1`。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+\max(
+dfs(index + 1, remain),\
+dfs(index + 1, remain - nums[index]) + 1
+)
+$$
+
+第二项需要满足 `remain >= nums[index]`，并且子问题本身不能是无效状态。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求和为 target 的最长子序列长度。
+     *
+     * @param nums 输入数组，元素均为正整数。
+     * @param target 目标子序列和。
+     * @return 和为 target 的最长子序列长度；如果不存在，返回 -1。
+     */
+    int lengthOfLongestSubsequence(vector<int>& nums, int target) {
+        vector<vector<int>> memo(nums.size(), vector<int>(target + 1, kUnknown));
+        const int answer = dfs(nums, memo, 0, target);
+        return answer < 0 ? -1 : answer;
+    }
+
+private:
+    static constexpr int kInvalid = -1000000000;
+    static constexpr int kUnknown = -1000000001;
+
+    int dfs(const vector<int>& nums, vector<vector<int>>& memo, int index, int remain) {
+        if (remain == 0) {
+            return 0;
+        }
+        if (index == static_cast<int>(nums.size())) {
+            return kInvalid;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        // 不选当前数字。
+        cached = dfs(nums, memo, index + 1, remain);
+
+        if (remain >= nums[index]) {
+            // 选当前数字。只有子问题有效时，才能在它的长度上加 1。
+            const int next_length = dfs(nums, memo, index + 1, remain - nums[index]);
+            if (next_length != kInvalid) {
+                cached = max(cached, next_length + 1);
+            }
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归已经是 0-1 背包的形状了：`remain` 是剩余容量，返回值是“最大长度”。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][j]` 表示只考虑前 `i` 个数字时，凑出和 `j` 的最长子序列长度。
+
+如果无法凑出 `j`，就让 `dp[i][j] = kInvalid`。
+
+最终答案是：
+
+$$
+dp[n][target]
+$$
+
+如果 `dp[n][target] < 0`，说明无法凑出 `target`，返回 `-1`。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实数字 `nums[item]`。
+
+`dp[item]` 表示还没处理 `nums[item]` 之前的状态，`dp[item + 1]` 表示处理完 `nums[item]` 之后的状态。
+
+- **不选当前数字**：凑出 `sum` 的最长长度继承自上一行。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前数字**：如果上一行能凑出 `sum - nums[item]`，那么选当前数字后，长度加 1。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum - nums[item]] + 1
+$$
+
+因为要求最长长度，所以两个来源取最大值：
+
+$$
+dp[item + 1][sum] =
+\max(dp[item][sum],\ dp[item][sum - nums[item]] + 1)
+$$
+
+第二项需要满足 `sum >= nums[item]`，并且 `dp[item][sum - nums[item]]` 不是无效状态。
+
+这就是它和 416、494 的差异：
+
+- 416 是可达性，两个来源用逻辑或合并。
+- 494 是方案数，两个来源用加法合并。
+- 2915 是最长长度，两个来源用 `max` 合并。
+
+### 初始化
+
+- `dp[0][0] = 0`：不选任何数字，可以凑出和 0，长度为 0。
+- `dp[0][j] = kInvalid`，其中 `j > 0`：不选任何数字，不可能凑出正数和。
+
+这里不能把所有状态初始化成 0。因为 0 代表一个合法长度，会让“不可能凑出”的状态也被误认为可以凑出。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `n - 1`，逐个处理真实数字 `nums[item]`。
+- 内层从 `sum = 0` 到 `target`，枚举当前要凑出的和。
+
+因为 `dp[item + 1][sum]` 只依赖上一行 `dp[item][...]`，所以二维写法里内层正序或逆序都可以。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 0-1 背包求和为 target 的最长子序列长度。
+     *
+     * @param nums 输入数组，元素均为正整数。
+     * @param target 目标子序列和。
+     * @return 和为 target 的最长子序列长度；如果不存在，返回 -1。
+     */
+    int lengthOfLongestSubsequence(vector<int>& nums, int target) {
+        constexpr int kInvalid = -1000000000;
+        const int n = static_cast<int>(nums.size());
+        vector<vector<int>> dp(n + 1, vector<int>(target + 1, kInvalid));
+        dp[0][0] = 0;
+
+        for (int item = 0; item < n; item++) {
+            const int num = nums[item];
+
+            for (int sum = 0; sum <= target; sum++) {
+                // 不选当前数字：继承上一行的最长长度。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= num && dp[item][sum - num] != kInvalid) {
+                    // 选当前数字：来源必须是上一行，保证每个数字最多使用一次。
+                    dp[item + 1][sum] = max(dp[item + 1][sum], dp[item][sum - num] + 1);
+                }
+            }
+        }
+
+        return dp[n][target] < 0 ? -1 : dp[n][target];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times target)$。
+- 空间复杂度：$O(n \times target)$。
+
+### 空间优化
+
+二维转移只依赖上一行，所以可以压成一维：
+
+`dp[sum]` 表示当前已经处理过的数字中，凑出和 `sum` 的最长子序列长度。
+
+处理当前数字 `num` 时：
+
+$$
+dp[sum] = \max(dp[sum],\ dp[sum - num] + 1)
+$$
+
+这仍然是 0-1 背包，所以一维优化必须逆序遍历：
+
+```cpp
+for (int sum = target; sum >= num; sum--)
+```
+
+逆序遍历保证 `dp[sum - num]` 还是处理当前数字之前的旧状态。如果正序遍历，当前数字可能在同一轮中被重复使用，题目就会从“每个元素最多选一次”变味。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 0-1 背包求和为 target 的最长子序列长度。
+     *
+     * @param nums 输入数组，元素均为正整数。
+     * @param target 目标子序列和。
+     * @return 和为 target 的最长子序列长度；如果不存在，返回 -1。
+     */
+    int lengthOfLongestSubsequence(vector<int>& nums, int target) {
+        constexpr int kInvalid = -1000000000;
+        vector<int> dp(target + 1, kInvalid);
+        dp[0] = 0;
+
+        for (const int num : nums) {
+            // 逆序遍历，保证当前数字不会在同一轮中被重复使用。
+            for (int sum = target; sum >= num; sum--) {
+                if (dp[sum - num] != kInvalid) {
+                    dp[sum] = max(dp[sum], dp[sum - num] + 1);
+                }
+            }
+        }
+
+        return dp[target] < 0 ? -1 : dp[target];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times target)$。
+- 空间复杂度：$O(target)$。
+
+### 这题的核心手感
+
+2915 的关键，是把“和为 `target` 的最长子序列”翻译成背包语言：
+
+> 从 `nums` 中选若干个数，使它们的和刚好等于 `target`，并且选中的数量尽量多。
+
+它和前面几道背包题的关系可以这样记：
+
+- 基础 0-1 背包：`dp[sum]` 存最大价值，转移用 `max`。
+- 416：`dp[sum]` 存能否凑出，转移用逻辑或。
+- 494：`dp[sum]` 存方案数，转移用加法。
+- 2915：`dp[sum]` 存最长长度，转移用 `max`。
+
+这题里每个数字的“价值”都是 1，所以当你选择 `nums[item]` 时，容量减少 `nums[item]`，长度增加 1：
+
+$$
+dp[sum] = \max(dp[sum],\ dp[sum - num] + 1)
+$$
+
+因为每个数组元素只能在子序列中出现一次，所以它仍然是 0-1 背包，一维优化时仍然必须**逆序遍历容量**。理解了这一点，2915 就是“刚好装满背包时求最大物品数量”。

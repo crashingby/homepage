@@ -3938,10 +3938,10 @@ struct PipelineState {
 
 对默认初始状态 `(index=0, phase=0, count=0)`，它等价于：
 
-\[
+$$
 \text{index} = \text{count} \bmod \text{Stages}, \qquad
 \text{phase} = \left\lfloor \frac{\text{count}}{\text{Stages}} \right\rfloor \bmod 2
-\]
+$$
 
 以 `K_PIPE_MAX = 3` 为例：
 
