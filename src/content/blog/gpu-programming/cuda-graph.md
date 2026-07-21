@@ -411,11 +411,116 @@ __host__ cudaError_t cudaThreadExchangeStreamCaptureMode(cudaStreamCaptureMode* 
 
 捕获模式的区别如下：
 
-| 模式 | 限制范围 | 使用建议 |
+`cudaStreamCaptureMode` 在 `cuda-13.3/targets/x86_64-linux/include/driver_types.h` 中的源码很短，但背后的语义很容易误会：
+
+```cpp
+enum __device_builtin__ cudaStreamCaptureMode { // 定义 stream capture 与其他线程 CUDA API 调用的交互模式。
+    cudaStreamCaptureModeGlobal = 0, // 全局模式：本线程或其他线程的 global 捕获都会禁止潜在不安全 API。
+    cudaStreamCaptureModeThreadLocal = 1, // 线程局部模式：只约束当前线程，不因为其他线程捕获而拦截本线程。
+    cudaStreamCaptureModeRelaxed = 2 // 宽松模式：不主动禁止潜在不安全 API，但仍禁止必然破坏 capture 的操作。
+}; // 结束 cudaStreamCaptureMode 定义。
+```
+
+先把几个词拆开。这里最容易糊的是：`cudaStreamBeginCapture(stream, mode)` 里的 `mode` 既会成为这个 **capture sequence（捕获序列）** 的属性，也会影响 CUDA Runtime 判断“当前线程能不能调用某些 API”。
+
+| 说法 | 具体含义 |
+| --- | --- |
+| **一个 capture** | 从 `cudaStreamBeginCapture()` 到 `cudaStreamEndCapture()` 之间的那段捕获序列。 |
+| **Relaxed capture** | 用 `cudaStreamCaptureModeRelaxed` 开始的捕获序列。 |
+| **非 Relaxed capture** | 用 `cudaStreamCaptureModeGlobal` 或 `cudaStreamCaptureModeThreadLocal` 开始的捕获序列。 |
+| **Global capture** | 用 `cudaStreamCaptureModeGlobal` 开始的捕获序列。它的影响会扩散到其他线程。 |
+| **ThreadLocal capture** | 用 `cudaStreamCaptureModeThreadLocal` 开始的捕获序列。它主要限制发起捕获的线程。 |
+| **冲突的 capture 操作** | 操作本身会观察、合并、逃逸或破坏正在捕获的序列；即使用 `Relaxed` 也不允许。 |
+| **潜在不安全 API** | 不一定必然破坏 capture，但它的副作用不会进入 graph，Runtime 在非 Relaxed 规则下会保守拦截。典型例子是 `cudaMalloc()`。 |
+
+一句话版本：**Global / ThreadLocal / Relaxed 不是说“哪些 kernel 被捕获”，而是说“捕获期间，CUDA 要多保守地禁止本线程或其他线程调用那些 graph 无法记录的 API”。**
+
+可以把 Runtime 的判断想成下面这张表。假设某个线程 T 现在想调用一个潜在不安全 API，例如 `cudaMalloc()`：
+
+| 当前情况 | T 调 `cudaMalloc()` 会怎样 | 原因 |
 | --- | --- | --- |
-| `cudaStreamCaptureModeGlobal` | 其他线程上的潜在不安全调用也可能被禁止 | 默认且最保守，优先用于不确定第三方代码行为的场景。 |
-| `cudaStreamCaptureModeThreadLocal` | 主要限制发起捕获的线程，忽略其他线程上的并行捕获 | 调用链明确、但进程内其他线程可能做独立 CUDA 工作时使用。 |
-| `cudaStreamCaptureModeRelaxed` | 不因“潜在不安全”而普遍禁止调用，但必然冲突的操作仍非法 | 只在调用者能证明相关操作不影响捕获正确性时使用。 |
+| T 自己正在进行 `Global` capture | 禁止 | 本线程有非 Relaxed capture。 |
+| T 自己正在进行 `ThreadLocal` capture | 禁止 | 本线程有非 Relaxed capture。 |
+| T 自己正在进行 `Relaxed` capture | 不因为“潜在不安全”而禁止 | Relaxed 明确放松这类保守拦截。 |
+| 另一个线程 U 正在进行 `Global` capture，T 自己没有 capture | 禁止 | Global capture 会让其他线程也避开潜在不安全 API。 |
+| 另一个线程 U 正在进行 `ThreadLocal` capture，T 自己没有 capture | 不因为 U 的 capture 而禁止 | ThreadLocal 不把限制扩散到其他线程。 |
+| 另一个线程 U 正在进行 `Relaxed` capture，T 自己没有 capture | 不因为 U 的 capture 而禁止 | Relaxed capture 不触发这类全局保守拦截。 |
+
+所以：
+
+- **什么叫 Global 捕获**：你调用 `cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)` 开始的那段 capture。它是默认、最保守模式。只要它正在进行，别的线程也会被禁止做 `cudaMalloc()` 这类潜在不安全调用。
+- **什么叫非 Relaxed 捕获**：`Global` 和 `ThreadLocal` 都算。非 Relaxed 的共同点是：开始 capture 的同一个线程里，潜在不安全 API 会被拦截；结束 capture 也必须在开始 capture 的同一个线程做。
+- **什么叫 Relaxed 捕获**：你用 `cudaStreamCaptureModeRelaxed` 开始 capture。Runtime 不再因为“这个 API 可能不安全”就提前拦你，但这不是免责金牌；如果 API 必然破坏捕获隔离，仍然会报错。
+- **什么叫冲突的 capture**：这类不是“可能不安全”，而是“肯定和捕获模型打架”。例如查询 capture 内刚 record 的 event、把两个独立 capture 序列意外 merge、让捕获 fork 到别的 stream 后没 join 回 origin stream、跨 capture 边界制造非 in-stream 依赖。Relaxed 也不能放行这些。
+
+所谓 **potentially unsafe API（潜在不安全 API）**，典型例子是 `cudaMalloc()`。它的问题不是“分配内存本身危险”，而是它不会作为一个异步操作排进捕获 stream，也不会变成 graph node。如果被捕获的后续 kernel 依赖这次分配，那么重放 graph 时这次分配不会跟着重放，图的语义就不完整。
+
+```cpp
+cudaGraph_t graph = nullptr; // 准备接收捕获结束后生成的图。
+CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)); // 开始严格捕获，禁止潜在不安全 API。
+float* d_data = nullptr; // 准备接收一次同步 cudaMalloc 的结果。
+cudaError_t status = cudaMalloc(&d_data, 4096); // 错误示例：cudaMalloc 不会被 capture 记录，Global 模式会拦截它。
+if (status != cudaSuccess) { // 如果捕获已经被非法 API 破坏，仍然需要结束 capture 来恢复 stream 状态。
+    cudaGraph_t discarded_graph = nullptr; // 准备接收可能为空的废弃图句柄。
+    cudaStreamEndCapture(stream, &discarded_graph); // 清理 invalidated capture；这里故意不再假设它会成功。
+    CUDA_CHECK(status); // 报告真正触发问题的 cudaMalloc 错误。
+} // 结束错误清理分支。
+CUDA_CHECK(cudaStreamEndCapture(stream, &graph)); // 如果前面没有出错，结束捕获并得到结果图。
+```
+
+如果要在 capture 里表达可重放的分配，应使用 `cudaMallocAsync()` / `cudaFreeAsync()` 这种能进入 stream 顺序的异步接口，或者显式添加 graph memory node。
+
+```cpp
+cudaGraph_t graph = nullptr; // 准备接收捕获生成的图。
+CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)); // 开始捕获 stream 上的异步工作。
+float* d_data = nullptr; // 准备接收异步分配返回的 device 指针。
+CUDA_CHECK(cudaMallocAsync(&d_data, 4096, stream)); // 正确示例：异步分配进入 stream，可捕获为 memory allocation node。
+initKernel<<<16, 256, 0, stream>>>(d_data, 1024); // 使用捕获到的分配结果作为后续 kernel 参数。
+CUDA_CHECK(cudaGetLastError()); // 检查 kernel launch 配置是否立即失败。
+CUDA_CHECK(cudaFreeAsync(d_data, stream)); // 正确示例：异步释放进入 stream，可捕获为 memory free node。
+CUDA_CHECK(cudaStreamEndCapture(stream, &graph)); // 捕获结束后得到包含 alloc、kernel、free 的图。
+```
+
+三种模式可以这样理解：
+
+| 模式 | 它到底放松了什么 | 适合场景 | 容易踩坑 |
+| --- | --- | --- | --- |
+| `cudaStreamCaptureModeGlobal` | 什么都不放松；本线程非 Relaxed capture 会禁 unsafe，其他线程的 Global capture 也会禁本线程 unsafe | 默认选择；你不确定库内部或其他线程是否会碰到 CUDA Runtime 全局副作用时，用它兜住语义 | 多线程程序中，一个线程 Global capture 时，另一个看似无关的线程调用 `cudaMalloc()` 也可能失败 |
+| `cudaStreamCaptureModeThreadLocal` | 放松“其他线程正在 capture 对我本线程的影响”；但本线程自己的 unsafe 仍然会被禁 | capture 调用链清晰，同时进程里其他工作线程可能独立做 CUDA 分配、查询或管理操作 | 其他线程如果实际改了本次 capture 依赖的资源，Runtime 不会替你拦住这种跨线程语义错误 |
+| `cudaStreamCaptureModeRelaxed` | 放松“本线程潜在不安全 API 的保守拦截”；但必然冲突 capture 的 API 仍然非法 | 只有当你能证明这些副作用不需要进入 graph、也不影响被捕获工作语义时才用 | 容易把不可重放的外部状态混进 captured graph；调试时症状常常晚到 graph launch 阶段才暴露 |
+
+更具体一点：
+
+- **Global 是学习和默认工程路径的首选**。它牺牲一点多线程灵活性，换来更早发现“这个 API 不会被 capture 记录”的问题。写框架、算子库 benchmark、封装第三方调用时，除非有明确理由，先用 `Global`。
+- **ThreadLocal 适合隔离良好的多线程程序**。例如线程 A 正在捕获一个固定推理图，线程 B 同时为另一个完全独立的模型准备显存。你不希望线程 A 的 capture 让线程 B 的分配失败，可以用 `ThreadLocal`。前提是线程 B 的分配结果不会被线程 A 捕获到的图依赖。
+- **Relaxed 是“我知道这个副作用不用进图”的模式**。比如你在捕获期间做一次与 captured work 无关的 host 侧缓存准备、日志、或者不会影响图重放语义的 CUDA 管理调用，可以用它减少 Runtime 的保守拦截。它不是“允许所有非法操作”的模式。
+
+下面是几个典型错误边界：
+
+| 错误方式 | 为什么错 | 常见结果 |
+| --- | --- | --- |
+| 在非 Relaxed capture 期间调用 `cudaMalloc()` / 类似同步全局副作用 API | 这些操作不进入 stream，也不会成为 graph node，重放 graph 时不会自动发生 | API 返回 capture 相关错误，捕获可能变成 `cudaStreamCaptureStatusInvalidated` |
+| 用 `cudaStreamLegacy` 开始 capture | legacy stream 会和 blocking stream 建立隐式依赖，不满足 capture 的隔离模型 | `cudaStreamBeginCapture()` 返回错误 |
+| 非 Relaxed capture 在另一个线程调用 `cudaStreamEndCapture()` | CUDA 13.3 文档要求非 Relaxed 模式必须由开始捕获的同一线程结束 | 返回 `cudaErrorStreamCaptureWrongThread` |
+| 查询在 capture 内最后一次 record 的 event，例如 `cudaEventQuery()` | 这个查询跨越 capture 边界观察内部状态，会破坏 capture 隔离 | 返回 `cudaErrorCapturedEvent` 或相关 capture 错误 |
+| 捕获序列 fork 到其他 stream 后没有 join 回 origin stream | 捕获结果无法从 origin stream 闭合，图里留下不可达分支 | `cudaStreamEndCapture()` 返回 `cudaErrorStreamCaptureUnjoined` |
+
+一个实用选择顺序是：
+
+1. 默认写 `cudaStreamCaptureModeGlobal`，先让 Runtime 帮你抓出潜在不安全调用。
+2. 如果多线程里其他线程确实需要独立 CUDA 管理操作，而且它们不参与本次捕获语义，再改成 `cudaStreamCaptureModeThreadLocal`。
+3. 只有在你能逐项说明“这些被放行的调用不会成为 captured graph 的依赖”时，才考虑 `cudaStreamCaptureModeRelaxed`。
+
+`cudaThreadExchangeStreamCaptureMode()` 是线程级别的临时模式切换工具，适合在库函数边界做 push-pop。它不会开始或结束 capture，只是改变当前线程面对“潜在不安全 API”时的交互策略：
+
+```cpp
+void callLibraryWithCaptureMode(cudaStreamCaptureMode desired_mode) { // 在一段库调用期间临时切换当前线程的 capture 交互模式。
+    cudaStreamCaptureMode previous_mode = desired_mode; // 输入期望模式，调用后会被替换成旧模式。
+    CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&previous_mode)); // 把当前线程切到 desired_mode，并保存旧模式。
+    libraryCallThatMayTouchCudaRuntime(); // 调用可能触碰 CUDA Runtime 的库函数，具体安全性由调用者保证。
+    CUDA_CHECK(cudaThreadExchangeStreamCaptureMode(&previous_mode)); // 恢复进入函数前的线程 capture 交互模式。
+} // 结束临时模式切换示例。
+```
 
 ### 最小流捕获
 
@@ -441,7 +546,54 @@ cudaGraphExec_t captureLinearGraph(cudaStream_t stream, float* data, std::size_t
 
 事件可以在捕获期间把一条流分叉到另一条流。额外参与捕获的流必须在结束前重新 join 回 origin stream，否则 `cudaStreamEndCapture()` 会以 `cudaErrorStreamCaptureUnjoined` 失败。
 
-下面同样生成图 25 的菱形拓扑：
+理解 fork / join 的关键是 **dependency set（依赖集合）**。捕获期间，每条参与 capture 的 stream 都有一个“下一个节点应该依赖谁”的集合。每捕获一个新节点，Runtime 会：
+
+1. 用这条 stream 当前的 dependency set 给新节点连入边。
+2. 把这条 stream 的 dependency set 更新为“刚捕获的新节点”。
+
+如果只在一条 stream 上捕获，dependency set 就退化成线性顺序：
+
+```mermaid
+flowchart LR
+    A["捕获 A"] --> B["捕获 B"]
+    B --> C["捕获 C"]
+```
+
+跨 stream 的神奇之处，是 event 把一条 stream 的 dependency set 复制给另一条 stream：
+
+- `cudaEventRecord(event, stream_1)`：把 `stream_1` 此刻“已经捕获到哪里了”记录到 `event`。如果刚捕获完 A，那么 `event` 代表“等待 A”。
+- `cudaStreamWaitEvent(stream_2, event, 0)`：让 `stream_2` 未来捕获的节点依赖这个 `event` 代表的依赖集合。于是 `stream_2` 的下一个节点会依赖 A。
+- 这一步就是 **fork**：依赖前沿从 `stream_1` 分出一份给 `stream_2`，后面两个 stream 可以各自继续捕获节点。
+- 反过来，在 `stream_2` 捕获完 C 后记录 `join_event`，再让 `stream_1` wait 这个 event，就是 **join**：把 `stream_2` 的尾部依赖重新接回 origin stream。
+
+下面是捕获菱形图时，每一步 dependency set 的变化。这里 `frontier(stream)` 表示这条 stream 的下一个 captured node 会依赖哪些节点。
+
+| 步骤 | 调用 | `stream_1` 的 frontier | `stream_2` 的 frontier | 图里的效果 |
+| --- | --- | --- | --- | --- |
+| 1 | begin capture | 空 | 未参与 | `stream_1` 成为 origin stream |
+| 2 | 捕获 A 到 `stream_1` | `{A}` | 未参与 | A 是根节点 |
+| 3 | record `fork_event` on `stream_1` | `{A}` | 未参与 | event 记住 `{A}` |
+| 4 | `stream_2` wait `fork_event` | `{A}` | `{A}` | `stream_2` 加入同一 capture，下一节点依赖 A |
+| 5 | 捕获 B 到 `stream_1` | `{B}` | `{A}` | B 依赖 A |
+| 6 | 捕获 C 到 `stream_2` | `{B}` | `{C}` | C 依赖 A，且与 B 可并行 |
+| 7 | record `join_event` on `stream_2` | `{B}` | `{C}` | event 记住 `{C}` |
+| 8 | `stream_1` wait `join_event` | `{B, C}` | `{C}` | origin stream 的下一节点同时依赖 B 和 C |
+| 9 | 捕获 D 到 `stream_1` | `{D}` | `{C}` | D 依赖 B 和 C |
+| 10 | end capture on `stream_1` | 完整闭合 | 已 join | 返回菱形 DAG |
+
+捕获出来的图不是“两个 stream 对象的录像”，而是下面这张依赖图：
+
+```mermaid
+flowchart TD
+    A["A<br/>stream_1"] --> B["B<br/>stream_1"]
+    A --> C["C<br/>stream_2"]
+    B --> D["D<br/>stream_1"]
+    C --> D
+```
+
+因此重放时虽然只调用一次 `cudaGraphLaunch(graph_exec, launch_stream)`，但图内部仍按 `A -> {B, C} -> D` 的 DAG 调度；`launch_stream` 只控制整张图相对外部工作的前后顺序。
+
+下面同样生成图 25 的菱形拓扑。可以按上面的 frontier 表逐行对照：
 
 ```cpp
 cudaGraphExec_t buildDiamondGraphWithCapture(cudaStream_t stream_1, cudaStream_t stream_2) { // 用两个 stream 捕获 A、B、C、D 菱形图。
@@ -653,42 +805,130 @@ cudaGraph_t captureReductionGraph(cudaStream_t stream_1, cudaStream_t stream_2, 
 ```cpp
 __host__ cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pGraphExec, cudaGraph_t graph, unsigned long long flags = 0); // 校验图模板并创建执行快照。
 __host__ cudaError_t cudaGraphInstantiateWithParams(cudaGraphExec_t* pGraphExec, cudaGraph_t graph, cudaGraphInstantiateParams* instantiateParams); // 用结构体传入 flags、上传 stream 并接收详细实例化结果。
-__host__ cudaError_t cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t stream); // 提前在指定 stream 上准备首次发射所需资源。
+__host__ cudaError_t cudaGraphUpload(cudaGraphExec_t graphExec, cudaStream_t stream); // 提前在指定 stream 上准备首次发射所需设备侧资源，减少图的冷启动开销。
 __host__ __device__ cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream); // 从 host 或符合条件的 device 代码发射可执行图。
 __host__ cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec); // 销毁可执行图及其执行资源。
 ```
 
-`cudaGraphInstantiateParams` 的成员如下：
+
+CUDA 13.3 的 `/usr/local/cuda-13.3/targets/x86_64-linux/include/driver_types.h` 中，实例化结果枚举、参数结构体和 flags 原型如下。先看 `cudaGraphInstantiateResult`，它用于比 `cudaError_t` 更细地说明“图为什么不能实例化”：
+
+```cpp
+typedef __device_builtin__ enum cudaGraphInstantiateResult { // 描述 cudaGraphInstantiateWithParams 的详细实例化结果。
+    cudaGraphInstantiateSuccess = 0, // 实例化成功。
+    cudaGraphInstantiateError = 1, // 因意外原因失败，具体错误通常要看 API 返回的 cudaError_t。
+    cudaGraphInstantiateInvalidStructure = 2, // 图结构非法，例如存在环或其他结构约束被破坏。
+    cudaGraphInstantiateNodeOperationNotSupported = 3, // device launch 实例化失败，因为某个节点操作不支持。
+    cudaGraphInstantiateMultipleDevicesNotSupported = 4, // device launch 或 device-side launch 相关图跨了不支持的多设备上下文。
+    cudaGraphInstantiateConditionalHandleUnused = 5 // 有 conditional handle 没有关联到任何 conditional node。
+} cudaGraphInstantiateResult; // 结束 cudaGraphInstantiateResult 定义。
+```
+
+再看 `cudaGraphInstantiateParams_st`。这个结构体是 `cudaGraphInstantiateWithParams()` 的参数块：`flags` 和 `uploadStream` 是输入，`errNode_out` 和 `result_out` 是输出。
+
+```cpp
+typedef __device_builtin__ struct cudaGraphInstantiateParams_st { // cudaGraphInstantiateWithParams 使用的实例化参数。
+    unsigned long long flags; // 输入：实例化 flags 位掩码，控制实例化和后续 graph launch 行为。
+    cudaStream_t uploadStream; // 输入：使用 cudaGraphInstantiateFlagUpload 时，上传工作排入的 stream。
+    cudaGraphNode_t errNode_out; // 输出：实例化失败时尽量返回出错节点；没有具体节点时为 nullptr。
+    cudaGraphInstantiateResult result_out; // 输出：返回更细的实例化结果，成功时为 cudaGraphInstantiateSuccess。
+} cudaGraphInstantiateParams; // 结束 cudaGraphInstantiateParams 定义。
+```
 
 | 成员 | 方向 | 含义 |
 | --- | --- | --- |
-| `flags` | 输入 | 实例化选项位掩码。 |
-| `uploadStream` | 输入 | 使用 `cudaGraphInstantiateFlagUpload` 时执行上传的 stream。 |
-| `errNode_out` | 输出 | 实例化失败时关联的错误节点；没有具体节点时为空。 |
-| `result_out` | 输出 | `cudaGraphInstantiateSuccess`、结构非法、不支持的节点操作或多设备不支持等更细结果。 |
+| `flags` | 输入 | 实例化选项位掩码。它不仅影响 instantiate 阶段，也可能影响之后每次 `cudaGraphLaunch()` 的行为。 |
+| `uploadStream` | 输入 | 只有设置 `cudaGraphInstantiateFlagUpload` 时才有意义；CUDA 会在实例化成功后把 upload 工作排入这个 stream。 |
+| `errNode_out` | 输出 | 实例化失败时尽量指向出错节点，例如非法结构中的 offending node、不支持 device launch 的节点；没有具体节点时为 `nullptr`。 |
+| `result_out` | 输出 | 比 `cudaError_t` 更细的结果码，例如结构非法、不支持的节点操作、多设备不支持或 conditional handle 未使用。 |
+
+使用时通常先 `{}` 零初始化，再填输入字段；调用返回后再读输出字段：
+
+```cpp
+cudaGraphExec_t graph_exec = nullptr; // 保存实例化成功后的 executable graph。
+cudaGraphInstantiateParams instantiate_params{}; // 零初始化输入 flags、uploadStream 和输出字段。
+instantiate_params.flags = cudaGraphInstantiateFlagUpload; // 请求实例化完成后顺便上传 graph。
+instantiate_params.uploadStream = stream; // 指定 upload 工作排入哪个 stream。
+cudaError_t status = cudaGraphInstantiateWithParams(&graph_exec, graph, &instantiate_params); // 用参数结构体实例化图。
+if (status != cudaSuccess) { // 如果实例化失败，读取更细的失败信息。
+    cudaGraphNode_t bad_node = instantiate_params.errNode_out; // 保存可能导致失败的节点，可能为 nullptr。
+    cudaGraphInstantiateResult reason = instantiate_params.result_out; // 保存更细的失败原因。
+    handleInstantiateFailure(status, bad_node, reason); // 交给应用自己的错误报告逻辑处理。
+} // 结束实例化失败分支。
+```
 
 常用实例化 flags：
 
+源码中的 `cudaGraphInstantiateFlags` 如下：
+
+```cpp
+enum __device_builtin__ cudaGraphInstantiateFlags { // 定义 graph 实例化可用的 flags 位。
+    cudaGraphInstantiateFlagAutoFreeOnLaunch = 1, // 每次重新发射前，自动释放上一轮遗留的 graph allocation。
+    cudaGraphInstantiateFlagUpload = 2, // 实例化后自动上传 graph，只支持 cudaGraphInstantiateWithParams。
+    cudaGraphInstantiateFlagDeviceLaunch = 4, // 把 graph 实例化为可从 device 端 cudaGraphLaunch 发射。
+    cudaGraphInstantiateFlagUseNodePriority = 8 // 执行 graph 时使用节点 priority 属性，而不是只使用 launch stream 的优先级。
+}; // 结束 cudaGraphInstantiateFlags 定义。
+```
+
 | flag | 作用 | 主要约束 |
 | --- | --- | --- |
-| `cudaGraphInstantiateFlagAutoFreeOnLaunch` | 每次重发前异步释放上次仍存活的 graph allocation | 不能与 device launch 同时使用；也不替代最终显式释放。 |
-| `cudaGraphInstantiateFlagUpload` | 实例化过程中在 `uploadStream` 提前上传 | 需要通过 `cudaGraphInstantiateWithParams()` 提供 stream。 |
-| `cudaGraphInstantiateFlagDeviceLaunch` | 允许从 device 发射该 exec | 图必须满足 device graph 的节点与单设备约束。 |
-| `cudaGraphInstantiateFlagUseNodePriority` | 使用节点自身 priority 而不是忽略它 | 更新时不能任意改变原始 priority。 |
+| `cudaGraphInstantiateFlagAutoFreeOnLaunch` | 含 graph memory allocation node 的图，如果上一轮发射留下未释放的 graph allocation，下一轮发射前自动释放。 | 不能和 `cudaGraphInstantiateFlagDeviceLaunch` 同时使用；它是“重新发射前兜底清理”，不是替代正常的 memory free node 设计。 |
+| `cudaGraphInstantiateFlagUpload` | 实例化成功后立刻把 graph upload 工作排入 `instantiateParams.uploadStream`，减少第一次 `cudaGraphLaunch()` 的冷启动开销。 | 只支持 `cudaGraphInstantiateWithParams()`，因为普通 `cudaGraphInstantiate()` 没有地方传 `uploadStream`。 |
+| `cudaGraphInstantiateFlagDeviceLaunch` | 让返回的 `cudaGraphExec_t` 既能 host launch，也能 device-side `cudaGraphLaunch()`。 | 需要 unified addressing；不能和 `AutoFreeOnLaunch` 同用；图还要满足 device graph launch 的节点类型、单设备和操作限制。 |
+| `cudaGraphInstantiateFlagUseNodePriority` | graph 执行时使用节点自己的 priority 属性，而不是统一继承 launch stream 的优先级。 | priority 主要作用于 kernel node；stream capture 时节点 priority 会从当时的 stream priority 复制过来。 |
+
+这几个 flags 是位掩码，可以按位或组合，但要避开文档明确禁止的组合。例如 upload 和 node priority 可以一起用，device launch 和 auto-free 不能一起用：
+
+```cpp
+cudaGraphInstantiateParams instantiate_params{}; // 零初始化结构体，避免未使用字段含有随机值。
+instantiate_params.flags = cudaGraphInstantiateFlagUpload | cudaGraphInstantiateFlagUseNodePriority; // 同时请求自动 upload 和使用节点优先级。
+instantiate_params.uploadStream = stream; // 指定 upload 工作所在 stream。
+CUDA_CHECK(cudaGraphInstantiateWithParams(&graph_exec, graph, &instantiate_params)); // 按指定 flags 实例化 graph。
+```
+
+`cudaGraphInstantiate()` 是简化入口，只能传 `flags`；如果需要 upload stream 或详细错误输出，就用 `cudaGraphInstantiateWithParams()`。
 
 ### 重复发射
 
+如果想提前支付首次发射准备成本，有两种等价写法。第一种是 **手动 upload**：先实例化，再显式调用 `cudaGraphUpload()`。
+
 ```cpp
-cudaGraphExec_t instantiateAndRun(cudaGraph_t graph, cudaStream_t stream, int repeat_count) { // 实例化图并按顺序重复发射。
+cudaGraphExec_t instantiateAndRunWithManualUpload(cudaGraph_t graph, cudaStream_t stream, int repeat_count) { // 用显式 cudaGraphUpload 预热并重复发射。
     cudaGraphExec_t graph_exec = nullptr; // 保存可执行图句柄。
     CUDA_CHECK(cudaGraphInstantiate(&graph_exec, graph, 0)); // 在循环外支付实例化与校验成本。
-    CUDA_CHECK(cudaGraphUpload(graph_exec, stream)); // 可选地把首次发射准备工作提前排入同一 stream。
+    CUDA_CHECK(cudaGraphUpload(graph_exec, stream)); // 手动把首次发射准备工作提前排入 stream。
     for (int iteration = 0; iteration < repeat_count; ++iteration) { // 按应用需要重复提交整张图。
-        CUDA_CHECK(cudaGraphLaunch(graph_exec, stream)); // 每次调用只提交一个预先实例化的工作流。
+        CUDA_CHECK(cudaGraphLaunch(graph_exec, stream)); // 同一 stream 顺序保证 launch 等待 upload 完成。
     } // 结束重复发射循环。
     CUDA_CHECK(cudaStreamSynchronize(stream)); // 仅在结果交给 CPU 或释放相关资源前等待所有发射完成。
     return graph_exec; // 返回 exec，让调用方决定何时销毁。
-} // 结束 instantiateAndRun。
+} // 结束 instantiateAndRunWithManualUpload。
+```
+
+第二种是 **参数结构体自动 upload**：用 `cudaGraphInstantiateFlagUpload` 告诉 `cudaGraphInstantiateWithParams()`，实例化成功后立刻把 upload 工作排入 `uploadStream`。这就是 `uploadStream` 字段真正服务的地方。
+
+```cpp
+cudaGraphExec_t instantiateAndRunWithUploadStream(cudaGraph_t graph, cudaStream_t upload_stream, cudaStream_t launch_stream, int repeat_count) { // 用 instantiate params 指定 upload stream 并重复发射。
+    cudaGraphExec_t graph_exec = nullptr; // 保存实例化后的 executable graph。
+    cudaGraphInstantiateParams instantiate_params{}; // 零初始化 flags、uploadStream 和输出字段。
+    instantiate_params.flags = cudaGraphInstantiateFlagUpload; // 请求实例化成功后自动执行 graph upload。
+    instantiate_params.uploadStream = upload_stream; // 指定自动 upload 工作排入哪条 stream。
+    CUDA_CHECK(cudaGraphInstantiateWithParams(&graph_exec, graph, &instantiate_params)); // 实例化图，并把 upload 排入 upload_stream。
+
+    if (upload_stream != launch_stream) { // 如果 upload 和 launch 使用不同 stream，需要显式建立跨 stream 顺序。
+        cudaEvent_t upload_done = nullptr; // 准备用 event 表达 upload 完成后才能 launch。
+        CUDA_CHECK(cudaEventCreateWithFlags(&upload_done, cudaEventDisableTiming)); // 创建轻量事件，仅用于 stream 间依赖。
+        CUDA_CHECK(cudaEventRecord(upload_done, upload_stream)); // 在 upload_stream 当前尾部记录事件，代表自动 upload 已排在它之前。
+        CUDA_CHECK(cudaStreamWaitEvent(launch_stream, upload_done, 0)); // 让 launch_stream 等待 upload_stream 上的 upload 完成。
+        CUDA_CHECK(cudaEventDestroy(upload_done)); // wait 已经捕获事件状态，host 侧可以销毁事件对象。
+    } // 结束跨 stream 顺序处理。
+
+    for (int iteration = 0; iteration < repeat_count; ++iteration) { // 重复提交实例化好的图。
+        CUDA_CHECK(cudaGraphLaunch(graph_exec, launch_stream)); // 把整张图排入 launch_stream 的外部顺序中。
+    } // 结束重复发射循环。
+    CUDA_CHECK(cudaStreamSynchronize(launch_stream)); // 等待最后一次 graph launch 完成，便于 CPU 读取结果或释放资源。
+    return graph_exec; // 返回 exec，调用方稍后用 cudaGraphExecDestroy 销毁。
+} // 结束 instantiateAndRunWithUploadStream。
 ```
 
 `cudaGraphLaunch()` 是异步提交。目标 stream 只负责让整张图与 stream 中的前后工作排序，并不把图内部所有节点串行化，也不表示所有节点都在这条 stream 上执行。
