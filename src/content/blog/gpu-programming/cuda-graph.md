@@ -949,21 +949,102 @@ cudaGraphExec_t instantiateAndRunWithUploadStream(cudaGraph_t graph, cudaStream_
 __host__ cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph, cudaGraphExecUpdateResultInfo* resultInfo); // 比较新图与原执行图，并在受支持时原位更新 exec。
 ```
 
+CUDA 13.3 的主 Runtime API 是上面的三参数形式，声明来自 `cuda_runtime_api.h`。如果包含 `cuda_runtime.h`，还能看到一个为了 C++ 源码兼容旧写法保留的 inline 包装：
+
+```cpp
+static __inline__ __host__ cudaError_t CUDARTAPI cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph, cudaGraphNode_t* hErrorNode_out, enum cudaGraphExecUpdateResult* updateResult_out) { // cuda_runtime.h 中用于兼容旧四参数写法的 C++ inline 包装。
+    cudaGraphExecUpdateResultInfo resultInfo; // 创建新版三参数接口需要的详细结果结构体。
+    cudaError_t status = cudaGraphExecUpdate(hGraphExec, hGraph, &resultInfo); // 调用真正的三参数 cudaGraphExecUpdate。
+    if (hErrorNode_out) { // 如果调用者请求旧式错误节点输出。
+        *hErrorNode_out = resultInfo.errorNode; // 把新版结构体里的 errorNode 映射回旧输出参数。
+    } // 结束错误节点输出分支。
+    if (updateResult_out) { // 如果调用者请求旧式更新结果输出。
+        *updateResult_out = resultInfo.result; // 把新版结构体里的 result 映射回旧输出参数。
+    } // 结束更新结果输出分支。
+    return status; // 返回三参数接口的 cudaError_t。
+} // 结束 cuda_runtime.h 兼容包装。
+```
+
+所以更准确的说法是：**13.3 的主接口是 `resultInfo` 三参数形式；`cuda_runtime.h` 里四参数形式只是 C++ convenience wrapper（源码兼容包装），不是新的底层语义**。学习和新代码建议直接使用 `cudaGraphExecUpdateResultInfo`，因为它多了 `errorFromNode`，能报告拓扑不匹配时的错误边上游节点。
+
+`cudaGraphExecUpdateResult` 的源码如下：
+
+```cpp
+enum __device_builtin__ cudaGraphExecUpdateResult { // 描述 cudaGraphExecUpdate 的详细更新结果。
+    cudaGraphExecUpdateSuccess = 0x0, // 更新成功，原 cudaGraphExec_t 已经吸收 updating graph 的可更新参数。
+    cudaGraphExecUpdateError = 0x1, // 因意外原因失败，具体原因通常要结合 API 返回的 cudaError_t。
+    cudaGraphExecUpdateErrorTopologyChanged = 0x2, // 图拓扑变化，节点数量、依赖数量、依赖顺序或 sink 排序等不匹配。
+    cudaGraphExecUpdateErrorNodeTypeChanged = 0x3, // 配对节点的节点类型变化，例如 kernel node 变成 memcpy node。
+    cudaGraphExecUpdateErrorFunctionChanged = 0x4, // kernel 函数变化导致失败；这是 CUDA driver 11.2 之前的旧结果类型。
+    cudaGraphExecUpdateErrorParametersChanged = 0x5, // 节点参数变化超出 whole graph update 支持范围。
+    cudaGraphExecUpdateErrorNotSupported = 0x6, // 某个节点类型、配置或操作不支持 whole graph update。
+    cudaGraphExecUpdateErrorUnsupportedFunctionChange = 0x7, // kernel 的 func 字段发生了不支持的函数变化。
+    cudaGraphExecUpdateErrorAttributesChanged = 0x8 // 节点属性变化超出 whole graph update 支持范围。
+}; // 结束 cudaGraphExecUpdateResult 定义。
+```
+
+对应的 `cudaGraphExecUpdateResultInfo` 源码如下：
+
+```cpp
+typedef __device_builtin__ struct cudaGraphExecUpdateResultInfo_st { // cudaGraphExecUpdate 返回详细错误位置和原因的结构体。
+    enum cudaGraphExecUpdateResult result; // 更具体的更新结果，例如拓扑变化、节点类型变化或参数变化。
+    cudaGraphNode_t errorNode; // 出错节点；拓扑边不匹配时表示错误边的下游节点，没有具体节点时为 nullptr。
+    cudaGraphNode_t errorFromNode; // 拓扑边不匹配时表示错误边的上游节点；非拓扑边错误时通常为 nullptr。
+} cudaGraphExecUpdateResultInfo; // 结束 cudaGraphExecUpdateResultInfo 定义。
+```
+
 **参数与结果**
 
 | 参数 / 成员 | 含义 |
 | --- | --- |
 | `hGraphExec` | 待更新的可执行图。 |
-| `hGraph` | 提供新节点参数的更新图；拓扑、依赖指定顺序和 sink 排序必须与原图匹配。 |
+| `hGraph` | updating graph（更新图），提供新节点参数；它必须和实例化 `hGraphExec` 时使用的 original graph（原图）拓扑等价。 |
 | `resultInfo->result` | 更精确的结果，例如成功、拓扑改变、节点类型改变、不支持的函数变化、参数变化或属性变化。 |
-| `resultInfo->errorFromNode` | 拓扑不匹配时，错误边的上游节点；其他错误通常为空。 |
-| `resultInfo->errorNode` | 错误边的下游节点或发生错误的具体节点。 |
+| `resultInfo->errorNode` | 发生错误的具体节点；拓扑边不匹配时表示错误边的下游节点；泛化错误时可能为空。 |
+| `resultInfo->errorFromNode` | 拓扑边不匹配时，表示错误边的上游节点；非拓扑边错误通常为空。 |
 
-为了让原图和更新图中的节点能被确定性配对，应保持：
+`errorFromNode` 和 `errorNode` 最适合按一条 **不匹配的依赖边** 来理解。假设 original graph 里 D 的第二个依赖来自 C，但 updating graph 里 D 的第二个依赖变成了 X。Runtime 按 edge order 配对依赖时发现这条边对不上：
+
+```mermaid
+flowchart LR
+    subgraph O["original graph：实例化 exec 时的图"]
+        OA["A"] --> OB["B"]
+        OA --> OC["C"]
+        OB --> OD["D"]
+        OC --> OD
+    end
+
+    subgraph U["updating graph：传给 cudaGraphExecUpdate 的图"]
+        UA["A'"] --> UB["B'"]
+        UA --> UX["X'"]
+        UB --> UD["D'"]
+        UX -. "这条依赖边与 original 的 C -> D 不匹配" .-> UD
+    end
+
+    UX -. "resultInfo->errorFromNode" .-> EF["errorFromNode = X'"]
+    UD -. "resultInfo->errorNode" .-> EN["errorNode = D'"]
+```
+
+这里 `errorFromNode` 是 **错误边的 from node（上游依赖节点）**，`errorNode` 是 **错误边的 to node（下游被依赖节点）**。换成人话就是：`D'` 这个节点的某条输入依赖错了，错的那条依赖来自 `X'`。如果只是节点数量不同、没有具体错误边，`errorFromNode` 通常就是 `nullptr`。
+
+`cudaGraphExecUpdate()` 的核心不是“两个图看起来差不多”，而是 Runtime 必须能把 original graph 和 updating graph 中的节点 **确定性一一配对**。除了拓扑相同，还要满足以下顺序规则：
 
 1. 每条 captured stream 上的相关 API 调用顺序一致，包括 event wait。
 2. 操作同一节点 incoming edge 的 API 顺序一致，依赖数组内部顺序也一致。
 3. sink node 的形成顺序一致；节点添加、边删除、依赖集合更新和 `cudaStreamEndCapture()` 都可能影响 sink 排序。
+
+更具体地说：
+
+- **capturing stream 的 API 顺序要一致**：如果 original graph 来自 stream capture，updating graph 重捕获时，作用在同一条 stream 上的 API 调用顺序必须一致；这包括 event wait，以及那些不直接创建节点、但会影响捕获依赖前沿的 API。
+- **incoming edge 的操作顺序要一致**：显式 `cudaGraphAddNode()`、`cudaGraphAddDependencies()` / `cudaGraphRemoveDependencies()`、captured stream API 等，只要会操作某个节点的入边，就要按同样顺序发生。传依赖数组时，数组内部顺序也必须匹配。
+- **sink node 排序要一致**：sink node 指最终图中没有 outgoing edge 的节点。会影响 sink 排序的操作包括：添加后仍是 sink 的节点、删除边后让某节点变成 sink、`cudaStreamUpdateCaptureDependencies()` 从捕获 stream 的依赖集合移除 sink node、以及 `cudaStreamEndCapture()`。
+
+当 `resultInfo->result == cudaGraphExecUpdateErrorTopologyChanged` 时，常见原因包括：
+
+- original graph 和 updating graph 的直接节点数量不同，此时 `errorNode` 通常为空。
+- exit / sink 侧节点集合无法按一致顺序配对，`errorNode` 可能指向 updating graph 中的某个 exit node。
+- updating graph 中某个节点的依赖数量和 paired original node 不同，`errorNode` 指向 updating graph 中的该节点。
+- 某条依赖边按顺序配对时不匹配，`errorNode` 指向错误边的下游节点，`errorFromNode` 指向不匹配的上游依赖节点。
 
 下面展示“更新失败则回退到重新实例化”的当前接口写法：
 
@@ -1000,7 +1081,7 @@ __host__ cudaError_t cudaGraphExecHostNodeSetParams(cudaGraphExec_t hGraphExec, 
 __host__ cudaError_t cudaGraphExecNodeSetParams(cudaGraphExec_t graphExec, cudaGraphNode_t node, cudaGraphNodeParams* nodeParams); // 通过 tagged union 更新受支持的 exec 节点。
 ```
 
-`cudaGraphNodeSetParams()` 直接修改图模板，之后需要实例化或 whole update 才会反映到 exec。各个 `cudaGraphExec*SetParams()` 的 `node` 则是原始 `cudaGraph_t` 中用于实例化 `hGraphExec` 的节点句柄；它们只改 executable，不会反向修改原图模板，也不会影响已经提交的发射。
+`cudaGraphNodeSetParams()` 直接修改图模板，之后需要实例化或 whole update 才会反映到 exec。各个 `cudaGraphExec*SetParams()` 的 `node` 则是原始 `cudaGraph_t` 中用于实例化 `hGraphExec` 的节点句柄（也就是你原来用哪个cudaGraphNode_t构建的cudaGraph_t，这里传的参数也就是原来的`node`）；它们只改 executable，不会反向修改原图模板，也不会影响已经提交的发射。
 
 ```cpp
 void updateScaleKernel(cudaGraphExec_t graph_exec, cudaGraphNode_t kernel_node, float* data, std::size_t count, float scale) { // 更新一个已知 scale kernel 节点的地址、长度和缩放因子。
@@ -1027,9 +1108,10 @@ __host__ cudaError_t cudaGraphNodeGetEnabled(cudaGraphExec_t hGraphExec, cudaGra
 
 ### 更新限制
 
-- **kernel 节点**：函数所属 context 不能改变；原本不使用 CUDA Dynamic Parallelism 的函数不能改成使用它的函数；cooperative 与 non-cooperative 发射状态不能任意互换。
-- **memcpy / memset 节点**：操作数所属 device 和 allocation context 不能改变；memcpy 的源/目标内存类型与 `cudaMemcpyKind` 不能改变。具体可变维度以当前 Runtime API 的对应 set-params 接口为准。
-- **conditional 节点**：handle 创建与绑定顺序必须匹配，条件节点自身的 body 数量、context 等参数不能通过 whole update 改变；body 内节点递归遵循普通更新限制。
+- **kernel 节点**：函数所属 context 不能改变；原本不使用 CUDA Dynamic Parallelism 的函数不能改成使用它的函数；原本不做 device-side update call 的函数不能改成会做这类调用的函数；cooperative 与 non-cooperative 发射状态不能互换；如果实例化时使用了 `cudaGraphInstantiateFlagUseNodePriority`，节点 priority 属性不能改变；含 device-updatable kernel node 的图不能走 whole graph update。
+- **device-side launch 相关 kernel**：如果 `hGraphExec` 不是以 device launch 方式实例化，原本不调用 device-side `cudaGraphLaunch()` 的节点，不能随意更新成会调用它的函数；除非它和实例化时已有 device-side launch 调用的节点在同一 device 上。如果实例化时没有任何这类调用，则不能通过 update 引入。
+- **memcpy / memset 节点**：操作数所属 device 和 allocation / mapping context 不能改变；源/目标 memory type 不能改变，例如不能从 device memory 改成 CUDA array；2D memset 通常只能改地址和值；1D memset 允许改维度，但新维度如果无法映射到原先为节点分配的执行资源，也可能失败。
+- **conditional 节点**：conditional node 自身参数不支持修改；body graph 内部节点参数递归遵循普通更新限制；conditional handle 的 flags 和默认值会作为 graph update 的一部分更新。
 - **external semaphore 节点**：不能改变 semaphore 操作的数量。
 - **memory alloc / free 节点**：通用 individual node update 不支持；含 memory node 的 whole update 还受到图实例化关系限制。
 
@@ -1887,7 +1969,7 @@ CUDA Programming Guide 更强调概念和工作流，其中少量示例未与最
 | `cudaStreamBeginCapture(stream)` | `cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal)` | 当前接口需要显式 capture mode。 |
 | 五参数 `cudaGraphAddNode(..., deps, count, params)` | 六参数 `cudaGraphAddNode(..., deps, dependencyData, count, params)` | CUDA 12.3 引入 edge data。 |
 | 五参数 `cudaGraphInstantiate(&exec, graph, errorNode, log, size)` | `cudaGraphInstantiate(&exec, graph, flags)` | 详细结果改由 `cudaGraphInstantiateWithParams()` 提供。 |
-| 四参数 `cudaGraphExecUpdate(exec, graph, errorNode, result)` | `cudaGraphExecUpdate(exec, graph, &resultInfo)` | 两个错误节点与详细结果合并到结构体。 |
+| 四参数 `cudaGraphExecUpdate(exec, graph, errorNode, result)` | 新代码优先用 `cudaGraphExecUpdate(exec, graph, &resultInfo)` | `cuda_runtime.h` 仍提供四参数 C++ inline 兼容包装，但主 Runtime API 使用 `cudaGraphExecUpdateResultInfo`，并额外提供 `errorFromNode`。 |
 | `cudaStreamRecordEvent(...)` | `cudaEventRecord(event, stream)` | 前者不是 Runtime API。 |
 | 四参数 `cudaMallocAsync(..., pool, stream)` | `cudaMallocFromPoolAsync(..., pool, stream)` | 指定 pool 的接口名称不同。 |
 | 通用 free node 直接传结构体 | 传 `&free_params` 给 `cudaGraphAddNode()` | `nodeParams` 参数是可写指针。 |
