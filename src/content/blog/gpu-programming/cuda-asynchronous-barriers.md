@@ -450,6 +450,14 @@ __global__ void split_arrive_wait_kernel(int iteration_count, float* data)
 
 这时 `phase/parity` 就是为了回答一个问题：**我现在等的是这个 slot 的哪一代数据？**
 
+先把本章的几个结论放在前面：
+
+- **`mbarrier.init` 后 active phase 从 0 开始**，所以第一代可读数据通常对应 `full.wait(0)`。
+- **`wait(p)` 等的是 phase `p` 这一代完成**，不是等 barrier 变成 `p`。
+- **`arrive()` 不带 phase**，它永远作用在 barrier 当前内部 active phase。
+- **slot 解决物理位置，phase/parity 解决复用代数**。4 个 slot 的流水线里，slot 每轮前进，只有绕回同一个 slot 时 parity 才翻转。
+- **读写流水线通常用两组 barrier**：`full[slot]` 表示“这一代数据写好了”，`empty[slot]` 表示“这一代数据消费完了”。
+
 ### phase 是代数，parity 是最低位
 
 可以把每个 mbarrier 想成有一个内部 generation counter：
