@@ -3897,80 +3897,308 @@ cluster_sync();
 
 ### `PipelineState`
 
-`PipelineState` 不是 barrier 本身，也不保存 TMA 是否完成。它只是 producer / consumer 手里的一个很小的**环形游标**：告诉调用方“这次该用第几个 stage，以及该等这块 stage 的第 0 代还是第 1 代”。
+`PipelineState` 不是 barrier，也不保存“TMA 是否已经完成”。它只是 producer 或 consumer 私自持有的一个**环形游标**：每次操作前，用它选中一个 stage，并带上这块 stage 当前该等待的 mbarrier parity。
 
-源码实现比名字更直白：
+它不负责同步；真正的同步仍由 `full_barrier_[index]` 或 `empty_barrier_[index]` 完成。因此可以把一次 pipeline 操作拆开看：
+
+```text
+PipelineState = 选哪一个 stage、wait 时传哪个 parity
+mbarrier      = 这一个 stage 此刻是否真的 full / empty
+```
+
+源码位于 `cutlass/pipeline/sm90_pipeline.hpp`。以下保留原来的控制流，并补上每个成员与接口的中文注释：
 
 ```cpp
 /**
- * @brief 环形 pipeline stage 状态。
+ * @brief 记录循环缓冲区当前位置，以及该位置对应的 mbarrier parity。
  *
- * @tparam Stages_ pipeline stage 数。
+ * @tparam Stages_ 循环缓冲区中 stage 的数量；例如 3 表示 stage 0、1、2。
  *
  * @details
- * `index_` 表示当前 stage 下标。
- * `phase_` 是 mbarrier parity phase，每绕环一圈翻转一次。
- * `count_` 是累计前进次数。
+ * 本类型只是一份由调用者推进的轻量状态，不包含任何 shared-memory barrier，
+ * 也不具备多线程共同修改时的同步语义。producer 与 consumer 分别保存自己的
+ * `PipelineState`，并在完成各自对当前 stage 的协议后显式执行 `++state`。
  */
 template <uint32_t Stages_>
 struct PipelineState {
-    int index_ = 0;
-    uint32_t phase_ = 0;
-    uint32_t count_ = 0;
+  /** @brief 编译期 stage 数，供 `PipelineTmaAsync<Stages>` 等类型读取。 */
+  static constexpr uint32_t Stages = Stages_;
 
-    int index() const;
-    uint32_t phase() const;
-    uint32_t count() const;
+  /**
+   * @brief 当前要访问的 stage 下标，正常范围为 `[0, Stages)`。
+   *
+   * `index_` 只负责选择 `full_barrier_[index_]`、`empty_barrier_[index_]`
+   * 或相应的 shared-memory tile；它本身不表示 barrier 已经完成。
+   */
+  int index_ = 0;
 
-    /**
-     * @brief 前进到下一个 stage；如果绕回 0，则翻转 phase。
-     */
-    void operator++() {
-        ++index_;
-        ++count_;
-        if (index_ == Stages) {
-            index_ = 0;
-            phase_ ^= 1;
-        }
+  /**
+   * @brief 当前 stage 的 wait parity，值只会在 0 和 1 之间切换。
+   *
+   * 这个值会传给 `mbarrier.try_wait.parity`。它表示“等待当前观察到的
+   * parity 翻转”，而不是数组下标，也不是独立的全局循环编号。
+   */
+  uint32_t phase_ = 0;
+
+  /**
+   * @brief 从该 state 建立以来累计前进的 stage 数。
+   *
+   * `count_` 主要供需要按迭代次数定位 pipeline 的代码使用；普通的
+   * `PipelineTmaAsync` acquire / wait 只读取 `index_` 和 `phase_`。
+   */
+  uint32_t count_ = 0;
+
+  /**
+   * @brief 构造默认游标 `(index=0, phase=0, count=0)`。
+   *
+   * 这是 consumer 常用的初始状态；producer 的标准初始状态见
+   * `make_producer_start_state()`，它故意使用不同的 phase。
+   */
+  CUTLASS_DEVICE
+  PipelineState() : index_{}, phase_{}, count_{} {}
+
+  /**
+   * @brief 用调用者给定的三个分量构造游标。
+   *
+   * @param index 当前 stage 下标。
+   * @param phase 当前 stage 的 wait parity。
+   * @param count 已前进的累计次数。
+   *
+   * @warning 构造函数不检查 `index < Stages`，也不验证三者是否满足默认
+   *          状态的递推关系；这种显式构造只应由理解 barrier 协议的代码使用。
+   */
+  CUTLASS_DEVICE
+  PipelineState(int index, uint32_t phase, uint32_t count)
+      : index_(index), phase_(phase), count_(count) {}
+
+  /** @brief 返回当前要访问的 stage 下标。 */
+  CUTLASS_DEVICE
+  int index() const { return index_; }
+
+  /** @brief 返回当前操作需要传给 parity wait 的 0/1 值。 */
+  CUTLASS_DEVICE
+  uint32_t phase() const { return phase_; }
+
+  /** @brief 返回累计前进次数，不代表当前 mbarrier 的硬件状态。 */
+  CUTLASS_DEVICE
+  uint32_t count() const { return count_; }
+
+  /**
+   * @brief 前进一个 stage；仅在跨越环形数组尾部时翻转 parity。
+   *
+   * 例如 `Stages == 3` 时：`(2, 0)` 递增后变成 `(0, 1)`。
+   * `phase_ ^= 1` 不是因为 stage 0 有特殊含义，而是同一块 stage 0 的
+   * mbarrier 即将被第二次复用，wait 必须等待另一代。
+   */
+  CUTLASS_DEVICE
+  void operator++() {
+    if constexpr (Stages > 0) {
+      ++index_;
+      ++count_;
+      if (index_ == Stages) {
+        index_ = 0;
+        phase_ ^= 1;
+      }
     }
+  }
+
+  /**
+   * @brief 原地前进多个 stage，是 `advance()` 的语法糖。
+   *
+   * @param num_iterations 要跳过的 stage 数。
+   * @return 当前 state 的引用，便于连续调用。
+   */
+  CUTLASS_DEVICE
+  PipelineState& operator+=(uint32_t num_iterations) {
+    return advance(num_iterations);
+  }
+
+  /**
+   * @brief 逐字段复制另一个 pipeline state。
+   *
+   * @param other 被复制的状态快照。
+   * @return 当前 state 的引用。
+   */
+  CUTLASS_DEVICE
+  PipelineState& operator=(PipelineState const& other) {
+    index_ = other.index();
+    phase_ = other.phase();
+    count_ = other.count();
+    return *this;
+  }
+
+  /**
+   * @brief 原地跳过多个 stage，并只根据跨越环边界的次数更新 parity。
+   *
+   * @param num_iterations 要前进的 stage 数。
+   * @return 当前 state 的引用。
+   *
+   * @details
+   * 当跳过次数小于 `Stages` 时，最多跨越一次边界，源码以
+   * `index_ + num_iterations >= Stages` 判断是否翻转。跳过次数不少于
+   * `Stages` 时，跨越边界次数为 `(index_ + num_iterations) / Stages`；
+   * 只有这个数为奇数时才翻转，因为跨越偶数次会翻转两次后回到原 parity。
+   */
+  CUTLASS_DEVICE
+  PipelineState& advance(uint32_t num_iterations) {
+    if constexpr (Stages > 0) {
+      if ((num_iterations < Stages) &&
+          (index_ + num_iterations) >= Stages) {
+        phase_ ^= 1;
+      }
+      if ((num_iterations >= Stages) &&
+          (((index_ + num_iterations) / Stages) % 2) == 1) {
+        phase_ ^= 1;
+      }
+      index_ = (index_ + num_iterations) % Stages;
+      count_ += num_iterations;
+    }
+    return *this;
+  }
+
+  /**
+   * @brief 从起始 state 推导前进多个 stage 后的新 state。
+   *
+   * @param start_state 输入状态；按值传递，因此调用后它本身不变。
+   * @param num_iterations 要前进的 stage 数。
+   * @return `start_state` 前进后的新状态。
+   */
+  CUTLASS_DEVICE
+  static PipelineState make_pipeline_state(PipelineState start_state,
+                                           uint32_t num_iterations) {
+    return start_state.advance(num_iterations);
+  }
 };
 ```
 
-对默认初始状态 `(index=0, phase=0, count=0)`，它等价于：
+#### 三个成员分别解决什么问题
+
+| 成员 | 它回答的问题 | 不能回答的问题 |
+| --- | --- | --- |
+| `index_` | “本轮访问 `smem` / barrier 数组的哪一个槽位？” | 这个槽位的数据是否已写好或已读完。 |
+| `phase_` | “对同一槽位执行 parity wait 时，应该等旧的 0 还是旧的 1 翻转？” | 这是 producer 还是 consumer，也不表示 stage 下标。 |
+| `count_` | “这个游标从起点一共前进了几步？” | mbarrier 的 arrival count 或 transaction bytes。 |
+
+`Stages == 0` 时，上面的 `if constexpr (Stages > 0)` 会让 `++` 与 `advance()` 成为无操作。这是 CUTLASS 为“没有 pipeline stage”的模板特化保留的合法状态。此时不能使用下面含 `/ Stages` 的公式，也不应拿它访问 stage 数组。
+
+对**默认构造**的 `(index=0, phase=0, count=0)`，并且只用 `++` / `advance()` 推进时，状态满足：
 
 $$
 \text{index} = \text{count} \bmod \text{Stages}, \qquad
 \text{phase} = \left\lfloor \frac{\text{count}}{\text{Stages}} \right\rfloor \bmod 2
 $$
 
-以 `K_PIPE_MAX = 3` 为例：
+这个式子不适用于人为指定非默认起点的情况；特别是下面的 `make_producer_start_state()` 故意构造了 `(0, 1, 0)`，它正是为了表达 producer 的初始化协议。
 
-| `count` | `index()` | `phase()` | 表示 |
+以 `K_PIPE_MAX = 3` 为例，默认 state 的演化如下：
+
+| `count` | `index()` | `phase()` | 本轮访问的含义 |
 | ---: | ---: | ---: | --- |
-| 0 | 0 | 0 | pipe 0 的第 0 代。 |
-| 1 | 1 | 0 | pipe 1 的第 0 代。 |
-| 2 | 2 | 0 | pipe 2 的第 0 代。 |
-| 3 | 0 | 1 | 又回到 pipe 0，但已是第 1 代，绝不能再用 phase 0 等它。 |
-| 4 | 1 | 1 | pipe 1 的第 1 代。 |
-| 6 | 0 | 0 | pipe 0 的第 2 代；parity 再回到 0。 |
+| 0 | 0 | 0 | 首次访问 pipe 0，等待其初始 parity 0 翻转。 |
+| 1 | 1 | 0 | 首次访问 pipe 1，等待其初始 parity 0 翻转。 |
+| 2 | 2 | 0 | 首次访问 pipe 2，等待其初始 parity 0 翻转。 |
+| 3 | 0 | 1 | 再次访问 pipe 0，必须等待 parity 1 翻转，不能再沿用 0。 |
+| 4 | 1 | 1 | 再次访问 pipe 1。 |
+| 6 | 0 | 0 | 第三次访问 pipe 0；parity 又回到 0。 |
 
-教程中有两个 state：
+`advance()` 的存在不是为了另造一套状态规则，而是为了快速跳过多个 stage。例如从 `(index=2, phase=0, count=2)` 执行 `advance(5)`，跨越环尾两次：`2 -> 0 -> 0`，翻转两次后 parity 仍为 0，结果是 `(index=1, phase=0, count=7)`。
+
+#### 它怎样接到 `PipelineTmaAsync` 的四个接口
+
+`PipelineTmaAsync` 的接口都把 `PipelineState` **按值**接收。这意味着 pipeline 对象只读取这份状态快照；真正的 `++state` 由调用者在本轮协议结束后执行，库不会悄悄替你推进游标。
+
+| 调用 | 读取 state 的哪些分量 | 实际访问的 barrier | 这一步的含义 |
+| --- | --- | --- | --- |
+| `producer_acquire(state)` | `index()`、`phase()` | `empty_barrier_[index]` | 等待 consumer 释放该槽位；随后 elected producer 对 `full_barrier_[index]` 执行 `arrive_and_expect_tx`，准备登记本次 TMA。 |
+| `producer_get_barrier(state)` | `index()` | `full_barrier_[index]` | 取出要绑给 `.with(mbarrier)` 的 full / transaction barrier。 |
+| `consumer_wait(state)` | `index()`、`phase()` | `full_barrier_[index]` | 等待 TMA 写入及其 transaction bytes 都完成。 |
+| `consumer_release(state)` | `index()` | `empty_barrier_[index]` | consumer 在 WGMMA 已不再读取该 stage 后 arrive，通知 producer 以后可重用它。 |
+
+因此，状态本身不带“读”或“写”的身份；身份来自**它被传给哪个接口**。同一份 `(index=0, phase=0)` 传给 `consumer_wait` 时是“等 pipe 0 变 full”，传给 `producer_acquire` 时则是“等 pipe 0 变 empty”。
+
+教程中的手写版本也有两个 state：
 
 ```cpp
-auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // TMA writes
-auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // MMA reads
+auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // TMA 重用 / 写入视角
+auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // WGMMA 读取视角
 ```
 
-- `read_state` 是 consumer 视角：选择要读取的 `read_pipe`，并把 `read_state.phase()` 传给 **producer/full barrier**。它问的是：“这块 pipe 的这一代 TMA 写完了吗？”
-- `write_state` 是 producer 视角：选择要覆盖写入的 `pipe`，并把 `write_state.phase()` 传给 **consumer/empty barrier**。它问的是：“这块 pipe 的上一代 WGMMA 已经读完、可以重用了吗？”
-- 两个 state 都是 `(index, phase)`，但它们等待的是**不同的 barrier 数组**：`read_state` 等 `producer_mbar[]`，`write_state` 等 `consumer_mbar[]`。不能把它们理解成同一份计数器的别名。
+- `read_state` 选择要读取的 `read_pipe`，并传给 `ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase())`。它的问题是：“该 pipe 的 TMA full barrier 是否已从本轮 parity 翻转？”
+- `write_state` 选择将要覆盖写入的 pipe，并传给 `ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase())`。它的问题是：“该 pipe 的上一轮 WGMMA 是否已经 release，使 empty barrier 翻转？”
+- 两个 state 虽然数值上常常同步前进，却等待**不同的 barrier 数组**。它们不是同一个计数器的两个名字；将来 producer、consumer 的进度不同时，二者也可以不同。
 
-#### 为什么这个教程的两个 state 都从 `(0, 0)` 开始
+#### `make_producer_start_state()`：为何 producer 从 `(0, 1, 0)` 开始
 
-教程没有用 CUTLASS 通用 pipeline 的 `producer_acquire()` 做初始填充，而是先手写一个 prologue：
+源码中的 helper 只有三行，但它解决了完整 CUTLASS pipeline 的第一次 `producer_acquire()`：
 
 ```cpp
-// 先异步提交 pipe 0、1、2 的 TMA，不等待它们完成。
+/**
+ * @brief 构造标准 TMA producer 的起始游标。
+ *
+ * @tparam Pipeline 提供编译期 `Pipeline::Stages` 的 pipeline 类型。
+ * @return `{index=0, phase=1, count=0}`。
+ *
+ * @details
+ * `empty_barrier[stage]` 初始化后，stage 在逻辑上已经可写；但还没有任何
+ * consumer 对它执行 release arrive。将 producer 的首次 wait parity 设为 1，
+ * 即与 mbarrier 初始化的 parity 0 相反，可把“初始化为空”视为已经满足的
+ * 一次 empty 条件，第一次 acquire 因而不会等待一个不存在的 consumer release。
+ */
+template <class Pipeline>
+CUTLASS_DEVICE
+PipelineState<Pipeline::Stages> make_producer_start_state() {
+  constexpr int InitialProducerStage = 0;
+  constexpr uint32_t InitialProducerPhase = 1;
+  constexpr uint32_t InitialProducerCount = 0;
+  return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
+}
+```
+
+要注意 mbarrier parity wait 的方向：传入的值表示“我目前观察到的旧 parity”；当 barrier 翻转为另一值时，wait 才通过。初始化后 barrier 的 parity 为 0：
+
+```text
+full_barrier[0]：初始为 0，尚无 TMA 完成
+  consumer 以 phase=0 wait：必须等 TMA 让它从 0 翻到 1
+
+empty_barrier[0]：初始为 0，但逻辑上本来就空闲
+  producer 以 phase=1 wait：当前已经是“不同于 1”的 0，立即通过
+```
+
+所以 `{0, 1, 0}` 的意思不是“producer 已经做完了第 1 轮”，更不是 `count=0` 却错误地配了 `phase=1`。它是为**empty barrier 的第一次虚拟 release**建立的初值约定。之后 producer 每走完全部 `Stages` 个槽位，`++state` 才把它从 phase 1 翻到 0；这时再回到 stage 0，就会正确等待 consumer 对初始 parity 0 的真实 release。
+
+完整 `PipelineTmaAsync` 的常见使用思想如下：
+
+```cpp
+using MainloopPipeline = cutlass::PipelineTmaAsync<K_PIPE_MAX>;
+
+// producer：首次 acquire 不应等待，因为所有 stage 初始化后都为空。
+auto producer_state = cutlass::make_producer_start_state<MainloopPipeline>();
+
+// consumer：首次要等 TMA 真的把 full_barrier 从初始 parity 0 翻转。
+auto consumer_state = cutlass::PipelineState<K_PIPE_MAX>{};
+
+for (...) {
+  pipeline.producer_acquire(producer_state);
+  auto* full_barrier = pipeline.producer_get_barrier(producer_state);
+  copy(tma_atom.with(*full_barrier), gmem_tile, smem_tile);
+  ++producer_state;
+
+  pipeline.consumer_wait(consumer_state);
+  run_wgmma_on(smem_tile);
+  pipeline.consumer_release(consumer_state);
+  ++consumer_state;
+}
+```
+
+这里 `producer_acquire()` 已由 elected producer 对 full transaction barrier 做了 `arrive_and_expect_tx`；TMA 指令完成后才会扣完 transaction bytes。真实 TMA 路径中的 `producer_commit()` 是空操作，源码只在单元测试没有 TMA 硬件时用它模拟 transaction completion。
+
+#### 为什么本教程的两个 state 都从 `(0, 0)` 开始
+
+本教程没有通过 `PipelineTmaAsync::producer_acquire()` 做初始填充，而是在 prologue 中直接操作 barrier 并提交所有初始 TMA：
+
+```cpp
+// 直接把 pipe 0、1、2 的第 0 代 full barrier 置为“等待 TMA 字节完成”。
+// 这里没有先等 empty barrier，因为所有 stage 在初始化后已知为空。
 for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
   ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
                                         tma_transaction_bytes);
@@ -3979,17 +4207,17 @@ for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
   ++k_tile;
 }
 
-// prologue 完成后才创建游标；下一次重用的是 pipe 0 的第 0 代。
+// 后续第一个 consumer wait 和第一个“重用前的 empty wait”都针对初始 parity 0。
 auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
 auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
 ```
 
 此时：
 
-- `read_state = (0, 0)` 正确，因为消费者下一步要等 `producer_mbar[0]` 的第 0 代 TMA 完成，然后消费 `K0`。
-- `write_state = (0, 0)` 也正确，因为 producer 下一次不是继续填 pipe 1，而是要在 `K0` 被消费后**重用** pipe 0；它要等的是 `consumer_mbar[0]` 的第 0 代完成。
+- `read_state = (0, 0)` 正确：消费者下一步等待 `producer_mbar[0]` 从初始 parity 0 翻转，随后消费 `K0`。
+- `write_state = (0, 0)` 也正确：producer 的下一次操作不是首次填充，而是**重用** pipe 0；它必须等待 consumer 对 `consumer_mbar[0]` 的真实 release，使初始 parity 0 翻转。
 
-这和完整 CUTLASS pipeline 常见的 `make_producer_start_state()` 不同。后者会把 producer 初值设成 `(0, 1)`，以表达“empty barrier 刚初始化、还没有 consumer 的第 0 代 release，因此 producer 的第一次 acquire 不应等一个不存在的旧 release”。那个初值服务 `producer_acquire()` 协议；不要把它机械搬到这个手写 prologue 的教程中。
+因此不要把 `make_producer_start_state()` 机械搬到此处：它服务的是“第一次填充前调用 `producer_acquire()`”的通用 CUTLASS 协议；本教程已经手写并跳过了那次首次 acquire，后续第一次 wait 必须等待真实的 phase 0 release。
 
 ### 主循环的时序
 

@@ -7328,3 +7328,468 @@ dp[sum] = \max(dp[sum],\ dp[sum - num] + 1)
 $$
 
 因为每个数组元素只能在子序列中出现一次，所以它仍然是 0-1 背包，一维优化时仍然必须**逆序遍历容量**。理解了这一点，2915 就是“刚好装满背包时求最大物品数量”。
+
+## [3877. 达到目标异或值的最少删除次数 - 力扣（LeetCode）](https://leetcode.cn/problems/minimum-removals-to-achieve-target-xor/description/)
+
+给你一个整数数组 `nums` 和一个整数 `target`。
+
+你可以从 `nums` 中移除任意数量的元素（可能为零）。返回使剩余元素的按位异或和等于 `target` 所需的最小移除次数。如果无法达到 `target`，返回 `-1`。
+
+空数组的按位异或和为 0。
+
+示例 1：
+
+```text
+输入：nums = [1,2,3], target = 2
+输出：1
+解释：移除 nums[1] = 2 后，剩余 [1, 3]，异或和为 2。
+```
+
+示例 2：
+
+```text
+输入：nums = [2,4], target = 1
+输出：-1
+解释：无法通过移除元素来达到 target。
+```
+
+示例 3：
+
+```text
+输入：nums = [7], target = 7
+输出：0
+解释：所有元素的异或和已经是 7，无需移除。
+```
+
+提示：
+
+- `1 <= nums.length <= 40`
+- `0 <= nums[i] <= 10^4`
+- `0 <= target <= 10^4`
+
+这题和 2915 的味道非常接近：2915 是“保留一些数，让它们的**和**等于 `target`，并让保留数量尽量多”；3877 是“保留一些数，让它们的**异或和**等于 `target`，并让保留数量尽量多”。
+
+因为题目要求的是**最少删除次数**，而不是直接问最多保留多少个数，所以先做一次转换：
+
+$$
+最少删除次数 = n - 最多保留元素数量
+$$
+
+于是问题变成：
+
+> 从 `nums` 中选出尽量多的元素，使这些元素的异或和等于 `target`。
+
+### 题目如何转成 0-1 背包？
+
+这题不是普通的“容量求和”背包，而是**异或背包**。
+
+每个元素仍然只有两个选择：
+
+- **保留当前元素**：它会参与剩余数组的异或和。
+- **删除当前元素**：它不会参与异或和。
+
+如果从“保留哪些元素”的角度看，它就是 0-1 背包：
+
+- **物品**：数组里的每个数 `nums[i]`。
+- **状态容量**：不是普通加法容量，而是当前异或值 `xor_value`。
+- **价值**：保留一个元素贡献长度 1。
+- **0-1 约束**：每个元素只能决策一次，要么保留，要么删除。
+- **目标**：在异或和等于 `target` 的前提下，保留元素数量最大。
+
+和 2915 对比：
+
+- 2915：选中 `num` 后，状态从 `sum - num` 转到 `sum`。
+- 3877：选中 `num` 后，状态从 `xor_value ^ num` 转到 `xor_value`。
+
+这里的关键变化是：加法背包用 `sum - num` 找来源，异或背包用 `xor_value ^ num` 找来源。
+
+为什么是 `xor_value ^ num`？
+
+因为异或满足：
+
+$$
+a \oplus num = xor\_value
+$$
+
+两边再异或一次 `num`：
+
+$$
+a = xor\_value \oplus num
+$$
+
+所以如果处理当前数字 `num` 之后想得到 `xor_value`，那么处理它之前需要已经得到 `xor_value ^ num`。
+
+### 递归切入（探索逻辑）
+
+先从递归想：站在 `nums[index]` 面前，仍然只有两个选择，删除或保留。
+
+定义 `dfs(index, current_xor)` 表示：已经处理到下标 `index`，当前保留元素的异或和为 `current_xor`，后面继续决策，最终能让异或和等于 `target` 的最大保留数量。
+
+递归边界：
+
+- 如果 `index == nums.size()`，说明所有元素都决策完了。
+- 如果 `current_xor == target`，说明当前保留集合合法，返回 0。
+- 否则返回无效值 `kInvalid`。
+
+站在当前元素 `nums[index]` 面前：
+
+- **删除当前元素**：异或和不变，答案来自 `dfs(index + 1, current_xor)`。
+- **保留当前元素**：异或和变成 `current_xor ^ nums[index]`，答案来自 `dfs(index + 1, current_xor ^ nums[index]) + 1`。
+
+递归表达式：
+
+$$
+dfs(index, current\_xor) =
+\max(
+dfs(index + 1, current\_xor),\
+dfs(index + 1, current\_xor \oplus nums[index]) + 1
+)
+$$
+
+最后如果最大保留数量无效，就返回 `-1`；否则返回 `n - 最大保留数量`。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求达到目标异或值的最少删除次数。
+     *
+     * @param nums 输入数组。
+     * @param target 目标异或值。
+     * @return 最少删除次数；如果无法达到 target，返回 -1。
+     */
+    int minRemovals(vector<int>& nums, int target) {
+        const vector<int>& lenqavitor = nums;
+        const int n = static_cast<int>(lenqavitor.size());
+        const int xor_limit = getXorLimit(lenqavitor, target);
+
+        vector<vector<int>> memo(n, vector<int>(xor_limit, kUnknown));
+        const int keep_count = dfs(lenqavitor, memo, 0, 0, target);
+        return keep_count < 0 ? -1 : n - keep_count;
+    }
+
+private:
+    static constexpr int kInvalid = -1000000000;
+    static constexpr int kUnknown = -1000000001;
+
+    int getXorLimit(const vector<int>& nums, int target) {
+        int max_value = target;
+        for (const int num : nums) {
+            max_value = max(max_value, num);
+        }
+
+        int xor_limit = 1;
+        while (xor_limit <= max_value) {
+            xor_limit <<= 1;
+        }
+        return xor_limit;
+    }
+
+    int dfs(
+        const vector<int>& nums,
+        vector<vector<int>>& memo,
+        int index,
+        int current_xor,
+        int target) {
+        if (index == static_cast<int>(nums.size())) {
+            return current_xor == target ? 0 : kInvalid;
+        }
+
+        int& cached = memo[index][current_xor];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        // 删除当前元素：当前异或值不变。
+        cached = dfs(nums, memo, index + 1, current_xor, target);
+
+        // 保留当前元素：当前异或值与 nums[index] 做异或，保留数量加 1。
+        const int next_xor = current_xor ^ nums[index];
+        const int next_keep_count = dfs(nums, memo, index + 1, next_xor, target);
+        if (next_keep_count != kInvalid) {
+            cached = max(cached, next_keep_count + 1);
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归还不是最优写法，但它能帮我们抓住核心：这题求的是“异或为 `target` 时的最大保留数量”。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][xor_value]` 表示只考虑前 `i` 个元素时，异或和为 `xor_value` 的最大保留元素数量。
+
+如果无法得到这个异或值，就让 `dp[i][xor_value] = kInvalid`。
+
+最终要看：
+
+$$
+dp[n][target]
+$$
+
+如果 `dp[n][target] < 0`，说明无法达到目标异或值，返回 `-1`；否则返回：
+
+$$
+n - dp[n][target]
+$$
+
+### 状态范围
+
+`nums[i] <= 10^4`，`target <= 10^4`，它们都小于 `2^14 = 16384`。
+
+异或不会产生比参与数字更高的二进制位，所以所有可能的异或值都落在：
+
+$$
+[0,\ 2^{14})
+$$
+
+代码里可以直接用 `16384` 作为状态范围，也可以根据 `max(nums, target)` 动态算出一个最小的 `xor_limit`：
+
+```cpp
+int xor_limit = 1;
+while (xor_limit <= max_value) {
+    xor_limit <<= 1;
+}
+```
+
+这样 `xor_value` 的枚举范围就是 `[0, xor_limit)`。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实元素 `nums[item]`。
+
+`dp[item]` 表示还没处理 `nums[item]` 之前的状态，`dp[item + 1]` 表示处理完 `nums[item]` 之后的状态。
+
+- **删除当前元素**：异或值不变，保留数量也不变。
+
+$$
+dp[item + 1][xor\_value] \leftarrow dp[item][xor\_value]
+$$
+
+- **保留当前元素**：如果上一行能得到 `xor_value ^ nums[item]`，那么保留当前元素后，就能得到 `xor_value`，并且保留数量加 1。
+
+$$
+dp[item + 1][xor\_value] \leftarrow dp[item][xor\_value \oplus nums[item]] + 1
+$$
+
+合起来就是：
+
+$$
+dp[item + 1][xor\_value] =
+\max(
+dp[item][xor\_value],\
+dp[item][xor\_value \oplus nums[item]] + 1
+)
+$$
+
+这里和加法背包最不一样的地方是来源状态：
+
+- 加法背包选当前元素时，来源是 `sum - num`。
+- 异或背包选当前元素时，来源是 `xor_value ^ num`。
+
+### 初始化
+
+- `dp[0][0] = 0`：不保留任何元素时，空数组的异或和为 0，保留数量为 0。
+- `dp[0][xor_value] = kInvalid`，其中 `xor_value != 0`：不保留任何元素，不可能得到非 0 异或值。
+
+这个初始化正好对应题面里的“空数组的按位异或和为 0”。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `n - 1`，逐个处理真实元素 `nums[item]`。
+- 内层从 `xor_value = 0` 到 `xor_limit - 1`，枚举当前要得到的异或值。
+
+因为 `dp[item + 1][xor_value]` 只依赖上一行 `dp[item][...]`，所以二维写法里异或值正序或逆序都可以。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维异或 0-1 背包求达到目标异或值的最少删除次数。
+     *
+     * @param nums 输入数组。
+     * @param target 目标异或值。
+     * @return 最少删除次数；如果无法达到 target，返回 -1。
+     */
+    int minRemovals(vector<int>& nums, int target) {
+        constexpr int kInvalid = -1000000000;
+        const vector<int>& lenqavitor = nums;
+        const int n = static_cast<int>(lenqavitor.size());
+        const int xor_limit = getXorLimit(lenqavitor, target);
+
+        vector<vector<int>> dp(n + 1, vector<int>(xor_limit, kInvalid));
+        dp[0][0] = 0;
+
+        for (int item = 0; item < n; item++) {
+            const int num = lenqavitor[item];
+
+            for (int xor_value = 0; xor_value < xor_limit; xor_value++) {
+                // 删除当前元素：继承上一行的最大保留数量。
+                dp[item + 1][xor_value] = dp[item][xor_value];
+
+                const int prev_xor = xor_value ^ num;
+                if (dp[item][prev_xor] != kInvalid) {
+                    // 保留当前元素：来源必须是上一行，保证每个元素最多使用一次。
+                    dp[item + 1][xor_value] = max(
+                        dp[item + 1][xor_value],
+                        dp[item][prev_xor] + 1);
+                }
+            }
+        }
+
+        return dp[n][target] < 0 ? -1 : n - dp[n][target];
+    }
+
+private:
+    int getXorLimit(const vector<int>& nums, int target) {
+        int max_value = target;
+        for (const int num : nums) {
+            max_value = max(max_value, num);
+        }
+
+        int xor_limit = 1;
+        while (xor_limit <= max_value) {
+            xor_limit <<= 1;
+        }
+        return xor_limit;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times xor\_limit)$。
+- 空间复杂度：$O(n \times xor\_limit)$。
+
+在本题约束下，`xor_limit` 最大约为 `2^14 = 16384`，`n <= 40`，所以这个规模可以接受。
+
+### 空间优化
+
+二维转移只依赖上一行，所以可以压成一维。
+
+`dp[xor_value]` 表示当前已经处理过的元素中，得到 `xor_value` 时的最大保留数量。
+
+处理当前元素 `num` 时，理论转移是：
+
+$$
+dp[xor\_value] =
+\max(dp[xor\_value],\ dp[xor\_value \oplus num] + 1)
+$$
+
+但这里和普通加法 0-1 背包有一个重要区别：**异或状态不能靠简单逆序遍历来防止重复使用当前元素**。
+
+原因是加法背包的来源 `sum - num` 总是小于 `sum`，所以逆序遍历能保证来源还没被本轮更新过。异或背包的来源 `xor_value ^ num` 没有大小单调性，它可能比 `xor_value` 小，也可能比 `xor_value` 大。
+
+所以一维优化时，需要显式复制上一轮状态：
+
+```cpp
+vector<int> next_dp = dp;
+```
+
+然后用旧的 `dp` 更新新的 `next_dp`，一轮结束后再整体替换。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维滚动异或 DP 求达到目标异或值的最少删除次数。
+     *
+     * @param nums 输入数组。
+     * @param target 目标异或值。
+     * @return 最少删除次数；如果无法达到 target，返回 -1。
+     */
+    int minRemovals(vector<int>& nums, int target) {
+        constexpr int kInvalid = -1000000000;
+        const vector<int>& lenqavitor = nums;
+        const int n = static_cast<int>(lenqavitor.size());
+        const int xor_limit = getXorLimit(lenqavitor, target);
+
+        vector<int> dp(xor_limit, kInvalid);
+        dp[0] = 0;
+
+        for (const int num : lenqavitor) {
+            vector<int> next_dp = dp;
+
+            for (int xor_value = 0; xor_value < xor_limit; xor_value++) {
+                if (dp[xor_value] == kInvalid) {
+                    continue;
+                }
+
+                // 保留当前元素：从旧状态 xor_value 转移到新状态 xor_value ^ num。
+                const int next_xor = xor_value ^ num;
+                next_dp[next_xor] = max(next_dp[next_xor], dp[xor_value] + 1);
+            }
+
+            dp = next_dp;
+        }
+
+        return dp[target] < 0 ? -1 : n - dp[target];
+    }
+
+private:
+    int getXorLimit(const vector<int>& nums, int target) {
+        int max_value = target;
+        for (const int num : nums) {
+            max_value = max(max_value, num);
+        }
+
+        int xor_limit = 1;
+        while (xor_limit <= max_value) {
+            xor_limit <<= 1;
+        }
+        return xor_limit;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times xor\_limit)$。
+- 空间复杂度：$O(xor\_limit)$。
+
+### 这题的核心手感
+
+3877 的核心，是把“最少删除”反过来想成“最多保留”：
+
+$$
+最少删除次数 = n - 最多保留数量
+$$
+
+然后问题就变成：
+
+> 选择尽量多的元素，让它们的异或和等于 `target`。
+
+它和 2915 很像：
+
+- 2915 是加法背包：状态是 `sum`，选当前数后状态变化是 `sum + num`。
+- 3877 是异或背包：状态是 `xor_value`，选当前数后状态变化是 `xor_value ^ num`。
+
+两题都在最大化保留数量，所以 `dp` 都存“最大长度 / 最大保留数量”，转移都用 `max`。
+
+但 3877 有一个非常关键的不同点：**一维优化不能靠逆序遍历完成**。
+
+- 加法背包有大小单调性，来源 `sum - num` 一定比 `sum` 小，所以逆序遍历能保护上一轮状态。
+- 异或背包没有大小单调性，来源 `xor_value ^ num` 的大小不固定，所以必须用 `next_dp` 显式保存下一轮状态。
+
+所以这题既像 0-1 背包，又是在提醒你：0-1 背包的本质不是“看到一维就逆序”，而是**每个物品只能基于上一轮状态转移一次**。加法背包可以用逆序模拟上一轮，异或背包则需要用滚动数组显式保存上一轮。
