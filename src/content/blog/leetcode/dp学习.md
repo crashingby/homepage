@@ -7793,3 +7793,398 @@ $$
 - 异或背包没有大小单调性，来源 `xor_value ^ num` 的大小不固定，所以必须用 `next_dp` 显式保存下一轮状态。
 
 所以这题既像 0-1 背包，又是在提醒你：0-1 背包的本质不是“看到一维就逆序”，而是**每个物品只能基于上一轮状态转移一次**。加法背包可以用逆序模拟上一轮，异或背包则需要用滚动数组显式保存上一轮。
+
+## [2787. 将一个数字表示成幂的和的方案数 - 力扣（LeetCode）](https://leetcode.cn/problems/ways-to-express-an-integer-as-sum-of-powers/description/)
+
+给你两个正整数 `n` 和 `x`。
+
+请你返回将 `n` 表示成一些**互不相同**正整数的 `x` 次幂之和的方案数。换句话说，需要统计满足下面关系的集合数目：
+
+$$
+n = n_1^x + n_2^x + \cdots + n_k^x
+$$
+
+由于答案可能非常大，需要对 $10^9 + 7$ 取模。
+
+示例 1：
+
+```text
+输入：n = 10, x = 2
+输出：1
+解释：10 = 3^2 + 1^2，这是唯一方案。
+```
+
+示例 2：
+
+```text
+输入：n = 4, x = 1
+输出：2
+解释：
+4 = 4^1
+4 = 3^1 + 1^1
+```
+
+提示：
+
+- `1 <= n <= 300`
+- `1 <= x <= 5`
+
+这题是非常标准的 0-1 背包计数。它和 494 很像，都是问“刚好凑出目标值的方案数”，只是 494 的物品来自原数组，2787 的物品来自所有不超过 `n` 的幂：
+
+$$
+1^x,\ 2^x,\ 3^x,\ \ldots
+$$
+
+### 题目如何转成 0-1 背包？
+
+先生成所有不超过 `n` 的 `base^x`：
+
+```text
+powers = [1^x, 2^x, 3^x, ...]
+```
+
+只要 `base^x <= n`，这个幂就可能参与组成 `n`；一旦 `base^x > n`，后面的底数更大，就都不可能参与了。
+
+这时题目可以翻译成：
+
+> 从 `powers` 中选出若干个数，使它们的和刚好等于 `n`，问一共有多少种选法。
+
+这正是 0-1 背包：
+
+- **物品**：每个幂值 `base^x`。
+- **重量**：幂值本身。
+- **背包容量**：`n`。
+- **0-1 约束**：每个正整数 `base` 只能使用一次，因为题目要求互不相同。
+- **目标**：统计刚好装满容量 `n` 的方案数。
+
+这里特别要注意“互不相同”四个字。比如 `x = 2` 时，`2^2` 这个物品最多只能选一次，所以它不是完全背包，而是 0-1 背包。
+
+另外，题目统计的是**集合数目**，不是排列数。`1^2 + 3^2` 和 `3^2 + 1^2` 是同一个集合，只能算一种。按底数从小到大处理每个幂，并且每个幂只决策一次，就自然避免了重复排列。
+
+### 递归切入（探索逻辑）
+
+先从递归想：站在第 `index` 个幂值 `powers[index]` 面前，仍然只有两个选择，选或不选。
+
+定义 `dfs(index, remain)` 表示：从下标 `index` 开始考虑幂值，还需要凑出 `remain`，一共有多少种方案。
+
+递归边界：
+
+- 如果 `remain == 0`，说明已经刚好凑出目标，返回 1。
+- 如果 `index == powers.size()`，说明所有幂值都看完了还没凑出来，返回 0。
+
+站在当前幂值 `powers[index]` 面前：
+
+- **不选当前幂值**：方案数来自 `dfs(index + 1, remain)`。
+- **选当前幂值**：前提是 `remain >= powers[index]`，方案数来自 `dfs(index + 1, remain - powers[index])`。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+dfs(index + 1, remain) + dfs(index + 1, remain - powers[index])
+$$
+
+第二项需要满足 `remain >= powers[index]`。因为答案可能很大，每次合并方案数都要取模。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索统计 n 表示成不同 x 次幂之和的方案数。
+     *
+     * @param n 目标整数。
+     * @param x 幂次。
+     * @return 表示方案数，对 1e9+7 取模。
+     */
+    int numberOfWays(int n, int x) {
+        const vector<int> powers = buildPowers(n, x);
+        vector<vector<int>> memo(powers.size(), vector<int>(n + 1, -1));
+        return dfs(powers, memo, 0, n);
+    }
+
+private:
+    static constexpr int kMod = 1000000007;
+
+    int dfs(const vector<int>& powers, vector<vector<int>>& memo, int index, int remain) {
+        if (remain == 0) {
+            return 1;
+        }
+        if (index == static_cast<int>(powers.size())) {
+            return 0;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != -1) {
+            return cached;
+        }
+
+        // 不选当前幂值。
+        cached = dfs(powers, memo, index + 1, remain);
+
+        if (remain >= powers[index]) {
+            // 选当前幂值。index 向后移动，保证每个底数最多使用一次。
+            cached += dfs(powers, memo, index + 1, remain - powers[index]);
+            cached %= kMod;
+        }
+
+        return cached;
+    }
+
+    vector<int> buildPowers(int n, int x) {
+        vector<int> powers;
+        for (int base = 1; ; base++) {
+            const int value = powLimited(base, x, n);
+            if (value > n) {
+                break;
+            }
+            powers.push_back(value);
+        }
+        return powers;
+    }
+
+    int powLimited(int base, int exponent, int limit) {
+        int value = 1;
+        for (int count = 0; count < exponent; count++) {
+            value *= base;
+            if (value > limit) {
+                return limit + 1;
+            }
+        }
+        return value;
+    }
+};
+```
+
+这段递归里，`remain` 就是背包剩余容量，返回值是“方案数”。这和 494 的背包递归是同一类问题。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][sum]` 表示只考虑前 `i` 个幂值时，凑出和 `sum` 的方案数。
+
+最终答案是：
+
+$$
+dp[m][n]
+$$
+
+其中 `m = powers.size()`。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实幂值 `powers[item]`。
+
+`dp[item]` 表示还没处理 `powers[item]` 之前的状态，`dp[item + 1]` 表示处理完 `powers[item]` 之后的状态。
+
+- **不选当前幂值**：凑出 `sum` 的方案数继承自上一行。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前幂值**：如果上一行能凑出 `sum - powers[item]`，那么加上当前幂值后，就能凑出 `sum`。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum - powers[item]]
+$$
+
+因为统计的是方案数，所以两个来源相加：
+
+$$
+dp[item + 1][sum] =
+dp[item][sum] + dp[item][sum - powers[item]]
+$$
+
+第二项需要满足 `sum >= powers[item]`，并且结果要对 $10^9 + 7$ 取模。
+
+### 初始化
+
+- `dp[0][0] = 1`：不选任何幂值，凑出和 0 有 1 种方法，也就是空集合。
+- `dp[0][sum] = 0`，其中 `sum > 0`：不选任何幂值，不可能凑出正数和。
+
+这里和 494 一样，`dp[0][0] = 1` 是方案数 DP 的种子。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `m - 1`，逐个处理真实幂值 `powers[item]`。
+- 内层从 `sum = 0` 到 `n`，枚举当前要凑出的和。
+
+因为 `dp[item + 1][sum]` 只依赖上一行 `dp[item][...]`，所以二维写法里内层正序或逆序都可以。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 0-1 背包统计 n 表示成不同 x 次幂之和的方案数。
+     *
+     * @param n 目标整数。
+     * @param x 幂次。
+     * @return 表示方案数，对 1e9+7 取模。
+     */
+    int numberOfWays(int n, int x) {
+        constexpr int kMod = 1000000007;
+        const vector<int> powers = buildPowers(n, x);
+        const int power_count = static_cast<int>(powers.size());
+        vector<vector<int>> dp(power_count + 1, vector<int>(n + 1, 0));
+        dp[0][0] = 1;
+
+        for (int item = 0; item < power_count; item++) {
+            const int power_value = powers[item];
+
+            for (int sum = 0; sum <= n; sum++) {
+                // 不选当前幂值：继承上一行方案数。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= power_value) {
+                    // 选当前幂值：来源必须是上一行，保证每个底数最多使用一次。
+                    dp[item + 1][sum] += dp[item][sum - power_value];
+                    dp[item + 1][sum] %= kMod;
+                }
+            }
+        }
+
+        return dp[power_count][n];
+    }
+
+private:
+    vector<int> buildPowers(int n, int x) {
+        vector<int> powers;
+        for (int base = 1; ; base++) {
+            const int value = powLimited(base, x, n);
+            if (value > n) {
+                break;
+            }
+            powers.push_back(value);
+        }
+        return powers;
+    }
+
+    int powLimited(int base, int exponent, int limit) {
+        int value = 1;
+        for (int count = 0; count < exponent; count++) {
+            value *= base;
+            if (value > limit) {
+                return limit + 1;
+            }
+        }
+        return value;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$，其中 `m` 是不超过 `n` 的 `x` 次幂数量。
+- 空间复杂度：$O(mn)$。
+
+因为 `n <= 300`，这个二维写法已经完全够用。
+
+### 空间优化
+
+二维转移只依赖上一行，所以可以压成一维：
+
+`dp[sum]` 表示当前已经处理过的幂值中，凑出和 `sum` 的方案数。
+
+处理当前幂值 `power_value` 时：
+
+$$
+dp[sum] = dp[sum] + dp[sum - power\_value]
+$$
+
+这就是标准加法 0-1 背包，所以一维优化必须逆序遍历：
+
+```cpp
+for (int sum = n; sum >= power_value; sum--)
+```
+
+逆序遍历保证 `dp[sum - power_value]` 还是处理当前幂值之前的旧状态。如果正序遍历，就会让同一个幂值在同一轮里被重复使用，题目要求的“互不相同整数”就会被破坏。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 0-1 背包统计 n 表示成不同 x 次幂之和的方案数。
+     *
+     * @param n 目标整数。
+     * @param x 幂次。
+     * @return 表示方案数，对 1e9+7 取模。
+     */
+    int numberOfWays(int n, int x) {
+        constexpr int kMod = 1000000007;
+        vector<int> dp(n + 1, 0);
+        dp[0] = 1;
+
+        for (int base = 1; ; base++) {
+            const int power_value = powLimited(base, x, n);
+            if (power_value > n) {
+                break;
+            }
+
+            // 逆序遍历，保证当前底数 base 的 x 次幂最多使用一次。
+            for (int sum = n; sum >= power_value; sum--) {
+                dp[sum] += dp[sum - power_value];
+                dp[sum] %= kMod;
+            }
+        }
+
+        return dp[n];
+    }
+
+private:
+    int powLimited(int base, int exponent, int limit) {
+        int value = 1;
+        for (int count = 0; count < exponent; count++) {
+            value *= base;
+            if (value > limit) {
+                return limit + 1;
+            }
+        }
+        return value;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(mn)$。
+- 空间复杂度：$O(n)$。
+
+### 这题的核心手感
+
+2787 的关键，是先把“互不相同正整数的 `x` 次幂”转成一个物品列表：
+
+$$
+powers = [1^x,\ 2^x,\ 3^x,\ \ldots]
+$$
+
+然后题目就变成：
+
+> 从 `powers` 中选若干个物品，使它们的和刚好等于 `n`，问有多少种选法。
+
+它和 494 的关系最像：
+
+- 494：给定原数组 `nums`，问有多少种选法凑出 `positive_sum`。
+- 2787：先生成幂数组 `powers`，问有多少种选法凑出 `n`。
+
+两题都是 0-1 背包计数，所以 `dp` 都存方案数，转移都用加法：
+
+$$
+dp[sum] = dp[sum] + dp[sum - weight]
+$$
+
+因为每个底数只能使用一次，一维优化时仍然必须**逆序遍历容量**。这题真正要抓住的不是幂运算，而是“生成物品后，它就是一个标准的 0-1 背包计数问题”。

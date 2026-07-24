@@ -58,6 +58,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: '小知识',
         description: '一些实用的小知识',
     },
+    'training-system': {
+        label: '训练系统',
+        description: '有关深度学习训练的理论，系统实现',
+    },
 }
 
 const fallbackTopic: BlogTopic = {
