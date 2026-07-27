@@ -1119,7 +1119,11 @@ __host__ cudaError_t cudaGraphNodeGetEnabled(cudaGraphExec_t hGraphExec, cudaGra
 
 ## Child Graph 的接口与所有权
 
-图 24 中的 Y 可以通过专用 child graph API 创建：
+child graph node 的作用是：**把一张已经构造好的 `cudaGraph_t` 嵌入到另一张父图里，并在父图中表现为一个普通节点**。父图只关心这个 child node 的前驱和后继；执行到 child node 时，CUDA 会执行它内部嵌入的子图。
+
+图 24 中的 Y 就可以看成父图里的一个 child graph node：父图拓扑是 `X -> Y -> Z`，而 Y 内部再展开为 `A -> {B, C} -> D`。
+
+### 核心接口
 
 ```cpp
 __host__ cudaError_t cudaGraphAddChildGraphNode(cudaGraphNode_t* pGraphNode, cudaGraph_t graph, const cudaGraphNode_t* pDependencies, size_t numDependencies, cudaGraph_t childGraph); // 克隆 childGraph 并把克隆结果嵌入父图节点。
@@ -1127,17 +1131,243 @@ __host__ cudaError_t cudaGraphChildGraphNodeGetGraph(cudaGraphNode_t node, cudaG
 __host__ cudaError_t cudaGraphExecChildGraphNodeSetParams(cudaGraphExec_t hGraphExec, cudaGraphNode_t node, cudaGraph_t childGraph); // 用拓扑匹配的新 child graph 更新 exec 中的 child node。
 ```
 
-- `cudaGraphAddChildGraphNode()` 会在调用时克隆 `childGraph`，所以调用方仍负责原 `childGraph` 的生命周期。
-- `cudaGraphChildGraphNodeGetGraph()` 返回的是节点内部图，不再克隆；它由 child node 持有，不能由调用方单独销毁。
-- 专用 `cudaGraphAddChildGraphNode()` 不接受含 allocation、free 或 conditional node 的 child graph。
-- CUDA 12.9 起，含 memory node 的 child graph 可以通过通用 `cudaGraphAddNode()` 配合 `cudaGraphChildGraphOwnershipMove` 转移给父图，规则在图内存节点一节说明。
-- 更新 exec 中的 child graph 时，新旧 child graph 必须拓扑一致，节点添加顺序也要匹配；限制递归应用到更深层子图。
+### `cudaGraphAddChildGraphNode`
 
-## Conditional Graph Nodes
+**用途**
+
+把一张普通 `cudaGraph_t` 作为 child graph node 加入父图。这个专用接口采用 **clone ownership（克隆所有权）**：调用时 CUDA 会克隆 `childGraph`，父图节点持有克隆后的内部图，调用方仍然持有原始 `childGraph`。
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `pGraphNode` | `cudaGraphNode_t*` | 输出参数，接收父图中新建的 child graph node 句柄。调用成功后，这个句柄属于 `graph`。 |
+| `graph` | `cudaGraph_t` | 父图。新 child graph node 会被加入这张图。 |
+| `pDependencies` | `const cudaGraphNode_t*` | child node 的直接前驱数组。`numDependencies == 0` 时可以为 `nullptr`；数组中不能有重复节点。 |
+| `numDependencies` | `size_t` | 前驱节点数量。为 0 时 child node 成为父图 root node。 |
+| `childGraph` | `cudaGraph_t` | 要嵌入的子图模板。这个接口会 clone 它，因此调用方仍负责原 `childGraph` 的销毁。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `cudaError_t` | 成功返回 `cudaSuccess`；常见失败包括 `cudaErrorInvalidValue`，例如参数非法、依赖重复、child graph 含不被此接口支持的节点。 |
+
+**副作用 / 约束**
+
+- 调用成功后，父图中新增一个 `cudaGraphNodeTypeGraph` 节点。
+- `childGraph` 会被 clone 到 child node 内部；原始 `childGraph` 不会被父图接管。
+- 专用接口不接受含 allocation node、free node 或 conditional node 的 `childGraph`。
+- `pDependencies` 只描述 child node 在父图中的依赖，不会改变 child graph 内部节点依赖。
+
+### `cudaGraphChildGraphNodeGetGraph`
+
+**用途**
+
+取得 child graph node 内部持有的嵌入图句柄，用来查询或修改这个 child node 内部的图模板。
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `node` | `cudaGraphNode_t` | 父图中的 child graph node 句柄。这个节点类型必须是 `cudaGraphNodeTypeGraph`。 |
+| `pGraph` | `cudaGraph_t*` | 输出参数，接收 child node 内部嵌入图的句柄。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `cudaError_t` | 成功返回 `cudaSuccess`；参数非法或 `node` 不是有效 child graph node 时返回错误。 |
+
+**副作用 / 约束**
+
+- 这个接口 **不 clone** 内部图，返回的是 child node 持有的实际图句柄。
+- 对返回图的修改会反映到 child node 上，因为它就是节点内部图。
+- 返回图的所有权仍属于 child node；调用方不能单独 `cudaGraphDestroy()` 它。
+- 不能向返回图继续添加 allocation node 或 free node。
+
+### `cudaGraphExecChildGraphNodeSetParams`
+
+**用途**
+
+在已经实例化的 `cudaGraphExec_t` 中，更新某个 child graph node 内部节点的参数。它只影响未来发射，不修改原始 `cudaGraph_t` 模板，也不影响已经提交或正在运行的 graph launch。
+
+**参数**
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `hGraphExec` | `cudaGraphExec_t` | 要被更新的 executable graph。 |
+| `node` | `cudaGraphNode_t` | 原始父图中的 child graph node 句柄。这个节点必须仍在实例化 `hGraphExec` 所用的父图中。 |
+| `childGraph` | `cudaGraph_t` | 提供新参数的子图。它不会替换 child node 的拓扑，只提供对应节点的新参数。 |
+
+**返回值**
+
+| 类型 | 含义 |
+| --- | --- |
+| `cudaError_t` | 成功返回 `cudaSuccess`；参数非法、拓扑不匹配、节点插入顺序不匹配或更新内容不受支持时返回错误。 |
+
+**副作用 / 约束**
+
+- `childGraph` 的拓扑和节点插入顺序必须匹配 `node` 内部已有的 child graph。
+- 改变 child node 与父图其他节点之间的边不会通过这个接口生效；官方说明中这些 edge change 会被忽略。
+- 更新会递归应用到更深层 child graph node；每一层都要满足 `cudaGraphExecUpdate()` 的更新限制。
+
+### 子图参数结构与所有权
+
+通用 `cudaGraphAddNode()` 也能创建 child graph node，此时要填 `cudaGraphNodeParams::graph`。CUDA 13.3 里相关结构体如下：
+
+```cpp
+enum __device_builtin__ cudaGraphChildGraphNodeOwnership { // 描述 child graph 加入父图时的所有权关系。
+    cudaGraphChildGraphOwnershipClone = 0, // 默认行为：把 child graph 克隆进父图节点；含 memory allocation/free node 的 child graph 不能使用这种方式。
+    cudaGraphChildGraphOwnershipMove = 1, // 把 child graph 所有权移动给父图节点；父图销毁时会销毁这个 child graph。
+    cudaGraphChildGraphOwnershipInvalid = -1 // 查询参数时用于防止误用 driver-owned graph 对象的无效标记。
+}; // 结束 cudaGraphChildGraphNodeOwnership 定义。
+
+struct __device_builtin__ cudaChildGraphNodeParams { // 通用 cudaGraphAddNode 创建 child graph node 时使用的参数。
+    cudaGraph_t graph; // 创建节点时表示要 clone 或 move 的 child graph；查询节点时表示节点内部拥有的 graph。
+    enum cudaGraphChildGraphNodeOwnership ownership; // 指定 child graph 是 clone 到父图，还是 move 给父图。
+}; // 结束 cudaChildGraphNodeParams 定义。
+```
+
+| ownership | 行为 | 适合场景 | 后续所有权 |
+| --- | --- | --- | --- |
+| `cudaGraphChildGraphOwnershipClone` | 克隆 `graph` 到 child node 内部 | 普通子图，不含 allocation/free node，不含 conditional node | 调用方继续拥有原 `graph`，父图拥有克隆图 |
+| `cudaGraphChildGraphOwnershipMove` | 把 `graph` 移动给父图节点 | child graph 含 allocation/free node，必须移动所有权才能嵌入 | 调用成功后原 `graph` 句柄由父图拥有，调用方不能再独立销毁或实例化 |
+
+move 成功后，原 child graph 句柄有这些限制：不能独立实例化或销毁，不能再加入另一个父图，不能作为 `cudaGraphExecUpdate()` 的输入，也不能继续向其中添加 allocation/free node。含 conditional node 的图仍不能作为 child graph。
+
+### 为什么 allocation/free node 和 conditional node 不能按普通方式 clone
+
+这里容易误解成“child graph API 比较挑食”。其实更准确的说法是：**`cudaGraphAddChildGraphNode()` 的语义就是 clone child graph，而 CUDA 13.3 明确规定含 allocation node、free node 或 conditional node 的 graph 不能 clone**。所以专用 child graph API 遇到这三类节点会直接失败。
+
+对 allocation/free node 来说，关键问题是它们不是普通计算节点，而是带有 **graph allocation 生命周期** 的资源节点。allocation node 创建时，CUDA 会为这次 graph allocation 选择固定虚拟地址；后续 kernel 参数里可能已经保存了这个地址。free node 又必须释放同一个 graph allocation。也就是说，图里保存的不只是“有一个分配操作”，还有“这次分配产生的地址、谁拥有它、谁负责释放它、哪些节点被证明在它的生命周期内访问它”。
+
+如果把这样的子图偷偷 clone 两份，就会立刻产生几个语义问题：
+
+- clone 后的 allocation 是不是应该复用原来的虚拟地址，还是生成新的虚拟地址？
+- 原图里已经写进 kernel 参数的 `dptr` 应该指向哪一次 allocation？
+- free node 释放的是原 graph allocation，还是 clone 出来的 graph allocation？
+- 如果两个 clone 同时发射，CUDA 应该怎样证明两份 graph allocation 的生命周期和别名关系？
+
+CUDA 选择不让 clone 语义承担这些问题。含 allocation/free node 的 child graph 仍然可以嵌入父图，但要用 `cudaGraphChildGraphOwnershipMove`：这相当于告诉 CUDA，“这张带资源生命周期的图不要复制，整体搬进父图节点里，由父图节点接管它”。这样 allocation/free 的虚拟地址、释放关系和所有权都只有一份，不会出现 clone 后两份图争同一套资源语义的尴尬局面。
+
+可以把两种语义画成这样：
+
+```mermaid
+flowchart TD
+    subgraph clone["普通 child graph：Clone"]
+        C0["原 child graph"] -.复制拓扑和参数.-> C1["父图节点内部 graph"]
+        C0 -.调用方继续拥有.-> Owner0["caller"]
+        C1 -.父图节点拥有.-> Owner1["parent child node"]
+    end
+
+    subgraph move["含 allocation/free：Move"]
+        M0["原 child graph<br/>含 Alloc/Free"] --> M1["父图 child node"]
+        M1 -.接管唯一所有权.-> Owner2["parent graph"]
+    end
+```
+
+conditional node 的限制又是另一类。条件节点内部有 `cudaGraphConditionalHandle` 和 body graph；handle 的值由 device 代码在 graph execution 中写入，body graph 的执行次数或分支选择也由这个运行期值决定。CUDA 13.3 头文件里对含 conditional node 的 graph 明确写了三条限制：**不能作为 child node 使用、同一时刻只能有一个实例化对象、不能 clone**。
+
+这背后的直觉是：conditional node 不是静态 DAG 里的普通节点，而是把一段 device-side 控制流嵌进图里。它带着条件 handle、body graph 数组、执行上下文和“每次 graph launch 如何初始化/更新条件值”的约束。如果允许 clone 或作为 child graph 使用，就会出现“handle 归哪张图”“body graph 归哪个 conditional node”“多个 executable 是否共享同一个条件状态”等问题。CUDA 目前把这类状态约束收得很紧：含 conditional node 的图只能作为自己的顶层 graph 使用，不能 clone，也不能塞进 child graph node 里。
+
+所以这条规则可以简化记成：
+
+| 子图内容 | 能否用 `cudaGraphAddChildGraphNode()` | 能否用 `cudaGraphChildGraphOwnershipMove` 嵌入 | 原因 |
+| --- | --- | --- | --- |
+| 只有普通 kernel/memcpy/memset/empty/host/event 等受支持节点 | 可以 | 通常没必要 | clone 后语义清楚，原图和父图内部图彼此独立。 |
+| 含 allocation/free node | 不可以 | 可以 | graph allocation 有唯一资源生命周期和所有权，必须整体 move，不能复制。 |
+| 含 conditional node | 不可以 | 不可以 | conditional graph 不能 clone，也不能作为 child node；条件 handle 和 body graph 带有更强的执行状态约束。 |
+
+### 如何适配子图接口嵌入一个子图
+
+先按普通方式构造 child graph，再把它作为父图的一个节点加入。普通子图优先使用专用 `cudaGraphAddChildGraphNode()`：
+
+```cpp
+cudaGraphExec_t buildParentWithClonedChild(cudaGraph_t child_graph) { // 把普通 child graph 克隆进父图并实例化。
+    cudaGraph_t parent_graph = nullptr; // 保存父图模板。
+    CUDA_CHECK(cudaGraphCreate(&parent_graph, 0)); // 创建空父图。
+
+    cudaGraphNode_t child_node = nullptr; // 接收父图里的 child graph node。
+    CUDA_CHECK(cudaGraphAddChildGraphNode(&child_node, parent_graph, nullptr, 0, child_graph)); // 把 child_graph 克隆为父图 root child node。
+
+    cudaGraphExec_t parent_exec = nullptr; // 接收可执行父图。
+    CUDA_CHECK(cudaGraphInstantiate(&parent_exec, parent_graph, 0)); // 实例化父图；child graph 会作为节点内部工作执行。
+    CUDA_CHECK(cudaGraphDestroy(parent_graph)); // 销毁父图模板；exec 保留自己的执行快照。
+    return parent_exec; // 返回可发射的父图 exec。
+} // 结束 buildParentWithClonedChild。
+```
+
+如果 child graph 含 allocation/free node，就不能用专用 clone API，而要用通用 `cudaGraphAddNode()` 搭配 `cudaGraphChildGraphOwnershipMove`：
+
+```cpp
+cudaGraphNode_t addMovedChildGraph(cudaGraph_t parent_graph, cudaGraph_t child_graph_with_memory) { // 把含 memory node 的 child graph 移动进父图。
+    cudaGraphNodeParams child_params{}; // 零初始化通用节点参数，确保保留字段为 0。
+    child_params.type = cudaGraphNodeTypeGraph; // 指明要创建 child graph node。
+    child_params.graph.graph = child_graph_with_memory; // 指定将被嵌入父图的 child graph。
+    child_params.graph.ownership = cudaGraphChildGraphOwnershipMove; // 把 child graph 所有权移动给父图节点。
+
+    cudaGraphNode_t child_node = nullptr; // 接收父图中的 child graph node。
+    CUDA_CHECK(cudaGraphAddNode(&child_node, parent_graph, nullptr, nullptr, 0, &child_params)); // 通过通用 API 创建 ownership-move child node。
+    return child_node; // 返回 child node 句柄；调用方不能再独立销毁 child_graph_with_memory。
+} // 结束 addMovedChildGraph。
+```
+
+如果需要在创建后修改 child node 内部图，可以先取内部图句柄：
+
+```cpp
+void appendWorkInsideChild(cudaGraphNode_t child_node) { // 演示如何取得 child node 内部图并继续修改。
+    cudaGraph_t embedded_graph = nullptr; // 接收 child node 持有的内部图。
+    CUDA_CHECK(cudaGraphChildGraphNodeGetGraph(child_node, &embedded_graph)); // 取得内部图；不会 clone，也不会转移所有权。
+    addMoreNonMemoryWork(embedded_graph); // 可以继续向内部图添加受支持的非 memory work。
+} // 结束 appendWorkInsideChild。
+```
+
+这三种用法可以按一句话选择：**普通子图用 clone 专用 API；含 memory node 的子图用通用 API + move；已经嵌入后要改内部图，用 `cudaGraphChildGraphNodeGetGraph()` 拿到节点持有的内部图。**
+
+## Conditional Graph Nodes（条件图节点）
 
 条件节点把数据相关的控制流留在 device 上，避免为了一个分支或循环条件把数据送回 host。条件在节点依赖满足时由 GPU 求值，body graph 可以继续包含受支持的 kernel、memcpy、memset、empty、child graph 和嵌套 conditional node。
 
-### 条件 handle 与核心接口
+### 条件节点相关类型源码摘录
+
+CUDA 13.3 在 `driver_types.h` 中把条件节点拆成三个核心概念：条件 handle、条件节点类型、条件节点参数。
+
+```cpp
+typedef __device_builtin__ unsigned long long cudaGraphConditionalHandle; // 条件变量句柄；device 代码通过它写入 IF/WHILE/SWITCH 的控制值。
+
+enum __device_builtin__ cudaGraphConditionalHandleFlags { // 创建条件 handle 时使用的 flags。
+    cudaGraphCondAssignDefault = 1 // 每次 graph launch 开始时，把 defaultLaunchValue 写成该 handle 的初始条件值。
+}; // 结束 cudaGraphConditionalHandleFlags 定义。
+
+enum __device_builtin__ cudaGraphConditionalNodeType { // conditional node 的控制流类型。
+    cudaGraphCondTypeIf = 0, // IF/ELSE 节点；条件非 0 执行 body[0]，若 size == 2 且条件为 0 则执行 body[1]。
+    cudaGraphCondTypeWhile = 1, // WHILE 节点；条件非 0 时反复执行 body[0]，每轮 body 完成后再次检查条件。
+    cudaGraphCondTypeSwitch = 2 // SWITCH 节点；条件值为 n 时执行 body[n] 一次，n >= size 时不执行任何 body。
+}; // 结束 cudaGraphConditionalNodeType 定义。
+
+struct __device_builtin__ cudaConditionalNodeParams { // 通用 cudaGraphAddNode 创建 conditional node 时使用的参数。
+    cudaGraphConditionalHandle handle; // 预先创建的条件 handle；一个 handle 只能关联到一个 conditional node。
+    enum cudaGraphConditionalNodeType type; // 条件节点类型，可以是 IF、WHILE 或 SWITCH。
+    unsigned int size; // body graph 数组大小；WHILE 为 1，IF 为 1 或 2，SWITCH 为大于 0 的任意值。
+    cudaGraph_t* phGraph_out; // CUDA 写回的 body graph 数组；数组和其中 graph 的所有权属于 conditional node。
+    cudaExecutionContext_t ctx; // conditional node 及其 body graph 所属的 CUDA execution context。
+}; // 结束 cudaConditionalNodeParams 定义。
+```
+
+| 类型 / 字段 | 含义 |
+| --- | --- |
+| `cudaGraphConditionalHandle` | 条件变量的 opaque handle。host 创建它，device kernel 通过 `cudaGraphSetConditional()` 写它。 |
+| `cudaGraphCondAssignDefault` | 是否在每次 graph execution 开始时把 `defaultLaunchValue` 重新写入 handle。 |
+| `cudaGraphCondTypeIf` | 条件非 0 执行 true body；可选 `size == 2` 时存在 false body。 |
+| `cudaGraphCondTypeWhile` | 条件非 0 时循环执行 body；body 内通常要写 handle 来终止循环。 |
+| `cudaGraphCondTypeSwitch` | 条件值作为 body 下标；越界时跳过所有 body。 |
+| `cudaConditionalNodeParams::phGraph_out` | 创建 conditional node 时由 CUDA 写回 body graph 数组，之后用显式 Graph API 或 capture 填充。 |
+| `cudaConditionalNodeParams::ctx` | 指定该 conditional node 使用的 execution context；为 `nullptr` 时通常使用当前上下文。 |
+
+含 conditional node 的图有额外限制：**不能 clone，不能作为 child graph node 嵌入父图，同一时刻只能存在一个 instantiated executable graph**。这也是前面 child graph 小节里说 conditional node 不能作为子图内容的根本原因。
+
+### 条件 handle 创建接口
 
 **原型**
 
@@ -1147,27 +1377,105 @@ __host__ cudaError_t cudaGraphConditionalHandleCreate_v2(cudaGraphConditionalHan
 __device__ void cudaGraphSetConditional(cudaGraphConditionalHandle handle, unsigned int value); // 从 device 代码写入条件值。
 ```
 
+`cudaGraphConditionalHandleCreate()` 是常用版本，它依赖当前 CUDA context。`cudaGraphConditionalHandleCreate_v2()` 多了一个 `cudaExecutionContext_t ctx`，用于显式指定这个条件 handle 和后续 conditional node 属于哪个 execution context。
+
 **参数**
 
-| 参数 | 含义 |
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `pHandle_out` | `cudaGraphConditionalHandle*` | 输出参数，接收新创建的条件 handle。handle 没有单独销毁接口，生命周期依附所属 graph / conditional node。 |
+| `graph` | `cudaGraph_t` | 这个 handle 所属的 graph。之后必须把 handle 绑定到这张图或其嵌套图中的某个 conditional node。 |
+| `ctx` | `cudaExecutionContext_t` | 仅 v2 接口有。显式指定 handle 和 conditional node 的 execution context；为 `nullptr` 时使用当前 context。 |
+| `defaultLaunchValue` | `unsigned int` | 可选默认条件值。只有 `flags` 包含 `cudaGraphCondAssignDefault` 时，才会在每次 graph execution 开始时自动写入。 |
+| `flags` | `unsigned int` | 当前只能是 0 或 `cudaGraphCondAssignDefault`。 |
+| `handle` | `cudaGraphConditionalHandle` | device 侧 `cudaGraphSetConditional()` 要写的条件 handle。 |
+| `value` | `unsigned int` | device 写入的条件值。IF/WHILE 把 0 当 false，非 0 当 true；SWITCH 把它当 body 下标。 |
+
+**返回值**
+
+| 类型 | 含义 |
 | --- | --- |
-| `pHandle_out` | 输出新 handle。handle 没有单独的销毁接口，生命周期依附所属图。 |
-| `graph` | 将要包含该条件节点的图；handle 必须最终绑定到此图或其子图中的一个条件节点。 |
-| `defaultLaunchValue` | 每次 graph execution 开始时可写入的默认条件值。 |
-| `flags` | 0 或 `cudaGraphCondAssignDefault`；后者让默认值在每次图执行开始时生效。 |
-| `value` | 由 device 写入的 32 位无符号条件值。IF/WHILE 把 0 当 false，SWITCH 把它当 body 下标。 |
+| `cudaError_t` | 成功返回 `cudaSuccess`；参数非法、功能不支持等情况返回错误。 |
+| `void` | `cudaGraphSetConditional()` 是 device 函数，没有返回值。 |
+
+**副作用 / 约束**
 
 一个 handle 必须只关联一个条件节点。若没有设置 `cudaGraphCondAssignDefault`，每次 graph execution 开始时条件值是**未定义的**，不能假设它会保留上一次执行的值；应在上游 kernel 中明确设置。创建却未绑定到条件节点的 handle 可能导致实例化失败。
 
-`cudaConditionalNodeParams` 的关键字段：
+`cudaGraphSetConditional()` 必须从 device 代码调用，通常放在 conditional node 的前驱 kernel 或 WHILE body kernel 里。多个 device 线程并发写同一个 handle 的结果不好推理，实际使用中应显式指定单线程或单个 warp 负责写条件值。
 
-| 字段 | 含义 |
-| --- | --- |
-| `handle` | 预先创建并且只绑定到这个条件节点的 handle。 |
-| `type` | `cudaGraphCondTypeIf`、`cudaGraphCondTypeWhile` 或 `cudaGraphCondTypeSwitch`。 |
-| `size` | body graph 数量：WHILE 必须为 1；IF 为 1 或 2；SWITCH 为任意大于 0 的值。 |
-| `phGraph_out` | CUDA 创建并持有的 body graph 数组，在条件节点整个生命周期内有效。 |
-| `ctx` | 条件节点使用的 CUDA execution context；普通接口通常使用当前 context。 |
+### `cudaConditionalNodeParams`
+
+**用途**
+
+`cudaConditionalNodeParams` 是通用 `cudaGraphAddNode()` 创建 `cudaGraphNodeTypeConditional` 节点时填入的参数。创建成功后，CUDA 会把 body graph 数组写回 `phGraph_out`，调用方再继续填充这些 body graph。
+
+**成员变量**
+
+| 成员 | 类型 | 含义 |
+| --- | --- | --- |
+| `handle` | `cudaGraphConditionalHandle` | 预先通过 `cudaGraphConditionalHandleCreate()` 或 v2 接口创建的 handle。这个 handle 必须最终只绑定到这一个 conditional node。 |
+| `type` | `enum cudaGraphConditionalNodeType` | 控制流类型：`If`、`While` 或 `Switch`。 |
+| `size` | `unsigned int` | CUDA 要创建多少个 body graph。WHILE 只能是 1；IF 可以是 1 或 2；SWITCH 必须大于 0。 |
+| `phGraph_out` | `cudaGraph_t*` | 输出成员。创建节点成功后，CUDA 把 body graph 数组地址写到这里；数组在 conditional node 生命周期内有效。 |
+| `ctx` | `cudaExecutionContext_t` | body graph 中工作所属的 execution context。若使用默认 primary context，通常保持为 `nullptr`。 |
+
+**副作用 / 约束**
+
+- 创建 conditional node 后，`phGraph_out[i]` 里的 graph 由 CUDA 持有，调用方不能单独 `cudaGraphDestroy()`。
+- body graph 可以用普通 graph node creation API 填充，也可以用 `cudaStreamBeginCaptureToGraph()` 捕获填充。
+- body graph 允许的节点类型包括 kernel、empty、child graph、memset、memcpy 和 conditional，并递归适用于嵌套 body。
+- body graph 中所有 kernel，包括嵌套 conditional 或 child graph 内的 kernel，都必须属于同一个 CUDA context。
+- conditional node 自身参数不支持后续修改；若要更新，通常要走整体 graph update，并遵守 `cudaGraphExecUpdate()` 的限制。
+
+### `cudaExecutionContext_t` 是什么
+
+`cudaExecutionContext_t` 的源码声明很短：
+
+```cpp
+typedef __device_builtin__ struct cudaExecutionContext_st* cudaExecutionContext_t; // CUDA Runtime 暴露的 execution context opaque handle。
+```
+
+它是 CUDA Runtime 在 13.x 中引入的一层 **execution context（执行上下文）抽象**，用来统一表示两类底层上下文：
+
+- **primary context（主上下文）**：Runtime 默认为每个 device 管理的上下文；普通 `cudaSetDevice()`、kernel launch、stream API 大多隐式使用它。
+- **green context**：CUDA 13.x 的资源隔离/资源划分上下文，可以用 `cudaGreenCtxCreate()` 创建，并通过 execution context 句柄显式提交工作。
+
+官方文档式地说，`cudaExecutionContext_t` 是 opaque handle：你不应该假设它内部就是 `CUcontext` 或 `CUgreenCtx`，Runtime 也不提供把它转换成 Driver API context 的接口。
+
+相关接口原型如下：
+
+```cpp
+__host__ cudaError_t cudaDeviceGetExecutionCtx(cudaExecutionContext_t* ctx, int device); // 取得某个 device 的 primary execution context；调用方不能销毁它。
+__host__ cudaError_t cudaGreenCtxCreate(cudaExecutionContext_t* phCtx, cudaDevResourceDesc_t desc, int device, unsigned int flags); // 创建 green context 并返回 execution context 句柄。
+__host__ cudaError_t cudaExecutionCtxDestroy(cudaExecutionContext_t ctx); // 销毁由 Runtime 显式创建的 execution context；不能销毁 primary context。
+__host__ cudaError_t cudaExecutionCtxStreamCreate(cudaStream_t* phStream, cudaExecutionContext_t ctx, unsigned int flags, int priority); // 在指定 execution context 上创建 stream。
+__host__ cudaError_t cudaExecutionCtxSynchronize(cudaExecutionContext_t ctx); // 等待该 execution context 上此前提交的任务完成。
+```
+
+在 conditional graph node 里，`ctx` 的作用是让节点创建时明确知道“这个条件控制流以及 body graph 应该在哪个执行上下文里运行”。这对普通程序通常不显眼，因为你一直在用某个 device 的 primary context，`ctx == nullptr` 就足够；但在显式 context 编程，尤其是 green context 场景里，就不能再靠“当前 host 线程上的 current context”猜了。
+
+可以这样理解：
+
+```mermaid
+flowchart TD
+    H["Host thread"] --> G["cudaGraph_t"]
+    G --> N{"conditional node"}
+    N --> B0["body graph 0"]
+    N --> B1["body graph 1"]
+    CTX["cudaExecutionContext_t<br/>primary context 或 green context"] -.约束执行归属.-> N
+    CTX -.body 中 kernel/memcpy/memset 使用同一 context.-> B0
+    CTX -.body 中 kernel/memcpy/memset 使用同一 context.-> B1
+```
+
+什么时候该关心 `cudaExecutionContext_t`：
+
+- 如果你只用普通 Runtime API、一个进程里按 `cudaSetDevice()` 使用默认 device，通常不需要显式传 `ctx`。
+- 如果你在用 green context，或想让图节点创建不依赖 host 线程当前 context，就应该用 v2 接口或通用 `cudaGraphAddNode()` 的 `ctx` 字段显式指定。
+- 如果 graph body 里的 kernel、memcpy、memset 可能来自不同 CUDA context，要停下来重构；conditional body 要求这些工作属于同一个 CUDA context。
+- 如果一个 API 明确要求 `cudaExecutionContext_t` 且没有默认值，不能传 `nullptr`；但 `cudaGraphConditionalHandleCreate_v2()` 的 `ctx` 默认是 `nullptr`，语义是使用当前 context。
+
+一句话总结：**stream 决定排队顺序，`cudaExecutionContext_t` 决定这些工作属于哪个 CUDA 执行资源/上下文；conditional node 的 `ctx` 是为了把 device-side 控制流也绑定到明确的执行上下文上。**
 
 ### 图 27：IF 条件节点
 
@@ -1184,7 +1492,7 @@ flowchart TD
     B -. "condition != 0 时执行一次" .-> I1
 ```
 
-**图 27：Conditional IF Node。** 条件非零时执行 `phGraph_out[0]` 一次；若 `size == 2`，条件为零时执行 `phGraph_out[1]` 一次。`size == 1` 时，零值表示跳过 body，不存在隐式 else。
+**图 27：Conditional IF Node。** IF 节点本身不负责计算条件，它只在执行时读取已经写入 `cudaGraphConditionalHandle` 的值。通常前驱 kernel 先调用 `cudaGraphSetConditional(handle, value)` 写条件，然后 IF 节点根据这个值分派：`value != 0` 时执行 `phGraph_out[0]` 这个 true body 一次；`value == 0` 且 `size == 2` 时执行 `phGraph_out[1]` 这个 false body 一次；`value == 0` 且 `size == 1` 时不执行任何 body，直接把 IF 节点标记为完成。这里的 `size` 表示 CUDA 要创建几个 body graph，不是执行次数。
 
 ### Graph API 创建 IF
 
