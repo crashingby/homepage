@@ -8188,3 +8188,433 @@ dp[sum] = dp[sum] + dp[sum - weight]
 $$
 
 因为每个底数只能使用一次，一维优化时仍然必须**逆序遍历容量**。这题真正要抓住的不是幂运算，而是“生成物品后，它就是一个标准的 0-1 背包计数问题”。
+
+## [474. 一和零 - 力扣（LeetCode）](https://leetcode.cn/problems/ones-and-zeroes/description/)
+
+给你一个二进制字符串数组 `strs` 和两个整数 `m`、`n`。
+
+请你找出并返回 `strs` 的最大子集长度，该子集中最多有 `m` 个 `0` 和 `n` 个 `1`。
+
+示例 1：
+
+```text
+输入：strs = ["10", "0001", "111001", "1", "0"], m = 5, n = 3
+输出：4
+解释：最多有 5 个 0 和 3 个 1 的最大子集是 {"10","0001","1","0"}。
+```
+
+示例 2：
+
+```text
+输入：strs = ["10", "0", "1"], m = 1, n = 1
+输出：2
+解释：最大的子集是 {"0", "1"}。
+```
+
+提示：
+
+- `1 <= strs.length <= 600`
+- `1 <= strs[i].length <= 100`
+- `strs[i]` 仅由 `'0'` 和 `'1'` 组成
+- `1 <= m, n <= 100`
+
+这题是 0-1 背包的二维费用版本。前面的背包大多只有一个容量，比如 `sum` 或 `target`；这题有两个容量：
+
+- `0` 的数量不能超过 `m`。
+- `1` 的数量不能超过 `n`。
+
+### 题目如何转成 0-1 背包？
+
+每个字符串都可以预处理成一个二元费用：
+
+```text
+字符串 s -> (zero_count, one_count)
+```
+
+比如：
+
+- `"10"` 消耗 1 个 `0` 和 1 个 `1`。
+- `"0001"` 消耗 3 个 `0` 和 1 个 `1`。
+- `"1"` 消耗 0 个 `0` 和 1 个 `1`。
+
+于是题目可以翻译成：
+
+> 从若干个字符串中选出尽量多的字符串，使总 `0` 数不超过 `m`，总 `1` 数不超过 `n`。
+
+这就是 0-1 背包：
+
+- **物品**：每个字符串 `strs[i]`。
+- **重量 / 费用**：两个维度，分别是 `zero_count` 和 `one_count`。
+- **背包容量**：两个维度，分别是 `m` 和 `n`。
+- **价值**：选中一个字符串贡献长度 1。
+- **0-1 约束**：每个字符串最多选一次。
+- **目标**：在两个容量都不超的前提下，最大化选中字符串数量。
+
+这题和 2915 很像：2915 是“一维容量下最大化选中数量”，474 是“二维容量下最大化选中数量”。
+
+### 递归切入（探索逻辑）
+
+先从递归想：站在第 `index` 个字符串面前，仍然只有两个选择，选或不选。
+
+定义 `dfs(index, remain_zero, remain_one)` 表示：从下标 `index` 开始考虑字符串，当前还剩 `remain_zero` 个 `0` 容量和 `remain_one` 个 `1` 容量，最多还能选多少个字符串。
+
+递归边界：
+
+- 如果 `index == strs.size()`，说明所有字符串都看完了，返回 0。
+
+站在当前字符串 `strs[index]` 面前，设它的费用为 `(zero_count, one_count)`：
+
+- **不选当前字符串**：答案来自 `dfs(index + 1, remain_zero, remain_one)`。
+- **选当前字符串**：前提是 `remain_zero >= zero_count` 且 `remain_one >= one_count`，答案来自 `dfs(index + 1, remain_zero - zero_count, remain_one - one_count) + 1`。
+
+递归表达式：
+
+$$
+dfs(index, remain\_zero, remain\_one) =
+\max(
+dfs(index + 1, remain\_zero, remain\_one),\
+dfs(index + 1, remain\_zero - zero\_count, remain\_one - one\_count) + 1
+)
+$$
+
+第二项需要两个容量都足够时才能选择。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求最多能选出的二进制字符串数量。
+     *
+     * @param strs 二进制字符串数组。
+     * @param m 最多允许使用的 0 的数量。
+     * @param n 最多允许使用的 1 的数量。
+     * @return 满足 0 和 1 数量限制的最大子集长度。
+     */
+    int findMaxForm(vector<string>& strs, int m, int n) {
+        const vector<array<int, 2>> costs = buildCosts(strs);
+        vector<vector<vector<int>>> memo(
+            costs.size(),
+            vector<vector<int>>(m + 1, vector<int>(n + 1, -1)));
+        return dfs(costs, memo, 0, m, n);
+    }
+
+private:
+    int dfs(
+        const vector<array<int, 2>>& costs,
+        vector<vector<vector<int>>>& memo,
+        int index,
+        int remain_zero,
+        int remain_one) {
+        if (index == static_cast<int>(costs.size())) {
+            return 0;
+        }
+
+        int& cached = memo[index][remain_zero][remain_one];
+        if (cached != -1) {
+            return cached;
+        }
+
+        // 不选当前字符串。
+        cached = dfs(costs, memo, index + 1, remain_zero, remain_one);
+
+        const int zero_count = costs[index][0];
+        const int one_count = costs[index][1];
+        if (remain_zero >= zero_count && remain_one >= one_count) {
+            // 选当前字符串。index 向后移动，保证每个字符串最多使用一次。
+            cached = max(
+                cached,
+                dfs(costs, memo, index + 1, remain_zero - zero_count, remain_one - one_count) + 1);
+        }
+
+        return cached;
+    }
+
+    vector<array<int, 2>> buildCosts(const vector<string>& strs) {
+        vector<array<int, 2>> costs;
+        costs.reserve(strs.size());
+
+        for (const string& str : strs) {
+            int zero_count = 0;
+            int one_count = 0;
+            for (const char ch : str) {
+                if (ch == '0') {
+                    zero_count++;
+                } else {
+                    one_count++;
+                }
+            }
+            costs.push_back({zero_count, one_count});
+        }
+
+        return costs;
+    }
+};
+```
+
+这段递归里，`remain_zero` 和 `remain_one` 就是两个背包容量，返回值是“最大可选字符串数量”。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][zero][one]` 表示只考虑前 `i` 个字符串时，在最多使用 `zero` 个 `0`、`one` 个 `1` 的限制下，最多能选多少个字符串。
+
+最终答案是：
+
+$$
+dp[strs.size()][m][n]
+$$
+
+注意这里是“最多使用”，不是“必须刚好使用”。所以即使没有把 `0` 和 `1` 的容量全部用完，也可以是合法答案。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实字符串 `strs[item]`。
+
+`dp[item]` 表示还没处理 `strs[item]` 之前的状态，`dp[item + 1]` 表示处理完 `strs[item]` 之后的状态。
+
+设当前字符串的费用为：
+
+```text
+zero_count = 当前字符串里的 0 的数量
+one_count  = 当前字符串里的 1 的数量
+```
+
+- **不选当前字符串**：最大子集长度继承上一行。
+
+$$
+dp[item + 1][zero][one] \leftarrow dp[item][zero][one]
+$$
+
+- **选当前字符串**：如果两个容量都足够，就从上一行的剩余容量转移过来，并让长度加 1。
+
+$$
+dp[item + 1][zero][one] \leftarrow dp[item][zero - zero\_count][one - one\_count] + 1
+$$
+
+合起来就是：
+
+$$
+dp[item + 1][zero][one] =
+\max(
+dp[item][zero][one],\
+dp[item][zero - zero\_count][one - one\_count] + 1
+)
+$$
+
+第二项需要满足 `zero >= zero_count` 且 `one >= one_count`。
+
+### 初始化
+
+所有状态初始化为 0 即可。
+
+原因是这题问的是“最多使用 `zero` 个 0、`one` 个 1 时，最多能选多少个字符串”。即使不选任何字符串，也能得到一个合法子集，长度为 0。
+
+这一点和“刚好凑出目标”的题不同：
+
+- 2915 是刚好凑出 `target`，凑不出时要用 `kInvalid`。
+- 474 是最多不超过容量，什么都不选永远合法，所以初始化为 0。
+
+### 遍历顺序
+
+三维 DP 中：
+
+- 外层从 `item = 0` 到 `strs.size() - 1`，逐个处理真实字符串。
+- 中间枚举 `zero = 0..m`。
+- 内层枚举 `one = 0..n`。
+
+因为 `dp[item + 1][zero][one]` 只依赖上一行 `dp[item][...]`，所以三维写法里容量正序或逆序都可以。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用三维 0-1 背包求最多能选出的二进制字符串数量。
+     *
+     * @param strs 二进制字符串数组。
+     * @param m 最多允许使用的 0 的数量。
+     * @param n 最多允许使用的 1 的数量。
+     * @return 满足 0 和 1 数量限制的最大子集长度。
+     */
+    int findMaxForm(vector<string>& strs, int m, int n) {
+        const vector<array<int, 2>> costs = buildCosts(strs);
+        const int item_count = static_cast<int>(costs.size());
+        vector<vector<vector<int>>> dp(
+            item_count + 1,
+            vector<vector<int>>(m + 1, vector<int>(n + 1, 0)));
+
+        for (int item = 0; item < item_count; item++) {
+            const int zero_count = costs[item][0];
+            const int one_count = costs[item][1];
+
+            for (int zero = 0; zero <= m; zero++) {
+                for (int one = 0; one <= n; one++) {
+                    // 不选当前字符串：继承上一行最大长度。
+                    dp[item + 1][zero][one] = dp[item][zero][one];
+
+                    if (zero >= zero_count && one >= one_count) {
+                        // 选当前字符串：来源必须是上一行，保证每个字符串最多使用一次。
+                        dp[item + 1][zero][one] = max(
+                            dp[item + 1][zero][one],
+                            dp[item][zero - zero_count][one - one_count] + 1);
+                    }
+                }
+            }
+        }
+
+        return dp[item_count][m][n];
+    }
+
+private:
+    vector<array<int, 2>> buildCosts(const vector<string>& strs) {
+        vector<array<int, 2>> costs;
+        costs.reserve(strs.size());
+
+        for (const string& str : strs) {
+            int zero_count = 0;
+            int one_count = 0;
+            for (const char ch : str) {
+                if (ch == '0') {
+                    zero_count++;
+                } else {
+                    one_count++;
+                }
+            }
+            costs.push_back({zero_count, one_count});
+        }
+
+        return costs;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(strs.size() \times m \times n)$。
+- 空间复杂度：$O(strs.size() \times m \times n)$。
+
+### 空间优化
+
+三维转移只依赖上一层 `item`，所以可以压成二维：
+
+`dp[zero][one]` 表示当前已经处理过的字符串中，在最多使用 `zero` 个 `0`、`one` 个 `1` 的限制下，最多能选多少个字符串。
+
+处理当前字符串费用 `(zero_count, one_count)` 时：
+
+$$
+dp[zero][one] =
+\max(
+dp[zero][one],\
+dp[zero - zero\_count][one - one\_count] + 1
+)
+$$
+
+这是二维费用的 0-1 背包，所以两个容量都必须逆序遍历：
+
+```cpp
+for (int zero = m; zero >= zero_count; zero--) {
+    for (int one = n; one >= one_count; one--) {
+        ...
+    }
+}
+```
+
+原因和一维 0-1 背包一样：逆序遍历保证 `dp[zero - zero_count][one - one_count]` 还是处理当前字符串之前的旧状态。如果正序遍历，当前字符串可能在同一轮里被重复使用。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <utility>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维滚动 0-1 背包求最多能选出的二进制字符串数量。
+     *
+     * @param strs 二进制字符串数组。
+     * @param m 最多允许使用的 0 的数量。
+     * @param n 最多允许使用的 1 的数量。
+     * @return 满足 0 和 1 数量限制的最大子集长度。
+     */
+    int findMaxForm(vector<string>& strs, int m, int n) {
+        vector<vector<int>> dp(m + 1, vector<int>(n + 1, 0));
+
+        for (const string& str : strs) {
+            const pair<int, int> cost = countZerosAndOnes(str);
+            const int zero_count = cost.first;
+            const int one_count = cost.second;
+
+            // 两个容量都逆序遍历，避免同一个字符串在本轮被重复使用。
+            for (int zero = m; zero >= zero_count; zero--) {
+                for (int one = n; one >= one_count; one--) {
+                    dp[zero][one] = max(
+                        dp[zero][one],
+                        dp[zero - zero_count][one - one_count] + 1);
+                }
+            }
+        }
+
+        return dp[m][n];
+    }
+
+private:
+    pair<int, int> countZerosAndOnes(const string& str) {
+        int zero_count = 0;
+        int one_count = 0;
+        for (const char ch : str) {
+            if (ch == '0') {
+                zero_count++;
+            } else {
+                one_count++;
+            }
+        }
+        return {zero_count, one_count};
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(strs.size() \times m \times n)$。
+- 空间复杂度：$O(m \times n)$。
+
+### 这题的核心手感
+
+474 的核心，是把一个字符串看成一个带有两个费用的物品：
+
+$$
+str \rightarrow (zero\_count,\ one\_count)
+$$
+
+然后题目就变成：
+
+> 在 `0` 容量不超过 `m`、`1` 容量不超过 `n` 的前提下，最多选多少个字符串。
+
+它和 2915 的关系最像：
+
+- 2915：一个容量 `sum`，每个数字消耗 `num`，价值为 1。
+- 474：两个容量 `(zero, one)`，每个字符串消耗 `(zero_count, one_count)`，价值为 1。
+
+所以 474 可以理解成“二维容量版 2915”。转移仍然是 0-1 背包的老动作：
+
+- 不选当前字符串：状态保持。
+- 选当前字符串：两个容量同时扣掉，价值加 1。
+
+一维加法背包压缩后容量要逆序；二维费用背包压缩后，两个容量都要逆序。真正要守住的仍然是这句话：**每个字符串只能基于上一轮状态转移一次**。

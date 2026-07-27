@@ -644,12 +644,35 @@ $$
 
 ### 先把总体风险翻译成一句话
 
-先固定一组模型参数 $\theta$。模型拿到一个样本
-$(\mathbf{x},\mathbf{y})$ 后，会产生一个损失：
+先别急着看 $R(\theta)$。训练目标里最基础的东西其实是**损失函数**。
+
+模型拿到输入 $\mathbf{x}$ 后，会输出预测
+$f_\theta(\mathbf{x})$。但“预测”本身不一定是一个能直接优化的数字：
+
+- 回归任务里，预测可能是房价、温度、坐标；
+- 二分类任务里，预测可能是“属于正类的概率”；
+- 多分类任务里，预测可能是一组类别概率。
+
+为了训练模型，我们需要把“预测得好不好”变成一个标量。这个标量越小，表示预测越好；越大，表示预测越差。这个规则就叫**损失函数**，通常记为 $\ell$。
+
+例如：
+
+- 如果任务是预测房价，可以用平方误差：预测 $9$、真实 $10$，损失是 $(9-10)^2=1$；
+- 如果任务只关心分类对错，可以用 0–1 损失：预测错记 $1$，预测对记 $0$；
+- 如果任务是概率分类，可以惩罚“模型给真实标签的概率太低”：真实类别概率越小，损失越大。后面从最大似然推导交叉熵时，会正式得到这个选择。
+
+所以在这一节里，先把 $\ell$ 理解成：
+
+> **给定一次预测和真实答案后，用一个具体规则算出来的错误程度。**
+
+不同任务会选择不同的 $\ell$。为了先讲清“平均损失”这个框架，我们暂时不固定 $\ell$ 的具体公式，而是统一写成：
 
 $$
 \ell\bigl(f_\theta(\mathbf{x}),\mathbf{y}\bigr).
 $$
+
+先固定一组模型参数 $\theta$。模型拿到一个样本
+$(\mathbf{x},\mathbf{y})$ 后，就可以用上面的规则算出这个样本的损失。
 
 但未来会遇到很多不同样本，每个样本的损失也不同。因此我们真正关心的不是某一个样本损失，而是：
 
@@ -792,48 +815,32 @@ $$
 | 多分类 | Softmax 交叉熵 | 未来样本的平均负对数概率 |
 | 只关心对错 | 0–1 损失 | 未来样本的错误率 |
 
-所以当我们说“用交叉熵训练分类模型”时，更完整的说法是：
+上表里的“二元交叉熵”和“Softmax 交叉熵”现在可以先只当作名字。它们的共同思想是：**分类模型会给真实标签一个概率，真实标签概率越低，损失越大。** 后面讲最大似然时，会从这个思想推导出交叉熵的公式。
 
-> 把单样本损失 $\ell$ 选成交叉熵，然后最小化训练集上的经验风险
+所以当我们说“用交叉熵训练分类模型”时，更完整、更不容易误解的说法是：
+
+> 先把“单个样本错得有多严重”的规则 $\ell$ 选成适合分类的交叉熵；
+> 再把所有训练样本的 $\ell$ 取平均，最小化这个平均值，也就是经验风险
 > $\widehat R(\theta)$。
 
-公式写出来就是：
-
-$$
-\ell_i
-=
-H(\mathbf{q}_i,\mathbf{p}_i)
-=
--\sum_{j=1}^{K}q_{ij}\log p_{ij},
-$$
+暂时不写交叉熵的具体公式，只看层级关系：
 
 $$
 \widehat R(\theta)
 =
-\frac{1}{N}\sum_{i=1}^{N}\ell_i
-=
-\frac{1}{N}\sum_{i=1}^{N}
-H(\mathbf{q}_i,\mathbf{p}_i).
-$$
-
-如果标签是 one-hot，上式又等价于：
-
-$$
-\widehat R(\theta)
-=
--\frac{1}{N}
+\frac{1}{N}
 \sum_{i=1}^{N}
-\log p_\theta(y_i\mid\mathbf{x}_i).
+\ell_i.
 $$
 
-这正是平均负对数似然。因此链路应该理解为：
+后面会证明：在 one-hot 分类任务中，如果从最大似然原则出发，单样本损失会自然变成“真实标签概率的负对数”。把它写成向量形式，就是交叉熵。因此完整链路应该理解为：
 
 $$
 \text{最大似然原则}
 \Longrightarrow
 \text{选择负对数似然作为单样本损失}
-\Longleftrightarrow
-\text{one-hot 分类下的交叉熵}
+\Longrightarrow
+\text{把这个单样本损失写成交叉熵形式}
 \Longrightarrow
 \text{最小化经验风险 } \widehat R(\theta).
 $$
@@ -1227,6 +1234,144 @@ $$
 $$
 \Delta\mathbf{y}\approx\mathbf{J}_f\Delta\mathbf{x}.
 $$
+
+这句话可以按分量展开来看。设输入变化为：
+
+$$
+\Delta\mathbf{x}
+=
+\begin{bmatrix}
+\Delta x_1\\
+\Delta x_2\\
+\vdots\\
+\Delta x_d
+\end{bmatrix},
+\qquad
+\Delta\mathbf{y}
+=
+\begin{bmatrix}
+\Delta y_1\\
+\Delta y_2\\
+\vdots\\
+\Delta y_m
+\end{bmatrix}.
+$$
+
+矩阵乘法 $\mathbf{J}_f\Delta\mathbf{x}$ 的第 $i$ 行是：
+
+$$
+\Delta y_i
+\approx
+\frac{\partial y_i}{\partial x_1}\Delta x_1
++
+\frac{\partial y_i}{\partial x_2}\Delta x_2
++
+\cdots
++
+\frac{\partial y_i}{\partial x_d}\Delta x_d.
+$$
+
+它的意思是：**第 $i$ 个输出 $y_i$ 的微小变化，由所有输入分量的微小变化共同造成**。其中
+$\partial y_i/\partial x_j$ 表示：只轻轻改变 $x_j$，其他输入暂时不动时，$y_i$ 对这个方向有多敏感。
+
+如果写得更短一点：
+
+$$
+\Delta y_i
+\approx
+\sum_{j=1}^{d}
+\frac{\partial y_i}{\partial x_j}\Delta x_j.
+$$
+
+这和前面多元函数的梯度完全对应。区别只在于：
+
+- 前面讨论的是一个标量输出 $L(\mathbf{x})$，所以只有一组偏导数组成一个梯度
+  $\nabla_{\mathbf{x}}L$；
+- 这里讨论的是向量输出 $\mathbf{y}=f(\mathbf{x})$，有
+  $m$ 个输出，所以每个输出 $y_i$ 都有一组自己的梯度。
+
+也就是说，Jacobian 可以理解为：**把每个输出 $y_i$ 对输入
+$\mathbf{x}$ 的梯度一行一行叠起来**：
+
+$$
+\mathbf{J}_f
+=
+\begin{bmatrix}
+(\nabla_{\mathbf{x}}y_1)^{\mathsf T}\\
+(\nabla_{\mathbf{x}}y_2)^{\mathsf T}\\
+\vdots\\
+(\nabla_{\mathbf{x}}y_m)^{\mathsf T}
+\end{bmatrix}.
+$$
+
+举一个二维输入、二维输出的小例子：
+
+$$
+y_1=x_1^2+x_2,\qquad
+y_2=x_1x_2.
+$$
+
+那么：
+
+$$
+\mathbf{J}_f
+=
+\begin{bmatrix}
+\frac{\partial y_1}{\partial x_1} & \frac{\partial y_1}{\partial x_2}\\
+\frac{\partial y_2}{\partial x_1} & \frac{\partial y_2}{\partial x_2}
+\end{bmatrix}
+=
+\begin{bmatrix}
+2x_1 & 1\\
+x_2 & x_1
+\end{bmatrix}.
+$$
+
+如果在 $x_1=2,x_2=3$ 处，输入发生小变化
+$\Delta x_1=0.01,\Delta x_2=-0.02$，则：
+
+$$
+\mathbf{J}_f
+=
+\begin{bmatrix}
+4 & 1\\
+3 & 2
+\end{bmatrix},
+\qquad
+\Delta\mathbf{x}
+=
+\begin{bmatrix}
+0.01\\
+-0.02
+\end{bmatrix}.
+$$
+
+因此：
+
+$$
+\Delta\mathbf{y}
+\approx
+\begin{bmatrix}
+4 & 1\\
+3 & 2
+\end{bmatrix}
+\begin{bmatrix}
+0.01\\
+-0.02
+\end{bmatrix}
+=
+\begin{bmatrix}
+4\times0.01+1\times(-0.02)\\
+3\times0.01+2\times(-0.02)
+\end{bmatrix}
+=
+\begin{bmatrix}
+0.02\\
+-0.01
+\end{bmatrix}.
+$$
+
+这就是 $\Delta\mathbf{y}\approx\mathbf{J}_f\Delta\mathbf{x}$ 的具体含义：输入向量轻轻动一下，每个输出分量都会按照自己那一行偏导数做一次“加权求和”。
 
 若最终输出是标量损失 $L$，并且已经知道
 $\nabla_{\mathbf{y}}L$，这里的“已经知道”是指已经得到：
@@ -3475,15 +3620,55 @@ $$
 
 ## 从全批量梯度下降到随机梯度下降
 
-全训练集目标为：
+前面已经定义过经验风险：
 
 $$
+\widehat R(\theta)
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\ell\bigl(f_\theta(\mathbf{x}_i),\mathbf{y}_i\bigr).
+$$
+
+到了优化器这一章，大家通常会把“当前要优化的目标函数”简写成
+$F(\theta)$，只是为了公式更短。这里如果没有正则项，$F(\theta)$
+就是训练集经验风险 $\widehat R(\theta)$：
+
+$$
+F(\theta)=\widehat R(\theta).
+$$
+
+再把第 $i$ 条样本的损失简写成：
+
+$$
+\ell_i(\theta)
+=
+\ell\bigl(f_\theta(\mathbf{x}_i),\mathbf{y}_i\bigr).
+$$
+
+于是同一个目标可以写成更短的形式：
+
+$$
+\boxed{
 F(\theta)
 =
-\frac{1}{N}\sum_{i=1}^{N}\ell_i(\theta).
+\widehat R(\theta)
+=
+\frac{1}{N}\sum_{i=1}^{N}\ell_i(\theta)
+}
 $$
 
-完整梯度：
+所以这个公式和前面的风险公式不是两套东西，而是同一件事的两种记法：
+
+- 前面写 $\widehat R(\theta)$，强调它是用训练集估计总体风险 $R(\theta)$；
+- 这里写 $F(\theta)$，强调优化器只需要一个“要下降的目标函数”；
+- 前面写 $\ell(f_\theta(\mathbf{x}_i),\mathbf{y}_i)$，强调预测和真实标签如何进入损失；
+- 这里写 $\ell_i(\theta)$，只是把第 $i$ 条样本的所有固定数据藏进下标 $i$ 里，突出它只随参数 $\theta$ 变化。
+
+如果后面加入权重衰减这类正则项，$F(\theta)$ 也可以表示
+$\widehat R(\theta)$ 加上正则项后的完整训练目标。当前这一小节先讨论最基础的无正则情形。
+
+在这个记号下，完整梯度就是：
 
 $$
 \nabla F(\theta)
@@ -3491,7 +3676,11 @@ $$
 \frac{1}{N}\sum_{i=1}^{N}\nabla\ell_i(\theta).
 $$
 
-每更新一次都扫描全部数据，代价通常太高。因此从训练集中抽取大小为 $B$ 的 mini-batch $\mathcal{B}_t$：
+如果每更新一次都扫描全部训练集，这叫**全批量梯度下降**。它使用的方向是
+$\nabla F(\theta)$，也就是所有样本损失梯度的平均值。问题是数据集很大时，每一步都扫完整训练集，代价通常太高。
+
+因此实际训练经常从训练集中抽取大小为 $B$ 的 mini-batch
+$\mathcal{B}_t$，只用这一小批样本估计完整梯度：
 
 $$
 \mathbf{g}_t
@@ -3511,7 +3700,8 @@ $$
 
 在下面这些条件下：
 
-- 目标确实能写成逐样本平均 $F=N^{-1}\sum_i\ell_i$；
+- 目标确实能写成逐样本平均
+  $F(\theta)=\frac{1}{N}\sum_{i=1}^{N}\ell_i(\theta)$；
 - 给定当前参数 $\theta_t$ 后，batch 独立地从样本索引中均匀抽取；
 - 计算中没有 BatchNorm、对比损失等跨样本耦合项；
 
