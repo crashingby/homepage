@@ -60,7 +60,7 @@ flowchart LR
 
 ### 分类模型学的是一个有限标签分布
 
-上一篇文章中的单标签分类样本是 $(\mathbf{u}, y)$：输入 $mathbf{u}$ 可以是一张图片或一个固定维特征，标签 $y\in\{1,\ldots,C\}$ 由人工标注。分类网络产生 logits $\mathbf{z}\in\mathbb{R}^{C}$，再由 softmax 给出：
+上一篇文章中的单标签分类样本是 $(\mathbf{u}, y)$：输入 $\mathbf{u}$ 可以是一张图片或一个固定维特征，标签 $y\in\{1,\ldots,C\}$ 由人工标注。分类网络产生 logits $\mathbf{z}\in\mathbb{R}^{C}$，再由 softmax 给出：
 
 $$
 p_\theta(y=c\mid \mathbf{u})
@@ -208,7 +208,7 @@ $$
 \texttt{labels}=[x_0,x_1,x_2,x_3].
 $$
 
-模型计算得到四组 logits $[\mathbf z_0,\mathbf z_1,\mathbf z_2,\mathbf z_3]$。损失实际对齐为：
+模型计算得到四组 logits $[\mathbf{z}_0,\mathbf{z}_1,\mathbf{z}_2,\mathbf{z}_3]$。损失实际对齐为：
 
 | logits 的位置 | 条件前缀 | 被比较的目标 |
 | --- | --- | --- |
@@ -250,7 +250,7 @@ flowchart TB
     N --> O["logits: B × T × V"]
 ```
 
-图里的循环表示 decoder layer 会执行 $L$ 次：第 $\ell$ 层吃进 $\mathbf H^{(\ell)}$，输出 $\mathbf H^{(\ell+1)}$，再交给下一层。所有 layer 跑完之后，才进入最终 RMSNorm 和 `lm_head`；`lm_head` 是从隐藏维度 $d$ 到词表大小 $V$ 的出口，不属于 decoder layer 循环内部。
+图里的循环表示 decoder layer 会执行 $L$ 次：第 $\ell$ 层吃进 $\mathbf{H}^{(\ell)}$，输出 $\mathbf{H}^{(\ell+1)}$，再交给下一层。所有 layer 跑完之后，才进入最终 RMSNorm 和 `lm_head`；`lm_head` 是从隐藏维度 $d$ 到词表大小 $V$ 的出口，不属于 decoder layer 循环内部。
 
 在本地源码中，这条路径对应：
 
@@ -273,38 +273,38 @@ flowchart TB
 设词表大小为 $V$，隐藏维度为 $d$，词嵌入矩阵为：
 
 $$
-\mathbf E\in\mathbb R^{V\times d}.
+\mathbf{E}\in\mathbb R^{V\times d}.
 $$
 
-可以把 $\mathbf E$ 理解成一张“向量码表”：
+可以把 $\mathbf{E}$ 理解成一张“向量码表”：
 
 - 一共有 $V$ 行，每一行对应词表里的一个 token。
 - 每一行有 $d$ 个数，所以一个 token embedding 不是 $V$ 维 one-hot 向量，而是一个 $d$ 维稠密向量。
 - 这 $d$ 个维度是训练学出来的连续特征坐标。可以粗略理解为每个维度都承载某些语义、语法或上下文偏好的信息，但在大模型里它们通常是**分布式表示**：一个维度未必对应一个人类可命名的概念，一个概念也往往分散在许多维度上。
 
-第 $t$ 个 token id 为 $x_t$ 时，输入嵌入层做的是**按 id 查行**，取出 $\mathbf E$ 的第 $x_t$ 行作为初始隐藏向量：
+第 $t$ 个 token id 为 $x_t$ 时，输入嵌入层做的是**按 id 查行**，取出 $\mathbf{E}$ 的第 $x_t$ 行作为初始隐藏向量：
 
 $$
-\mathbf h_t^{(0)}=\mathbf E[x_t]\in\mathbb R^d.
+\mathbf{h}_t^{(0)}=\mathbf{E}[x_t]\in\mathbb R^d.
 $$
 
 如果一个 batch 的 `input_ids` 形状是 $B\times T$，那么 embedding lookup 之后得到的张量形状就是：
 
 $$
-\operatorname{Embedding}(\mathbf X)
+\operatorname{Embedding}(\mathbf{X})
 \in\mathbb R^{B\times T\times d}.
 $$
 
 也就是说，原来每个位置只有一个整数 id；经过 embedding 之后，每个位置都变成了一个 $d$ 维向量。后面的 self-attention、MLP 和 RMSNorm 处理的都是这些连续向量，而不是 token id 本身。
 
-从数学上看，如果令 $\mathbf e_{x_t}\in\{0,1\}^V$ 是 one-hot 向量，也可以写成：
+从数学上看，如果令 $\mathbf{e}_{x_t}\in\{0,1\}^V$ 是 one-hot 向量，也可以写成：
 
 $$
-\mathbf h_t^{(0)}
-=\mathbf e_{x_t}^{\mathsf T}\mathbf E.
+\mathbf{h}_t^{(0)}
+=\mathbf{e}_{x_t}^{\mathsf T}\mathbf{E}.
 $$
 
-这个写法说明了“按 id 查第 $x_t$ 行”和“one-hot 乘 embedding 矩阵”在数学上等价：one-hot 里只有第 $x_t$ 个位置是 $1$，矩阵乘法会把 $\mathbf E$ 的第 $x_t$ 行选出来。但真实实现不会构造 $V$ 维稀疏 one-hot 张量，因为那会浪费大量显存和计算；`nn.Embedding` 直接把 token id 当作索引，从权重矩阵中取出对应行。
+这个写法说明了“按 id 查第 $x_t$ 行”和“one-hot 乘 embedding 矩阵”在数学上等价：one-hot 里只有第 $x_t$ 个位置是 $1$，矩阵乘法会把 $\mathbf{E}$ 的第 $x_t$ 行选出来。但真实实现不会构造 $V$ 维稀疏 one-hot 张量，因为那会浪费大量显存和计算；`nn.Embedding` 直接把 token id 当作索引，从权重矩阵中取出对应行。
 
 反向传播时，来自输入 embedding 路径的梯度也只会更新本 batch 出现过的 token 对应行。若输入 embedding 和输出头权重绑定，输出头的 softmax 交叉熵还会通过词表竞争项给更多行带来梯度。
 
@@ -312,12 +312,12 @@ $$
 
 ### RMSNorm：只校准均方根，不减均值
 
-对任一 token 隐状态 $\mathbf h\in\mathbb R^d$，RMSNorm 计算：
+对任一 token 隐状态 $\mathbf{h}\in\mathbb R^d$，RMSNorm 计算：
 
 $$
-\operatorname{RMSNorm}(\mathbf h)
+\operatorname{RMSNorm}(\mathbf{h})
 =\boldsymbol\gamma\odot
-\frac{\mathbf h}{\sqrt{\frac1d\sum_{i=1}^{d}h_i^2+\varepsilon}},
+\frac{\mathbf{h}}{\sqrt{\frac1d\sum_{i=1}^{d}h_i^2+\varepsilon}},
 \qquad \boldsymbol\gamma\in\mathbb R^d.
 $$
 
@@ -328,29 +328,29 @@ $$
 Llama block 是 **Pre-Norm**，即先归一化再送进注意力/MLP：
 
 $$
-\widetilde{\mathbf H}^{(\ell)}
-=\operatorname{RMSNorm}_{\ell,1}(\mathbf H^{(\ell)}).
+\widetilde{\mathbf{H}}^{(\ell)}
+=\operatorname{RMSNorm}_{\ell,1}(\mathbf{H}^{(\ell)}).
 $$
 
-残差旁路仍直接保留 $\mathbf H^{(\ell)}$。这给深层网络留下一条较直接的梯度通道，是大规模 Transformer 稳定训练的重要结构选择。
+残差旁路仍直接保留 $\mathbf{H}^{(\ell)}$。这给深层网络留下一条较直接的梯度通道，是大规模 Transformer 稳定训练的重要结构选择。
 
 ### 多头投影与 GQA
 
 对一个 block 输入的归一化隐状态：
 
 $$
-\widetilde{\mathbf H}\in\mathbb R^{B\times T\times d},
+\widetilde{\mathbf{H}}\in\mathbb R^{B\times T\times d},
 $$
 
 先做三个线性投影。这里的投影还没有“分头”，只是把每个 token 的 $d$ 维向量映射成 Query、Key、Value 所需的长向量：
 
 $$
 \begin{aligned}
-\mathbf Q_{\text{flat}}&=\widetilde{\mathbf H}\mathbf W_Q
+\mathbf{Q}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_Q
 \in\mathbb R^{B\times T\times(Hd_h)},\\
-\mathbf K_{\text{flat}}&=\widetilde{\mathbf H}\mathbf W_K
+\mathbf{K}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_K
 \in\mathbb R^{B\times T\times(H_{kv}d_h)},\\
-\mathbf V_{\text{flat}}&=\widetilde{\mathbf H}\mathbf W_V
+\mathbf{V}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_V
 \in\mathbb R^{B\times T\times(H_{kv}d_h)}.
 \end{aligned}
 $$
@@ -359,8 +359,8 @@ $$
 
 $$
 \begin{aligned}
-&\mathbf W_Q\in\mathbb R^{d\times(Hd_h)},\\
-&\mathbf W_K,\mathbf W_V\in\mathbb R^{d\times(H_{kv}d_h)},\\
+&\mathbf{W}_Q\in\mathbb R^{d\times(Hd_h)},\\
+&\mathbf{W}_K,\mathbf{W}_V\in\mathbb R^{d\times(H_{kv}d_h)},\\
 &g(a)=\left\lfloor\frac{a}{H/H_{kv}}\right\rfloor,
 \qquad a\in\{0,\ldots,H-1\}.
 \end{aligned}
@@ -370,17 +370,17 @@ $$
 
 $$
 \begin{aligned}
-\mathbf Q
+\mathbf{Q}
 &=\operatorname{transpose}_{1,2}
-\bigl(\operatorname{reshape}(\mathbf Q_{\text{flat}},B,T,H,d_h)\bigr)
+\bigl(\operatorname{reshape}(\mathbf{Q}_{\text{flat}},B,T,H,d_h)\bigr)
 \in\mathbb R^{B\times H\times T\times d_h},\\
-\mathbf K
+\mathbf{K}
 &=\operatorname{transpose}_{1,2}
-\bigl(\operatorname{reshape}(\mathbf K_{\text{flat}},B,T,H_{kv},d_h)\bigr)
+\bigl(\operatorname{reshape}(\mathbf{K}_{\text{flat}},B,T,H_{kv},d_h)\bigr)
 \in\mathbb R^{B\times H_{kv}\times T\times d_h},\\
-\mathbf V
+\mathbf{V}
 &=\operatorname{transpose}_{1,2}
-\bigl(\operatorname{reshape}(\mathbf V_{\text{flat}},B,T,H_{kv},d_h)\bigr)
+\bigl(\operatorname{reshape}(\mathbf{V}_{\text{flat}},B,T,H_{kv},d_h)\bigr)
 \in\mathbb R^{B\times H_{kv}\times T\times d_h}.
 \end{aligned}
 $$
@@ -408,8 +408,8 @@ $$
 第 $a$ 个 Query 头使用第 $g(a)$ 个 KV 头。例如 8B 常见 $H=32,H_{kv}=8$，每 4 个 Query 头共享一组 $K,V$。源码中的 `num_key_value_groups = num_attention_heads // num_key_value_heads` 和 `repeat_kv` 正是这个映射；概念上可把 KV 沿头维复制成：
 
 $$
-\operatorname{repeat\_kv}(\mathbf K),
-\operatorname{repeat\_kv}(\mathbf V)
+\operatorname{repeat\_kv}(\mathbf{K}),
+\operatorname{repeat\_kv}(\mathbf{V})
 \in\mathbb R^{B\times H\times T\times d_h},
 $$
 
@@ -417,18 +417,18 @@ $$
 
 ### RoPE：把绝对位置变成旋转相位
 
-若没有位置编码，自注意力只依赖 token 向量集合，对调换顺序不敏感。Rotary Position Embedding（RoPE）不向 $\mathbf h_t$ 相加位置向量，而是在每个注意力头中，把 $Q,K$ 的通道成对组成二维平面，再按 token 的位置旋转这些二维向量。
+若没有位置编码，自注意力只依赖 token 向量集合，对调换顺序不敏感。Rotary Position Embedding（RoPE）不向 $\mathbf{h}_t$ 相加位置向量，而是在每个注意力头中，把 $Q,K$ 的通道成对组成二维平面，再按 token 的位置旋转这些二维向量。
 
 对某一层、某一个头、某一个 token，Query 向量可写成：
 
 $$
-\mathbf q_t\in\mathbb R^{d_h}.
+\mathbf{q}_t\in\mathbb R^{d_h}.
 $$
 
 这里先把“坐标”这个词说清楚。一个 $d_h$ 维向量本质上就是一串数：
 
 $$
-\mathbf x=[x_0,x_1,\ldots,x_{d_h-1}].
+\mathbf{x}=[x_0,x_1,\ldots,x_{d_h-1}].
 $$
 
 其中 $x_0$ 是第 0 个维度的值，$x_1$ 是第 1 个维度的值，这些维度也常被叫作向量的**坐标**。二维旋转一次只能作用在两个数上，比如平面坐标 $(x,y)$ 旋转后仍是两个数。因此 RoPE 的做法是：不要一次旋转整个 $d_h$ 维向量，而是先把它拆成许多组二维坐标，每组两个数，各自做一次二维旋转。
@@ -443,7 +443,7 @@ $$
 这里的 $m$ 是“可以拆出多少个二维组”，$i$ 表示**第 $i$ 个二维组**，不是序列位置。以一个很小的例子看，若 $d_h=8$，那么 $m=4$，向量可以写成：
 
 $$
-\mathbf x=[x_0,x_1,x_2,x_3,x_4,x_5,x_6,x_7].
+\mathbf{x}=[x_0,x_1,x_2,x_3,x_4,x_5,x_6,x_7].
 $$
 
 Transformers Llama 的实现会把前半段和后半段配对：
@@ -469,7 +469,7 @@ $$
 先看一个二维平面。对角度 $\phi$，旋转矩阵为：
 
 $$
-\mathbf R(\phi)=
+\mathbf{R}(\phi)=
 \begin{bmatrix}
 \cos\phi&-\sin\phi\\
 \sin\phi&\cos\phi
@@ -496,57 +496,57 @@ $$
 
 注意这里按 Transformers Llama 的实现习惯，把最后一维分成前半和后半，所以第 $i$ 对坐标是 $(i,i+m)$。有些 RoPE 讲解会把相邻维度 $(2i,2i+1)$ 作为一对；二者只差一个维度重排，本质都是把 $d_h$ 维向量拆成 $m$ 个二维平面。
 
-把所有二维平面的旋转矩阵放到一个 block diagonal（分块对角）矩阵里，就得到作用在整个头向量上的 $\mathbf R_t$：
+把所有二维平面的旋转矩阵放到一个 block diagonal（分块对角）矩阵里，就得到作用在整个头向量上的 $\mathbf{R}_t$：
 
 $$
-\widehat{\mathbf q}_t=\mathbf R_t\mathbf q_t,
+\widehat{\mathbf{q}}_t=\mathbf{R}_t\mathbf{q}_t,
 \qquad
-\widehat{\mathbf k}_t=\mathbf R_t\mathbf k_t.
+\widehat{\mathbf{k}}_t=\mathbf{R}_t\mathbf{k}_t.
 $$
 
 为什么 RoPE 能把绝对位置变成相对位置？关键是二维旋转矩阵满足：
 
 $$
-\mathbf R(\alpha)^{\mathsf T}=\mathbf R(-\alpha),
+\mathbf{R}(\alpha)^{\mathsf T}=\mathbf{R}(-\alpha),
 \qquad
-\mathbf R(\alpha)\mathbf R(\beta)=\mathbf R(\alpha+\beta).
+\mathbf{R}(\alpha)\mathbf{R}(\beta)=\mathbf{R}(\alpha+\beta).
 $$
 
 所以同一个二维平面上：
 
 $$
-\mathbf R(\phi_{t,i})^{\mathsf T}\mathbf R(\phi_{j,i})
-=\mathbf R(-\phi_{t,i})\mathbf R(\phi_{j,i})
-=\mathbf R(\phi_{j,i}-\phi_{t,i})
-=\mathbf R((j-t)\omega_i).
+\mathbf{R}(\phi_{t,i})^{\mathsf T}\mathbf{R}(\phi_{j,i})
+=\mathbf{R}(-\phi_{t,i})\mathbf{R}(\phi_{j,i})
+=\mathbf{R}(\phi_{j,i}-\phi_{t,i})
+=\mathbf{R}((j-t)\omega_i).
 $$
 
 把所有二维平面合起来，就得到：
 
 $$
-(\mathbf R_t\mathbf q_t)^{\mathsf T}(\mathbf R_j\mathbf k_j)
-=\mathbf q_t^{\mathsf T}\mathbf R_t^{\mathsf T}\mathbf R_j\mathbf k_j
-=\mathbf q_t^{\mathsf T}\mathbf R_{j-t}\mathbf k_j.
+(\mathbf{R}_t\mathbf{q}_t)^{\mathsf T}(\mathbf{R}_j\mathbf{k}_j)
+=\mathbf{q}_t^{\mathsf T}\mathbf{R}_t^{\mathsf T}\mathbf{R}_j\mathbf{k}_j
+=\mathbf{q}_t^{\mathsf T}\mathbf{R}_{j-t}\mathbf{k}_j.
 $$
 
 因此注意力分数虽然使用的是位置 $t$ 和 $j$ 的绝对旋转，但点积里只剩下相对位移 $j-t$。这就是 RoPE 的核心：**把绝对位置编码进旋转相位，让 Query-Key 点积自然感知相对距离**。
 
-Transformers 的 Llama 源码没有显式构造 $\mathbf R_t$ 这个大矩阵，而是生成 `cos/sin` 并用逐元素形式：
+Transformers 的 Llama 源码没有显式构造 $\mathbf{R}_t$ 这个大矩阵，而是生成 `cos/sin` 并用逐元素形式：
 
 $$
-\operatorname{RoPE}(\mathbf q)
-=\mathbf q\odot\cos\boldsymbol\phi
-+\operatorname{rotate\_half}(\mathbf q)\odot\sin\boldsymbol\phi,
+\operatorname{RoPE}(\mathbf{q})
+=\mathbf{q}\odot\cos\boldsymbol\phi
++\operatorname{rotate\_half}(\mathbf{q})\odot\sin\boldsymbol\phi,
 $$
 
 其中源码里的 `rotate_half` 是：
 
 $$
-\operatorname{rotate\_half}([\mathbf x^{(1)},\mathbf x^{(2)}])
-=[-\mathbf x^{(2)},\mathbf x^{(1)}],
+\operatorname{rotate\_half}([\mathbf{x}^{(1)},\mathbf{x}^{(2)}])
+=[-\mathbf{x}^{(2)},\mathbf{x}^{(1)}],
 $$
 
-其中 $\mathbf x^{(1)}=\mathbf x_{0:m}$，$\mathbf x^{(2)}=\mathbf x_{m:2m}$。源码先计算 `freqs`，再做 `emb = torch.cat((freqs, freqs), dim=-1)`，所以同一个 $\cos\phi_{t,i},\sin\phi_{t,i}$ 会同时出现在第 $i$ 维和第 $i+m$ 维。展开第 $i$ 对坐标：
+其中 $\mathbf{x}^{(1)}=\mathbf{x}_{0:m}$，$\mathbf{x}^{(2)}=\mathbf{x}_{m:2m}$。源码先计算 `freqs`，再做 `emb = torch.cat((freqs, freqs), dim=-1)`，所以同一个 $\cos\phi_{t,i},\sin\phi_{t,i}$ 会同时出现在第 $i$ 维和第 $i+m$ 维。展开第 $i$ 对坐标：
 
 $$
 \begin{aligned}
@@ -585,39 +585,39 @@ $$
 $$
 s_{t,j}^{a}
 =\frac{\left\langle
-\widehat{\mathbf q}_{t}^{a},
-\widehat{\mathbf k}_{j}^{g(a)}
+\widehat{\mathbf{q}}_{t}^{a},
+\widehat{\mathbf{k}}_{j}^{g(a)}
 \right\rangle}{\sqrt{d_h}}+M_{t,j}.
 $$
 
 这里写的是**单个 Query 向量和单个 Key 向量的点积**。点积就是对应维度相乘再相加：
 
 $$
-\left\langle \mathbf q,\mathbf k\right\rangle
+\left\langle \mathbf{q},\mathbf{k}\right\rangle
 =\sum_{r=0}^{d_h-1}q_rk_r.
 $$
 
-如果把向量都看成列向量，点积也常写成 $\mathbf q^{\mathsf T}\mathbf k$。这个转置只是列向量记法的要求，不是 attention 里额外做了一个复杂操作。为了避免混淆，单个位置的分数直接理解成“Query 和 Key 的相似度点积”就可以。
+如果把向量都看成列向量，点积也常写成 $\mathbf{q}^{\mathsf T}\mathbf{k}$。这个转置只是列向量记法的要求，不是 attention 里额外做了一个复杂操作。为了避免混淆，单个位置的分数直接理解成“Query 和 Key 的相似度点积”就可以。
 
 若把一个头里所有位置的 Query/Key 按行堆成矩阵：
 
 $$
-\widehat{\mathbf Q}^a\in\mathbb R^{T\times d_h},
+\widehat{\mathbf{Q}}^a\in\mathbb R^{T\times d_h},
 \qquad
-\widehat{\mathbf K}^{g(a)}\in\mathbb R^{T\times d_h},
+\widehat{\mathbf{K}}^{g(a)}\in\mathbb R^{T\times d_h},
 $$
 
 那么整张注意力分数矩阵就是更常见的形式：
 
 $$
-\mathbf S^a
-=\frac{\widehat{\mathbf Q}^a
-(\widehat{\mathbf K}^{g(a)})^{\mathsf T}}
-{\sqrt{d_h}}+\mathbf M
+\mathbf{S}^a
+=\frac{\widehat{\mathbf{Q}}^a
+(\widehat{\mathbf{K}}^{g(a)})^{\mathsf T}}
+{\sqrt{d_h}}+\mathbf{M}
 \in\mathbb R^{T\times T}.
 $$
 
-矩阵中第 $(t,j)$ 个元素正好是 $\left\langle \widehat{\mathbf q}_t^a,\widehat{\mathbf k}_j^{g(a)}\right\rangle$。所以单个位置看是向量点积；展开成矩阵批量计算时，为了一次得到所有 Query 位置对所有 Key 位置的分数，才写成 $QK^{\mathsf T}$。
+矩阵中第 $(t,j)$ 个元素正好是 $\left\langle \widehat{\mathbf{q}}_t^a,\widehat{\mathbf{k}}_j^{g(a)}\right\rangle$。所以单个位置看是向量点积；展开成矩阵批量计算时，为了一次得到所有 Query 位置对所有 Key 位置的分数，才写成 $QK^{\mathsf T}$。
 
 缩放 $1/\sqrt{d_h}$ 控制内积方差，避免 softmax 在头宽变大时过快饱和。纯因果掩码为：
 
@@ -629,7 +629,7 @@ M_{t,j}=
 \end{cases}
 $$
 
-经过 softmax 时，要特别注意归一化的维度。$\mathbf S^a\in\mathbb R^{T\times T}$ 的第 $t$ 行表示：**第 $t$ 个 Query 位置分别看向所有 Key 位置 $j=0,\ldots,T-1$ 的分数**。softmax 是按行做的，也就是每个 Query 位置独立归一化一组长度为 $T$ 的分数：
+经过 softmax 时，要特别注意归一化的维度。$\mathbf{S}^a\in\mathbb R^{T\times T}$ 的第 $t$ 行表示：**第 $t$ 个 Query 位置分别看向所有 Key 位置 $j=0,\ldots,T-1$ 的分数**。softmax 是按行做的，也就是每个 Query 位置独立归一化一组长度为 $T$ 的分数：
 
 $$
 \alpha_{t,j}^{a}
@@ -648,37 +648,37 @@ $$
 被遮蔽位置的分子为 $\exp(-\infty)=0$，故它们概率严格为零。输出是可见 Value 的加权和：
 
 $$
-\mathbf o_t^a=\sum_{j=0}^{t}\alpha_{t,j}^{a}\mathbf v_j^{g(a)}.
+\mathbf{o}_t^a=\sum_{j=0}^{t}\alpha_{t,j}^{a}\mathbf{v}_j^{g(a)}.
 $$
 
 对所有 batch、所有 Query 头并行算完后，注意力输出的形状是：
 
 $$
-\mathbf O\in\mathbb R^{B\times H\times T\times d_h}.
+\mathbf{O}\in\mathbb R^{B\times H\times T\times d_h}.
 $$
 
 它还不能直接加回残差流，因为残差流的布局是 $B\times T\times d$。因此需要把头维移回序列维后面，再把 $H$ 个头的 $d_h$ 维子空间拼回一个 $Hd_h=d$ 维向量：
 
 $$
-\mathbf O_{\text{cat}}
+\mathbf{O}_{\text{cat}}
 =\operatorname{reshape}
-\bigl(\operatorname{transpose}_{1,2}(\mathbf O),B,T,Hd_h\bigr)
+\bigl(\operatorname{transpose}_{1,2}(\mathbf{O}),B,T,Hd_h\bigr)
 \in\mathbb R^{B\times T\times(Hd_h)}.
 $$
 
-随后用输出投影 $\mathbf W_O$ 混合不同头的信息，并回到残差流维度：
+随后用输出投影 $\mathbf{W}_O$ 混合不同头的信息，并回到残差流维度：
 
 $$
-\operatorname{Attn}(\widetilde{\mathbf H})
-=\mathbf O_{\text{cat}}\mathbf W_O
+\operatorname{Attn}(\widetilde{\mathbf{H}})
+=\mathbf{O}_{\text{cat}}\mathbf{W}_O
 \in\mathbb R^{B\times T\times d},
-\qquad \mathbf W_O\in\mathbb R^{Hd_h\times d}.
+\qquad \mathbf{W}_O\in\mathbb R^{Hd_h\times d}.
 $$
 
 最后做第一个残差更新：
 
 $$
-\mathbf U=\mathbf H^{(\ell)}+\operatorname{Attn}(\widetilde{\mathbf H}^{(\ell)}).
+\mathbf{U}=\mathbf{H}^{(\ell)}+\operatorname{Attn}(\widetilde{\mathbf{H}}^{(\ell)}).
 $$
 
 训练时虽然模型在位置 $t$ 只能看见 $\le t$ 的 token，但所有 $t$ 的 $QK^{\mathsf T}$ 可以一次大矩阵乘法并行算出，再套上三角掩码。这就是“自回归生成必须逐 token 解码”与“自回归训练仍可并行处理整段已知文本”并不矛盾的原因。
@@ -691,22 +691,22 @@ $$
 
 $$
 \begin{aligned}
-\mathbf G&=\mathbf U'\mathbf W_{\mathrm{gate}},\\
-\mathbf A&=\mathbf U'\mathbf W_{\mathrm{up}},\\
+\mathbf{G}&=\mathbf{U}'\mathbf{W}_{\mathrm{gate}},\\
+\mathbf{A}&=\mathbf{U}'\mathbf{W}_{\mathrm{up}},\\
 \operatorname{SiLU}(z)&=z\,\sigma(z),\qquad
 \sigma(z)=\frac{1}{1+e^{-z}},\\
-\operatorname{MLP}(\mathbf U')
-&=\bigl(\operatorname{SiLU}(\mathbf G)\odot\mathbf A\bigr)
-\mathbf W_{\mathrm{down}},
+\operatorname{MLP}(\mathbf{U}')
+&=\bigl(\operatorname{SiLU}(\mathbf{G})\odot\mathbf{A}\bigr)
+\mathbf{W}_{\mathrm{down}},
 \end{aligned}
 $$
 
-其中 $\mathbf U'=\operatorname{RMSNorm}_{\ell,2}(\mathbf U)$，三个矩阵形状是：
+其中 $\mathbf{U}'=\operatorname{RMSNorm}_{\ell,2}(\mathbf{U})$，三个矩阵形状是：
 
 $$
-\mathbf W_{\mathrm{gate}},\mathbf W_{\mathrm{up}}\in\mathbb R^{d\times d_{ff}},
+\mathbf{W}_{\mathrm{gate}},\mathbf{W}_{\mathrm{up}}\in\mathbb R^{d\times d_{ff}},
 \qquad
-\mathbf W_{\mathrm{down}}\in\mathbb R^{d_{ff}\times d}.
+\mathbf{W}_{\mathrm{down}}\in\mathbb R^{d_{ff}\times d}.
 $$
 
 `gate_proj` 决定哪些中间特征通过，`up_proj` 提供被门控的内容，逐元素积完成动态门控；`down_proj` 把宽中间表示投回 $d$。源码的一行 `down_proj(act_fn(gate_proj(x)) * up_proj(x))` 与此完全对应。
@@ -714,8 +714,8 @@ $$
 再做第二个残差更新，得到下一层输入：
 
 $$
-\mathbf H^{(\ell+1)}
-=\mathbf U+\operatorname{MLP}(\operatorname{RMSNorm}_{\ell,2}(\mathbf U)).
+\mathbf{H}^{(\ell+1)}
+=\mathbf{U}+\operatorname{MLP}(\operatorname{RMSNorm}_{\ell,2}(\mathbf{U})).
 $$
 
 每层的注意力子层与 MLP 子层都保留残差连接。注意力的计算和序列长度二次相关，而 MLP 的计算随 $T\,d\,d_{ff}$ 线性增长；在不同模型规模、上下文长度下，两者会成为不同的主要算力瓶颈。
@@ -725,15 +725,15 @@ $$
 经过 $L$ 层后：
 
 $$
-\mathbf H_{\mathrm{final}}
-=\operatorname{RMSNorm}_{\mathrm{final}}(\mathbf H^{(L)}).
+\mathbf{H}_{\mathrm{final}}
+=\operatorname{RMSNorm}_{\mathrm{final}}(\mathbf{H}^{(L)}).
 $$
 
 语言模型头把每个位置的 $d$ 维向量映射到 $V$ 个 logits：
 
 $$
-\mathbf z_t=\mathbf h_{\mathrm{final},t}\mathbf W_{\mathrm{lm}}^{\mathsf T},
-\qquad \mathbf W_{\mathrm{lm}}\in\mathbb R^{V\times d}.
+\mathbf{z}_t=\mathbf{h}_{\mathrm{final},t}\mathbf{W}_{\mathrm{lm}}^{\mathsf T},
+\qquad \mathbf{W}_{\mathrm{lm}}\in\mathbb R^{V\times d}.
 $$
 
 第 $v$ 个分量 $z_{t,v}$ 不是概率，也不是 token id；它是“在当前前缀下选 vocabulary item $v$”的未归一化分数。softmax 才把它变成条件分布：
@@ -758,16 +758,16 @@ $$
 若权重绑定（weight tying），可令：
 
 $$
-\mathbf W_{\mathrm{lm}}=\mathbf E.
+\mathbf{W}_{\mathrm{lm}}=\mathbf{E}.
 $$
 
 这样输入“查表”和输出“给词表打分”共用同一词向量空间，减少参数。Transformers 中 `LlamaForCausalLM` 声明了可绑定的 `lm_head.weight` 与 `model.embed_tokens.weight`；是否实际绑定由 checkpoint/config 的 `tie_word_embeddings` 决定。不要把“代码支持绑定”与“所有 Llama checkpoint 都绑定”混为一谈。
 
 ## 损失与反向传播：梯度究竟怎样穿过 Llama
 
-### 单个位置的交叉熵梯度
+### 从单个位置到整个 batch 的交叉熵梯度
 
-对于位置 $t$ 的真实下一个 token $y=x_{t+1}$，令 one-hot 标签为 $\mathbf q$，即 $q_v=\mathbb 1[v=y]$。预测概率 $p_v=\operatorname{softmax}(\mathbf z)_v$，单点损失：
+对于位置 $t$ 的真实下一个 token $y=x_{t+1}$，令 one-hot 标签为 $\mathbf{q}$，即 $q_v=\mathbb 1[v=y]$。预测概率 $p_v=\operatorname{softmax}(\mathbf{z})_v$，单点损失：
 
 $$
 \ell_t=-\sum_{v=0}^{V-1}q_v\log p_v=-\log p_y.
@@ -781,47 +781,145 @@ $$
 
 这正是“预测概率减真实分布”。若正确词概率太低，$v=y$ 的梯度为负；梯度下降会增大 $z_{t,y}$。错误词概率越高，正梯度越大；梯度下降会压低其 logit。对有效 token 平均时，所有这些梯度再除以有效 token 数 $|\mathcal I|$。
 
-输出头的局部梯度随之得到：
+上面只是一个位置。训练时真正得到的是整段序列、整个 batch 的 logits：
 
 $$
-\frac{\partial\mathcal L}{\partial\mathbf W_{\mathrm{lm}}}
-=\sum_{(b,t)\in\mathcal I}
-\left(\frac{\partial\mathcal L}{\partial\mathbf z_{b,t}}\right)^{\mathsf T}
-\mathbf h_{b,t},
+\mathbf{Z}\in\mathbb R^{B\times T\times V}.
+$$
+
+因果语言模型会右移标签，所以位置 $t$ 的 logits 监督目标是：
+
+$$
+y_{b,t}=Y_{b,t+1}.
+$$
+
+如果 $y_{b,t}=-100$，说明这个目标被忽略，不参与损失。令有效监督位置集合为：
+
+$$
+\mathcal I=\{(b,t)\mid 0\le b<B,\ 0\le t<T-1,\ y_{b,t}\ne -100\},
+\qquad N_{\text{eff}}=|\mathcal I|.
+$$
+
+对每个有效位置，先对词表维做 softmax：
+
+$$
+p_{b,t,v}
+=\operatorname{softmax}(\mathbf{Z}_{b,t,:})_v
+=\frac{\exp Z_{b,t,v}}
+{\sum_{u=0}^{V-1}\exp Z_{b,t,u}}.
+$$
+
+整个 batch 的 token 平均交叉熵就是：
+
+$$
+\boxed{
+\mathcal L
+=-\frac{1}{N_{\text{eff}}}
+\sum_{(b,t)\in\mathcal I}
+\log p_{b,t,y_{b,t}}
+}
+$$
+
+也可以写成 one-hot 的交叉熵形式。令 $q_{b,t,v}=\mathbb 1[v=y_{b,t}]$，则：
+
+$$
+\mathcal L
+=-\frac{1}{N_{\text{eff}}}
+\sum_{(b,t)\in\mathcal I}
+\sum_{v=0}^{V-1}q_{b,t,v}\log p_{b,t,v}.
+$$
+
+因此对 logits 的梯度是：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial Z_{b,t,v}}
+=
+\begin{cases}
+\dfrac{1}{N_{\text{eff}}}\left(p_{b,t,v}-q_{b,t,v}\right),
+&(b,t)\in\mathcal I,\\
+0,&(b,t)\notin\mathcal I.
+\end{cases}
+}
+$$
+
+这就是单位置公式的 batch 版本：每个有效 token 都贡献一份 $p-q$，最后因为默认 `reduction="mean"` 再除以有效 token 数。若实现使用 `reduction="sum"`，则没有这个 $1/N_{\text{eff}}$。
+
+实际实现一般不会构造三维 one-hot 张量，而是把 logits 展平成二维矩阵：
+
+$$
+\mathbf{Z}_{\text{flat}}\in\mathbb R^{N_{\text{eff}}\times V},
 \qquad
-\frac{\partial\mathcal L}{\partial\mathbf h_{b,t}}
-=\frac{\partial\mathcal L}{\partial\mathbf z_{b,t}}
-\mathbf W_{\mathrm{lm}}.
+\mathbf{y}_{\text{flat}}\in\{0,\ldots,V-1\}^{N_{\text{eff}}},
 $$
 
-这里隐藏状态的梯度会继续反向穿过最终 RMSNorm、所有 Transformer block 和输入 embedding。
+然后调用交叉熵。`ignore_index=-100` 的位置在展平后被跳过，因此不会贡献 loss，也不会产生 logits 梯度。
+
+输出头的梯度也可以按有效 token 展平来看。设有效位置对应的隐藏状态为：
+
+$$
+\mathbf{H}_{\text{eff}}\in\mathbb R^{N_{\text{eff}}\times d},
+\qquad
+\mathbf{G}_{Z}
+=\frac{\partial\mathcal L}{\partial\mathbf{Z}_{\text{eff}}}
+\in\mathbb R^{N_{\text{eff}}\times V}.
+$$
+
+因为输出头是：
+
+$$
+\mathbf{Z}_{\text{eff}}
+=\mathbf{H}_{\text{eff}}\mathbf{W}_{\mathrm{lm}}^{\mathsf T},
+\qquad
+\mathbf{W}_{\mathrm{lm}}\in\mathbb R^{V\times d},
+$$
+
+所以输出头和隐藏状态的梯度为：
+
+$$
+\frac{\partial\mathcal L}{\partial\mathbf{W}_{\mathrm{lm}}}
+=\mathbf{G}_{Z}^{\mathsf T}\mathbf{H}_{\text{eff}}
+\in\mathbb R^{V\times d},
+\qquad
+\frac{\partial\mathcal L}{\partial\mathbf{H}_{\text{eff}}}
+=\mathbf{G}_{Z}\mathbf{W}_{\mathrm{lm}}
+\in\mathbb R^{N_{\text{eff}}\times d}.
+$$
+
+这里得到的隐藏状态梯度会按原来的 batch/sequence 位置放回 $\mathbb R^{B\times T\times d}$，无效位置填零，然后继续反向穿过最终 RMSNorm、所有 Transformer block 和输入 embedding。
 
 ### 反向传播不是“手写每层求导”，而是反向累积向量-Jacobian 积
 
 把整个模型写成：
 
 $$
-\mathbf Z=f_\theta(\mathbf X),\qquad
-\mathcal L=\ell(\mathbf Z,\mathbf Y).
+\mathbf{Z}=f_\theta(\mathbf{X}),\qquad
+\mathcal L=\ell(\mathbf{Z},\mathbf{Y}).
 $$
+
+这里的粗体大写表示一整个 batch 的张量：
+
+- $\mathbf{X}$ 是输入 token id 矩阵，也就是 `input_ids`，形状通常是 $B\times T$。
+- $\mathbf{Y}$ 是标签矩阵，也就是 `labels`，形状也是 $B\times T$。在因果语言模型里它通常先复制自 `input_ids`，再把 padding 或不计损失的位置改成 `-100`；真正计算损失时会右移，让位置 $t$ 的 logits 去预测 $Y_{t+1}$。
+- $\mathbf{Z}$ 是模型输出的 logits，形状是 $B\times T\times V$。
 
 链式法则给出：
 
 $$
 \nabla_\theta\mathcal L
-=\left(\frac{\partial\mathbf Z}{\partial\theta}\right)^{\mathsf T}
-\nabla_{\mathbf Z}\mathcal L.
+=\left(\frac{\partial\mathbf{Z}}{\partial\theta}\right)^{\mathsf T}
+\nabla_{\mathbf{Z}}\mathcal L.
 $$
 
 全 Jacobian 大到不可显式存储。PyTorch autograd 从标量 `loss` 开始，按计算图反向执行每个算子的 vector-Jacobian product（VJP），只传播“下游损失对当前输出的梯度”。这与上一篇中线性层、激活函数的反向传播是同一件事，只是计算图换成了更深、更宽、更复杂的 Transformer。
 
 几个容易混淆的梯度路径是：
 
-- **残差相加**：若 $\mathbf y=\mathbf x+g(\mathbf x)$，则 $\nabla_{\mathbf x}\mathcal L$ 同时收到恒等路径的梯度和 $g$ 路径的梯度。恒等项有助于深层梯度传递。
+- **残差相加**：若 $\mathbf{y}=\mathbf{x}+g(\mathbf{x})$，则 $\nabla_{\mathbf{x}}\mathcal L$ 同时收到恒等路径的梯度和 $g$ 路径的梯度。恒等项有助于深层梯度传递。
 - **注意力 softmax**：一个 attention score 的变化会改变同一行所有 attention weights，因为它们分母共享；它不是逐元素独立激活。因果 mask 的位置在前向概率为零，对应边不参与有意义的梯度传递。
 - **$Q,K,V$ 投影**：注意力输出对 $Q,K,V$ 都有梯度；其中 $Q,K$ 通过分数影响“看哪里”，$V$ 通过加权和影响“取什么内容”。GQA 共享的 $K,V$ 头会累加来自多个 Query 头的梯度。
 - **RoPE**：cos/sin 由固定位置和超参数确定，通常不是可训练量；梯度会通过正交旋转回传到原始 $Q,K$。
-- **embedding 查表**：对于 id 为 $x_t$ 的行，梯度会累加到 $\mathbf E[x_t]$；同一 token 在不同位置出现，会对同一参数行累加贡献。
+- **embedding 查表**：对于 id 为 $x_t$ 的行，梯度会累加到 $\mathbf{E}[x_t]$；同一 token 在不同位置出现，会对同一参数行累加贡献。
 - **RMSNorm**：分母依赖整个隐藏维，所以某一维的梯度会通过均方根耦合到同一 token 的其他维；它不跨 token 混合信息。
 
 ### 一个训练 step 的准确顺序
@@ -863,16 +961,16 @@ optimizer.zero_grad(set_to_none=True)
 
 ### AdamW 如何把梯度变成参数更新
 
-把本次得到的梯度记为 $\mathbf g_t=\nabla_\theta\mathcal L_t$。常用 AdamW 维护一阶、二阶矩估计：
+把本次得到的梯度记为 $\mathbf{g}_t=\nabla_\theta\mathcal L_t$。常用 AdamW 维护一阶、二阶矩估计：
 
 $$
 \begin{aligned}
-\mathbf m_t&=\beta_1\mathbf m_{t-1}+(1-\beta_1)\mathbf g_t,\\
-\mathbf v_t&=\beta_2\mathbf v_{t-1}+(1-\beta_2)\mathbf g_t^{\odot2},\\
-\widehat{\mathbf m}_t&=\frac{\mathbf m_t}{1-\beta_1^t},\qquad
-\widehat{\mathbf v}_t=\frac{\mathbf v_t}{1-\beta_2^t},\\
+\mathbf{m}_t&=\beta_1\mathbf{m}_{t-1}+(1-\beta_1)\mathbf{g}_t,\\
+\mathbf{v}_t&=\beta_2\mathbf{v}_{t-1}+(1-\beta_2)\mathbf{g}_t^{\odot2},\\
+\widehat{\mathbf{m}}_t&=\frac{\mathbf{m}_t}{1-\beta_1^t},\qquad
+\widehat{\mathbf{v}}_t=\frac{\mathbf{v}_t}{1-\beta_2^t},\\
 \theta_{t+1}&=(1-\eta_t\lambda)\theta_t
--\eta_t\frac{\widehat{\mathbf m}_t}{\sqrt{\widehat{\mathbf v}_t}+\epsilon}.
+-\eta_t\frac{\widehat{\mathbf{m}}_t}{\sqrt{\widehat{\mathbf{v}}_t}+\epsilon}.
 \end{aligned}
 $$
 
@@ -932,9 +1030,9 @@ flowchart LR
 设全局 batch 有 $B_g$ 条、每条 $T$ token，global batch token 数为近似 $N_{\text{tok}}=B_gT$（扣除 padding/掩码后为有效 token 数）。一次迭代可以拆成：
 
 1. 数据 worker 读取并随机抽取文档，tokenize、加入边界 token、打包成长度 $T$ 的整数张量。
-2. 每张 GPU 取得一个 micro-batch $(\mathbf X,\mathbf A,\mathbf Y)$：`input_ids` 为 $(B,T)$，`attention_mask` 表示上下文可见性，`labels` 通常复制 `input_ids` 后将忽略位置置 `-100`。
-3. 模型并行计算所有位置 logits $\mathbf Z\in\mathbb R^{B\times T\times V}$；没有任何位置直接读取“未来的真实 token”。
-4. 损失函数在逻辑上把 $mathbf Z[:,0:T-1,:]$ 和 $mathbf Y[:,1:T]$ 比较，仅对有效目标求平均。
+2. 每张 GPU 取得一个 micro-batch $(\mathbf{X},\mathbf{A},\mathbf{Y})$：$\mathbf{X}$ 是 `input_ids`，形状为 $(B,T)$；$\mathbf{A}$ 是 `attention_mask`，表示上下文可见性；$\mathbf{Y}$ 是 `labels`，通常复制 `input_ids` 后将忽略位置置 `-100`。
+3. 模型并行计算所有位置 logits $\mathbf{Z}\in\mathbb R^{B\times T\times V}$；没有任何位置直接读取“未来的真实 token”。
+4. 损失函数在逻辑上把 $\mathbf{Z}[:,0:T-1,:]$ 和 $\mathbf{Y}[:,1:T]$ 比较，仅对有效目标求平均。
 5. autograd 得到局部梯度；数据并行组对同名参数梯度求和/平均。若做梯度累积，先重复若干 micro-batch 的 2--4，再同步和更新。
 6. 优化器更新 $\theta$，学习率调度器推进；按固定 token 间隔记录指标、在一致状态点保存模型、优化器和数据进度。
 
@@ -983,12 +1081,12 @@ Meta 对 Llama 3 公开描述的后训练组合包括 SFT、rejection sampling�
 
 ## 复习：把整套机制压缩成七个等式
 
-1. **自回归分解**：$p_\theta(\mathbf x)=\prod_t p_\theta(x_t\mid x_{<t})$。
-2. **嵌入**：$\mathbf h_t^{(0)}=\mathbf E[x_t]$。
+1. **自回归分解**：$p_\theta(\mathbf{x})=\prod_t p_\theta(x_t\mid x_{<t})$。
+2. **嵌入**：$\mathbf{h}_t^{(0)}=\mathbf{E}[x_t]$。
 3. **RoPE 注意力**：$\operatorname{softmax}(\widehat Q\widehat K^{\mathsf T}/\sqrt{d_h}+M)V$。
 4. **因果约束**：$M_{t,j}=-\infty$ 当 $j>t$（packed 时还要求同一文档）。
-5. **Llama block**：$\mathbf U=\mathbf H+\operatorname{Attn}(\operatorname{RMSNorm}(\mathbf H))$，$\mathbf H'=\mathbf U+\operatorname{SwiGLU}(\operatorname{RMSNorm}(\mathbf U))$。
-6. **词表分布**：$p(v\mid x_{\le t})=\operatorname{softmax}(\mathbf h_t\mathbf W_{lm}^{\mathsf T})_v$。
+5. **Llama block**：$\mathbf{U}=\mathbf{H}+\operatorname{Attn}(\operatorname{RMSNorm}(\mathbf{H}))$，$\mathbf{H}'=\mathbf{U}+\operatorname{SwiGLU}(\operatorname{RMSNorm}(\mathbf{U}))$。
+6. **词表分布**：$p(v\mid x_{\le t})=\operatorname{softmax}(\mathbf{h}_t\mathbf{W}_{lm}^{\mathsf T})_v$。
 7. **训练目标**：$\mathcal L=-\frac1{|\mathcal I|}\sum_{(b,t)\in\mathcal I}\log p_\theta(x_{t+1}^{(b)}\mid x_{\le t}^{(b)})$，并由 $\nabla_\theta\mathcal L$ 经 AdamW 更新参数。
 
 只要能沿着这七步说清一个 token 怎样变成概率、真实下一个 token 怎样变成交叉熵、这个标量怎样对所有投影矩阵和 embedding 产生梯度，就已经掌握了 Llama 类大模型预训练的数学主线。
@@ -998,4 +1096,4 @@ Meta 对 Llama 3 公开描述的后训练组合包括 SFT、rejection sampling�
 - [Meta：Introducing Meta Llama 3](https://ai.meta.com/blog/meta-llama-3/)：Llama 3 的公开架构、数据规模、8,192 序列与文档边界掩码、并行训练和后训练概述。
 - [The Llama 3 Herd of Models](https://arxiv.org/abs/2407.21783)：Llama 3 系列的正式技术报告。
 - [Hugging Face Transformers：Llama 文档](https://huggingface.co/docs/transformers/model_doc/llama)：`LlamaModel` / `LlamaForCausalLM` 输入、输出、`labels` 与 KV cache 的 API 语义。
-- 本机源码：`~/miniconda3/envs/dl/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py` 与 `transformers/loss/loss_utils.py`，核对版本为 Transformers 5.9.0。
+- 源码：`transformers/models/llama/modeling_llama.py` 与 `transformers/loss/loss_utils.py`，核对版本为 Transformers 5.9.0。
