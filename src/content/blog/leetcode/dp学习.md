@@ -8618,3 +8618,713 @@ $$
 - 选当前字符串：两个容量同时扣掉，价值加 1。
 
 一维加法背包压缩后容量要逆序；二维费用背包压缩后，两个容量都要逆序。真正要守住的仍然是这句话：**每个字符串只能基于上一轮状态转移一次**。
+
+## [3180. 执行操作可获得的最大总奖励 I - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-total-reward-using-operations-i/description/)
+
+给你一个整数数组 `rewardValues`，长度为 `n`，代表奖励的值。
+
+最初，你的总奖励 `x` 为 0。你可以执行任意次操作：选择一个未标记下标 `i`，如果 `rewardValues[i] > x`，就把 `rewardValues[i]` 加到 `x` 上，并标记该下标。
+
+返回执行最优操作能够获得的最大总奖励。
+
+示例 1：
+
+```text
+输入：rewardValues = [1,1,3,3]
+输出：4
+解释：依次标记下标 0 和 2，总奖励为 4。
+```
+
+示例 2：
+
+```text
+输入：rewardValues = [1,6,4,3,2]
+输出：11
+解释：依次标记下标 0、2 和 1，总奖励为 11。
+```
+
+提示：
+
+- `1 <= rewardValues.length <= 2000`
+- `1 <= rewardValues[i] <= 2000`
+
+这题看起来不像背包，因为它多了一个条件：只有当 `rewardValues[i] > 当前总奖励 x` 时，才能选择这个奖励。
+
+但如果把状态定义成“当前总奖励能不能被凑出来”，它仍然可以转成 0-1 背包。
+
+### 题目如何转成 0-1 背包？
+
+先观察两个关键点。
+
+**第一，奖励值可以排序后处理。**
+
+如果已经决定要选一组奖励，那么把它们按从小到大尝试，总是更自然。因为当前总奖励越小，越容易满足：
+
+$$
+reward > current\_sum
+$$
+
+所以我们先对 `rewardValues` 排序，再按从小到大处理每个奖励。
+
+**第二，状态可以写成“某个总奖励是否可达”。**
+
+设当前已经处理过一些奖励，如果某个总奖励 `sum` 是可达的，那么面对当前奖励 `value`：
+
+- 不选它：`sum` 仍然可达。
+- 选它：只有当 `sum < value` 时才能选，选完后新总奖励变成 `sum + value`。
+
+这就是 0-1 背包：
+
+- **物品**：每个奖励值 `rewardValues[i]`。
+- **状态容量**：当前总奖励 `sum`。
+- **0-1 约束**：每个下标最多标记一次。
+- **选择条件**：只有旧状态 `sum < rewardValues[i]` 时，才能选当前奖励。
+- **目标**：找最大的可达总奖励。
+
+这和普通背包的差别在于，普通背包通常是“容量够就能选”；本题是“当前总奖励必须比奖励值小才能选”。
+
+### 状态范围
+
+设最大奖励为 `max_reward`。如果最后一次选择的奖励是 `last_reward`，那么选择它之前的总奖励一定满足：
+
+$$
+previous\_sum < last\_reward
+$$
+
+所以最终总奖励：
+
+$$
+final\_sum = previous\_sum + last\_reward < 2 \times last\_reward \le 2 \times max\_reward
+$$
+
+因此所有可能答案都小于 `2 * max_reward`。在本题约束下，`max_reward <= 2000`，所以状态范围最多也就 4000 左右。
+
+### 递归切入（探索逻辑）
+
+先从递归想。排序后，站在 `rewardValues[index]` 面前，还是只有两个选择：选或不选。
+
+定义 `dfs(index, current_sum)` 表示：从下标 `index` 开始考虑奖励，当前总奖励为 `current_sum`，后面最多还能额外获得多少奖励。
+
+递归边界：
+
+- 如果 `index == rewardValues.size()`，说明奖励都看完了，返回 0。
+
+站在当前奖励 `rewardValues[index]` 面前：
+
+- **不选当前奖励**：额外收益来自 `dfs(index + 1, current_sum)`。
+- **选当前奖励**：前提是 `current_sum < rewardValues[index]`，额外收益来自 `rewardValues[index] + dfs(index + 1, current_sum + rewardValues[index])`。
+
+递归表达式：
+
+$$
+dfs(index, current\_sum) =
+\max(
+dfs(index + 1, current\_sum),\
+rewardValues[index] + dfs(index + 1, current\_sum + rewardValues[index])
+)
+$$
+
+第二项需要满足 `current_sum < rewardValues[index]`。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求执行操作可获得的最大总奖励。
+     *
+     * @param rewardValues 奖励值数组。
+     * @return 可以获得的最大总奖励。
+     */
+    int maxTotalReward(vector<int>& rewardValues) {
+        sort(rewardValues.begin(), rewardValues.end());
+        const int reward_limit = rewardValues.back() * 2;
+        vector<vector<int>> memo(
+            rewardValues.size(),
+            vector<int>(reward_limit, -1));
+        return dfs(rewardValues, memo, 0, 0);
+    }
+
+private:
+    int dfs(
+        const vector<int>& rewardValues,
+        vector<vector<int>>& memo,
+        int index,
+        int current_sum) {
+        if (index == static_cast<int>(rewardValues.size())) {
+            return 0;
+        }
+
+        int& cached = memo[index][current_sum];
+        if (cached != -1) {
+            return cached;
+        }
+
+        // 不选当前奖励。
+        cached = dfs(rewardValues, memo, index + 1, current_sum);
+
+        const int reward = rewardValues[index];
+        if (current_sum < reward) {
+            // 选当前奖励。index 向后移动，保证每个下标最多使用一次。
+            cached = max(
+                cached,
+                reward + dfs(rewardValues, memo, index + 1, current_sum + reward));
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归里，`current_sum` 就是当前总奖励。它不像传统背包那样从目标容量往回扣，而是从当前可达总奖励往前扩展。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][sum]` 表示只考虑前 `i` 个排序后的奖励时，能否得到总奖励 `sum`。
+
+最终答案是所有可达 `sum` 中的最大值。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实奖励 `rewardValues[item]`。
+
+`dp[item]` 表示还没处理 `rewardValues[item]` 之前的状态，`dp[item + 1]` 表示处理完 `rewardValues[item]` 之后的状态。
+
+设当前奖励为 `reward`。
+
+- **不选当前奖励**：旧的可达总奖励继续可达。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前奖励**：只有当旧总奖励 `sum < reward` 时，才能从 `sum` 转到 `sum + reward`。
+
+$$
+dp[item + 1][sum + reward] \leftarrow dp[item][sum]
+$$
+
+合起来就是：
+
+```text
+如果 dp[item][sum] 为 true：
+    dp[item + 1][sum] = true
+    如果 sum < reward：
+        dp[item + 1][sum + reward] = true
+```
+
+这题的状态转移和前面几道不同：前面通常是从“目标状态”反推来源，例如 `sum - num`；这里更自然的是从“旧可达状态”向外扩展。
+
+### 初始化
+
+- `dp[0][0] = true`：不选任何奖励时，总奖励为 0。
+- 其他状态初始化为 `false`。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `rewardValues.size() - 1`，逐个处理排序后的奖励。
+- 内层枚举所有可达总奖励 `sum`。
+
+因为 `dp[item + 1][...]` 只依赖上一行 `dp[item][...]`，所以二维写法里 `sum` 正序或逆序都可以。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维可达性 DP 求执行操作可获得的最大总奖励。
+     *
+     * @param rewardValues 奖励值数组。
+     * @return 可以获得的最大总奖励。
+     */
+    int maxTotalReward(vector<int>& rewardValues) {
+        sort(rewardValues.begin(), rewardValues.end());
+        const int reward_limit = rewardValues.back() * 2;
+        const int reward_count = static_cast<int>(rewardValues.size());
+
+        vector<vector<char>> dp(reward_count + 1, vector<char>(reward_limit, 0));
+        dp[0][0] = 1;
+
+        int answer = 0;
+        for (int item = 0; item < reward_count; item++) {
+            const int reward = rewardValues[item];
+
+            for (int sum = 0; sum < reward_limit; sum++) {
+                if (!dp[item][sum]) {
+                    continue;
+                }
+
+                // 不选当前奖励：旧总奖励继续可达。
+                dp[item + 1][sum] = 1;
+                answer = max(answer, sum);
+
+                if (sum < reward) {
+                    // 选当前奖励：只有旧总奖励小于当前奖励时才合法。
+                    const int next_sum = sum + reward;
+                    dp[item + 1][next_sum] = 1;
+                    answer = max(answer, next_sum);
+                }
+            }
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times max\_reward)$。
+- 空间复杂度：$O(n \times max\_reward)$。
+
+这里状态上界实际是 `2 * max_reward`，所以写成 $O(n \times max\_reward)$。
+
+### 空间优化
+
+二维转移只依赖上一行，所以可以压成一维：
+
+`dp[sum]` 表示当前已经处理过的奖励中，总奖励 `sum` 是否可达。
+
+处理当前奖励 `reward` 时，只能从旧状态 `sum < reward` 转移到 `sum + reward`：
+
+$$
+dp[sum + reward] \leftarrow dp[sum]
+$$
+
+这题的一维优化有点特别：它不需要普通加法背包那种从大到小枚举 `sum`。
+
+原因是当前奖励只能从来源区间：
+
+$$
+[0,\ reward)
+$$
+
+转移到新区间：
+
+$$
+[reward,\ 2 \times reward)
+$$
+
+新产生的状态一定不在本轮来源区间里，所以不会被当前奖励再次使用。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维可达性 DP 求执行操作可获得的最大总奖励。
+     *
+     * @param rewardValues 奖励值数组。
+     * @return 可以获得的最大总奖励。
+     */
+    int maxTotalReward(vector<int>& rewardValues) {
+        sort(rewardValues.begin(), rewardValues.end());
+        const int reward_limit = rewardValues.back() * 2;
+        vector<char> dp(reward_limit, 0);
+        dp[0] = 1;
+
+        int answer = 0;
+        for (const int reward : rewardValues) {
+            // 只有旧总奖励小于当前奖励时，才能选择当前奖励。
+            for (int sum = 0; sum < reward; sum++) {
+                if (!dp[sum]) {
+                    continue;
+                }
+
+                const int next_sum = sum + reward;
+                dp[next_sum] = 1;
+                answer = max(answer, next_sum);
+            }
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times max\_reward)$。
+- 空间复杂度：$O(max\_reward)$。
+
+### 这题的核心手感
+
+3180 的核心，是把操作条件：
+
+$$
+reward > current\_sum
+$$
+
+翻译成 DP 转移条件：
+
+$$
+如果\ dp[sum]\ 为真且\ sum < reward,\ 那么\ dp[sum + reward]\ 为真
+$$
+
+所以它不是普通的“容量够就选”，而是“当前总奖励足够小才能选”。
+
+它和前面背包题的关系是：
+
+- 416：可达性 DP，问能不能凑出某个和。
+- 2915：最大长度 DP，问刚好凑出某个和时最多选几个。
+- 3180：可达性 DP，问哪些总奖励可以通过合法操作得到，然后取最大可达值。
+
+这题最值得记住的点有两个：
+
+- **先排序**：从小到大处理奖励，能把“任意操作顺序”整理成稳定的 DP 顺序。
+- **来源受限**：处理奖励 `reward` 时，只能从 `sum < reward` 的旧状态转移。
+
+普通 0-1 背包的一维优化常靠逆序遍历保护旧状态；3180 由于来源区间 `[0, reward)` 和新状态区间 `[reward, 2 * reward)` 天然分开，所以可以直接原地更新。真正不变的原则仍然是：**当前物品只能从本轮之前已经存在的状态转移一次**。
+
+## 基础完全背包（和 0-1 背包对照）
+
+完全背包可以看作 0-1 背包的一个重要变体。
+
+0-1 背包里，每个物品最多只能选一次；完全背包里，每个物品可以选任意多次。
+
+给定 `n` 种物品和一个容量为 `capacity` 的背包。第 `i` 种物品有重量 `weight[i]` 和价值 `value[i]`，每种物品可以选择任意多个。请问在不超过背包容量的前提下，最多能获得多少总价值？
+
+示例：
+
+```text
+输入：
+capacity = 6
+weight = [2, 3]
+value  = [4, 5]
+
+输出：
+12
+
+解释：
+选择 3 个重量为 2 的物品，总重量为 6，总价值为 12。
+```
+
+这题的框架仍然沿用前面的背包流程：递归切入、状态定义、状态转移、初始化、遍历顺序、空间优化。真正要抓住的是：**选当前物品之后，是否还能继续选当前物品**。
+
+### 题目如何转成背包？
+
+完全背包的语义很直接：
+
+- **物品**：每一种物品。
+- **重量**：`weight[i]`。
+- **价值**：`value[i]`。
+- **背包容量**：`capacity`。
+- **完全约束**：每种物品可以选任意多次。
+- **目标**：在容量不超过 `capacity` 的前提下，最大化总价值。
+
+和 0-1 背包相比，唯一变化就是“选完当前物品后还能不能继续选它”：
+
+- 0-1 背包：选了第 `item` 个物品后，下一步必须去 `item + 1`。
+- 完全背包：选了第 `item` 个物品后，下一步仍然可以留在 `item`，继续选同一种物品。
+
+### 递归切入（探索逻辑）
+
+先从递归想。定义 `dfs(index, cap)` 表示：从第 `index` 种物品开始考虑，当前背包剩余容量为 `cap` 时，最多还能获得多少价值。
+
+站在第 `index` 种物品面前，有两个选择：
+
+- **不选当前物品**：跳到下一种物品，答案来自 `dfs(index + 1, cap)`。
+- **选当前物品**：前提是 `cap >= weight[index]`，答案来自 `dfs(index, cap - weight[index]) + value[index]`。
+
+注意第二项仍然是 `dfs(index, ...)`，不是 `dfs(index + 1, ...)`。这就是完全背包和 0-1 背包的根本区别：**选了当前物品之后，还可以继续选当前物品**。
+
+递归边界：
+
+- 如果 `index == weight.size()`，说明所有物品种类都看完了，返回 0。
+- 如果 `cap == 0`，说明容量用完了，返回 0。
+
+递归表达式：
+
+$$
+dfs(index, cap) =
+\max(
+dfs(index + 1, cap),\
+dfs(index, cap - weight[index]) + value[index]
+)
+$$
+
+第二项需要满足 `cap >= weight[index]`。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求解基础完全背包最大价值。
+     *
+     * @param weight 每种物品的重量，weight[i] 对应第 i 种物品。
+     * @param value 每种物品的价值，value[i] 对应第 i 种物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int completeKnapsack(const vector<int>& weight, const vector<int>& value, int capacity) {
+        vector<vector<int>> memo(weight.size(), vector<int>(capacity + 1, -1));
+        return dfs(weight, value, memo, 0, capacity);
+    }
+
+private:
+    int dfs(
+        const vector<int>& weight,
+        const vector<int>& value,
+        vector<vector<int>>& memo,
+        int index,
+        int cap) {
+        if (index == static_cast<int>(weight.size()) || cap == 0) {
+            return 0;
+        }
+
+        int& cached = memo[index][cap];
+        if (cached != -1) {
+            return cached;
+        }
+
+        // 不选当前物品：进入下一种物品。
+        cached = dfs(weight, value, memo, index + 1, cap);
+
+        if (cap >= weight[index]) {
+            // 选当前物品：仍然停留在当前物品种类，允许继续选择它。
+            cached = max(
+                cached,
+                dfs(weight, value, memo, index, cap - weight[index]) + value[index]);
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归里，最重要的是 `dfs(index, cap - weight[index])`。只要这个下标不向后移动，就表达了“当前物品可以重复选”。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][cap]` 表示只考虑前 `i` 种物品时，背包容量不超过 `cap` 能获得的最大价值。
+
+最终答案是：
+
+$$
+dp[n][capacity]
+$$
+
+### 状态转移
+
+继续使用安全垫写法，处理真实物品 `weight[item]` 和 `value[item]`。
+
+`dp[item]` 表示还没处理第 `item` 种物品之前的状态，`dp[item + 1]` 表示处理完第 `item` 种物品之后的状态。
+
+- **不选当前物品**：最大价值继承上一行。
+
+$$
+dp[item + 1][cap] \leftarrow dp[item][cap]
+$$
+
+- **选当前物品**：如果容量足够，就从当前行的剩余容量转移过来。
+
+$$
+dp[item + 1][cap] \leftarrow dp[item + 1][cap - weight[item]] + value[item]
+$$
+
+注意这里是 `dp[item + 1]`，不是 `dp[item]`。
+
+合起来就是：
+
+$$
+dp[item + 1][cap] =
+\max(
+dp[item][cap],\
+dp[item + 1][cap - weight[item]] + value[item]
+)
+$$
+
+第二项需要满足 `cap >= weight[item]`。
+
+这里正是完全背包的核心：
+
+- 0-1 背包选当前物品：来源是上一行 `dp[item][cap - weight[item]]`。
+- 完全背包选当前物品：来源是当前行 `dp[item + 1][cap - weight[item]]`。
+
+来源在当前行，意味着当前物品已经可以被使用过一次、两次、更多次。
+
+### 初始化
+
+- `dp[0][cap] = 0`：不考虑任何物品时，无论容量多大，最大价值都是 0。
+- `dp[i][0] = 0`：背包容量为 0 时，无法放入任何正重量物品，最大价值也是 0。
+
+因为这是“容量不超过 `cap` 的最大价值”，所以初始化为 0 是合理的。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `n - 1`，逐个处理真实物品。
+- 内层从 `cap = 0` 到 `capacity`，枚举当前容量。
+
+这里内层必须正序，原因是当前行的 `dp[item + 1][cap]` 依赖当前行更小容量的 `dp[item + 1][cap - weight[item]]`。只有正序遍历容量，当前行的小容量状态才已经算出来。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求解基础完全背包最大价值。
+     *
+     * @param weight 每种物品的重量，weight[i] 对应第 i 种物品。
+     * @param value 每种物品的价值，value[i] 对应第 i 种物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int completeKnapsack(const vector<int>& weight, const vector<int>& value, int capacity) {
+        const int n = static_cast<int>(weight.size());
+        vector<vector<int>> dp(n + 1, vector<int>(capacity + 1, 0));
+
+        for (int item = 0; item < n; item++) {
+            const int item_weight = weight[item];
+            const int item_value = value[item];
+
+            for (int cap = 0; cap <= capacity; cap++) {
+                // 不选当前物品：继承上一行结果。
+                dp[item + 1][cap] = dp[item][cap];
+
+                if (cap >= item_weight) {
+                    // 选当前物品：来源是当前行，允许同一种物品被重复选择。
+                    dp[item + 1][cap] = max(
+                        dp[item + 1][cap],
+                        dp[item + 1][cap - item_weight] + item_value);
+                }
+            }
+        }
+
+        return dp[n][capacity];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times capacity)$。
+- 空间复杂度：$O(n \times capacity)$。
+
+### 空间优化
+
+二维转移只依赖：
+
+- 上一行同容量：`dp[item][cap]`。
+- 当前行较小容量：`dp[item + 1][cap - weight[item]]`。
+
+压成一维后，`dp[cap]` 表示当前已经处理过的物品种类中，容量不超过 `cap` 时能获得的最大价值。
+
+处理当前物品时：
+
+$$
+dp[cap] = \max(dp[cap],\ dp[cap - weight] + value)
+$$
+
+完全背包的一维容量必须正序遍历：
+
+```cpp
+for (int cap = item_weight; cap <= capacity; cap++)
+```
+
+原因是完全背包允许当前物品重复使用。正序遍历时，`dp[cap - item_weight]` 可能已经在本轮被当前物品更新过，再用它更新 `dp[cap]`，正好表示“当前物品再选一次”。
+
+这和 0-1 背包刚好相反：
+
+- 0-1 背包怕当前物品被重复使用，所以一维容量逆序。
+- 完全背包允许当前物品被重复使用，所以一维容量正序。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求解基础完全背包最大价值。
+     *
+     * @param weight 每种物品的重量，weight[i] 对应第 i 种物品。
+     * @param value 每种物品的价值，value[i] 对应第 i 种物品。
+     * @param capacity 背包最大容量。
+     * @return 不超过背包容量时可以获得的最大总价值。
+     */
+    int completeKnapsack(const vector<int>& weight, const vector<int>& value, int capacity) {
+        const int n = static_cast<int>(weight.size());
+        vector<int> dp(capacity + 1, 0);
+
+        for (int item = 0; item < n; item++) {
+            const int item_weight = weight[item];
+            const int item_value = value[item];
+
+            // 正序遍历容量，允许当前物品在同一轮中被重复使用。
+            for (int cap = item_weight; cap <= capacity; cap++) {
+                dp[cap] = max(dp[cap], dp[cap - item_weight] + item_value);
+            }
+        }
+
+        return dp[capacity];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(n \times capacity)$。
+- 空间复杂度：$O(capacity)$。
+
+### 这题的核心手感
+
+完全背包和 0-1 背包的外壳很像，真正的分水岭只有一个问题：
+
+> 选了当前物品之后，还能不能继续选当前物品？
+
+如果不能继续选，就是 0-1 背包：
+
+$$
+dp[item + 1][cap] =
+\max(dp[item][cap],\ dp[item][cap - weight[item]] + value[item])
+$$
+
+如果还能继续选，就是完全背包：
+
+$$
+dp[item + 1][cap] =
+\max(dp[item][cap],\ dp[item + 1][cap - weight[item]] + value[item])
+$$
+
+所以在安全垫写法里，判断两者最简单：
+
+- **0-1 背包选当前物品时，看上一行**：`dp[item][...]`。
+- **完全背包选当前物品时，看当前行**：`dp[item + 1][...]`。
+
+压成一维之后，遍历顺序也随之相反：
+
+- **0-1 背包逆序**：保护上一轮状态，避免当前物品重复使用。
+- **完全背包正序**：允许本轮更新继续参与后续转移，从而重复使用当前物品。
+
+完全背包不是一个新框架，它只是把 0-1 背包里的“选一次后去下一行”，改成了“选一次后还留在当前行”。
