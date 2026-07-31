@@ -346,11 +346,11 @@ $$
 
 $$
 \begin{aligned}
-\mathbf{Q}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_Q
+\mathbf{Q}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_Q^{\mathsf T}
 \in\mathbb R^{B\times T\times(Hd_h)},\\
-\mathbf{K}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_K
+\mathbf{K}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_K^{\mathsf T}
 \in\mathbb R^{B\times T\times(H_{kv}d_h)},\\
-\mathbf{V}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_V
+\mathbf{V}_{\text{flat}}&=\widetilde{\mathbf{H}}\mathbf{W}_V^{\mathsf T}
 \in\mathbb R^{B\times T\times(H_{kv}d_h)}.
 \end{aligned}
 $$
@@ -359,12 +359,18 @@ $$
 
 $$
 \begin{aligned}
-&\mathbf{W}_Q\in\mathbb R^{d\times(Hd_h)},\\
-&\mathbf{W}_K,\mathbf{W}_V\in\mathbb R^{d\times(H_{kv}d_h)},\\
+&\mathbf{W}_Q\in\mathbb R^{(Hd_h)\times d},\\
+&\mathbf{W}_K,\mathbf{W}_V\in\mathbb R^{(H_{kv}d_h)\times d},\\
 &g(a)=\left\lfloor\frac{a}{H/H_{kv}}\right\rfloor,
 \qquad a\in\{0,\ldots,H-1\}.
 \end{aligned}
 $$
+
+这里的 $\mathbf{W}_Q,\mathbf{W}_K,\mathbf{W}_V$ 与 Transformers 里
+`q_proj.weight`、`k_proj.weight`、`v_proj.weight` 的实际存储形状一致，都是
+`[out_features, in_features]`。因此前向公式里要写
+$\mathbf{W}^{\mathsf T}$，这和 `nn.Linear` 内部执行
+$\mathbf{X}\,\texttt{weight}^{\mathsf T}$ 完全一致。
 
 接下来才是**分头**。投影得到的最后一维会被拆成“头数 $\times$ 每头宽度”，然后把头维移动到序列维前面，方便每个头并行计算注意力：
 
@@ -670,9 +676,9 @@ $$
 
 $$
 \operatorname{Attn}(\widetilde{\mathbf{H}})
-=\mathbf{O}_{\text{cat}}\mathbf{W}_O
+=\mathbf{O}_{\text{cat}}\mathbf{W}_O^{\mathsf T}
 \in\mathbb R^{B\times T\times d},
-\qquad \mathbf{W}_O\in\mathbb R^{Hd_h\times d}.
+\qquad \mathbf{W}_O\in\mathbb R^{d\times(Hd_h)}.
 $$
 
 最后做第一个残差更新：
@@ -691,22 +697,22 @@ $$
 
 $$
 \begin{aligned}
-\mathbf{G}&=\mathbf{U}'\mathbf{W}_{\mathrm{gate}},\\
-\mathbf{A}&=\mathbf{U}'\mathbf{W}_{\mathrm{up}},\\
+\mathbf{G}&=\mathbf{U}'\mathbf{W}_{\mathrm{gate}}^{\mathsf T},\\
+\mathbf{A}&=\mathbf{U}'\mathbf{W}_{\mathrm{up}}^{\mathsf T},\\
 \operatorname{SiLU}(z)&=z\,\sigma(z),\qquad
 \sigma(z)=\frac{1}{1+e^{-z}},\\
 \operatorname{MLP}(\mathbf{U}')
 &=\bigl(\operatorname{SiLU}(\mathbf{G})\odot\mathbf{A}\bigr)
-\mathbf{W}_{\mathrm{down}},
+\mathbf{W}_{\mathrm{down}}^{\mathsf T},
 \end{aligned}
 $$
 
 其中 $\mathbf{U}'=\operatorname{RMSNorm}_{\ell,2}(\mathbf{U})$，三个矩阵形状是：
 
 $$
-\mathbf{W}_{\mathrm{gate}},\mathbf{W}_{\mathrm{up}}\in\mathbb R^{d\times d_{ff}},
+\mathbf{W}_{\mathrm{gate}},\mathbf{W}_{\mathrm{up}}\in\mathbb R^{d_{ff}\times d},
 \qquad
-\mathbf{W}_{\mathrm{down}}\in\mathbb R^{d_{ff}\times d}.
+\mathbf{W}_{\mathrm{down}}\in\mathbb R^{d\times d_{ff}}.
 $$
 
 `gate_proj` 决定哪些中间特征通过，`up_proj` 提供被门控的内容，逐元素积完成动态门控；`down_proj` 把宽中间表示投回 $d$。源码的一行 `down_proj(act_fn(gate_proj(x)) * up_proj(x))` 与此完全对应。
@@ -888,7 +894,653 @@ $$
 
 这里得到的隐藏状态梯度会按原来的 batch/sequence 位置放回 $\mathbb R^{B\times T\times d}$，无效位置填零，然后继续反向穿过最终 RMSNorm、所有 Transformer block 和输入 embedding。
 
-### 反向传播不是“手写每层求导”，而是反向累积向量-Jacobian 积
+### 线性层统一约定：匹配 Llama / PyTorch 实际权重形状
+
+为了避免手推时在转置上来回切换，本文统一采用和
+Transformers Llama 源码一致的权重形状。对任意
+`nn.Linear(in_features, out_features)`，PyTorch 实际保存：
+
+$$
+\mathbf{W}
+\in\mathbb R^{d_{\mathrm{out}}\times d_{\mathrm{in}}},
+\qquad
+\mathbf{b}\in\mathbb R^{d_{\mathrm{out}}}.
+$$
+
+一个 batch 的 token 隐状态按行排列：
+
+$$
+\mathbf{X}\in\mathbb R^{N\times d_{\mathrm{in}}},
+\qquad N=BT.
+$$
+
+因此线性层前向统一写成：
+
+$$
+\boxed{
+\mathbf{Y}
+=
+\mathbf{X}\mathbf{W}^{\mathsf T}
++\mathbf{1}\mathbf{b}^{\mathsf T}
+\in\mathbb R^{N\times d_{\mathrm{out}}}.
+}
+$$
+
+Llama 3 的 attention、MLP 和 `lm_head` 通常没有 bias；没有 bias 时直接去掉
+$\mathbf{1}\mathbf{b}^{\mathsf T}$。这就是源码里
+`self.q_proj(hidden_states)`、`self.gate_proj(x)`、`self.lm_head(hidden_states)`
+背后的矩阵乘法语义。
+
+这和上一篇 `training-mathematical-theory.md` 的列向量公式并不矛盾。上一篇先讲单个样本：
+
+$$
+\mathbf{z}_{\mathrm{col}}
+=
+\mathbf{W}\mathbf{x}_{\mathrm{col}}
++\mathbf{b},
+\qquad
+\mathbf{x}_{\mathrm{col}}\in\mathbb R^{d_{\mathrm{in}}\times1},
+\quad
+\mathbf{W}\in\mathbb R^{d_{\mathrm{out}}\times d_{\mathrm{in}}}.
+$$
+
+把多个样本改成按行排列后，自然就是：
+
+$$
+\mathbf{Y}
+=
+\mathbf{X}\mathbf{W}^{\mathsf T}
++\mathbf{1}\mathbf{b}^{\mathsf T}.
+$$
+
+也就是说，本文现在使用的 $\mathbf{W}$ 与 PyTorch checkpoint 里的
+`.weight` 同形，也与上一篇列向量公式里的 $\mathbf{W}$ 同形。以后看到
+$\mathbf{W}^{\mathsf T}$，它不是另一个参数，只是同一个源码权重在行向量 batch 前向里需要转置后参与乘法。
+
+给定上游梯度：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{Y}}
+=
+\frac{\partial\mathcal L}{\partial\mathbf{Y}}
+\in\mathbb R^{N\times d_{\mathrm{out}}},
+$$
+
+线性层反向也统一为：
+
+$$
+\boxed{
+\boldsymbol{\Delta}_{\mathbf{X}}
+=
+\boldsymbol{\Delta}_{\mathbf{Y}}\mathbf{W},
+\qquad
+\frac{\partial\mathcal L}{\partial\mathbf{W}}
+=
+\boldsymbol{\Delta}_{\mathbf{Y}}^{\mathsf T}\mathbf{X},
+\qquad
+\frac{\partial\mathcal L}{\partial\mathbf{b}}
+=
+\sum_{n=1}^{N}\boldsymbol{\Delta}_{\mathbf{Y}_{n,:}}.
+}
+$$
+
+形状可以直接核对：
+
+$$
+(N\times d_{\mathrm{out}})(d_{\mathrm{out}}\times d_{\mathrm{in}})
+=
+N\times d_{\mathrm{in}},
+$$
+
+$$
+(d_{\mathrm{out}}\times N)(N\times d_{\mathrm{in}})
+=
+d_{\mathrm{out}}\times d_{\mathrm{in}}.
+$$
+
+所以参数梯度
+$\partial\mathcal L/\partial\mathbf{W}$ 与源码权重
+`.weight` 形状完全一致。后面所有
+$\mathbf{W}_Q,\mathbf{W}_K,\mathbf{W}_V,\mathbf{W}_O,
+\mathbf{W}_{\mathrm{gate}},\mathbf{W}_{\mathrm{up}},
+\mathbf{W}_{\mathrm{down}},\mathbf{W}_{\mathrm{lm}}$
+都遵守这套约定。
+
+Llama 主要权重形状可统一记为：
+
+| 参数 | 源码 / 本文形状 | 前向 |
+| --- | --- | --- |
+| $\mathbf{W}_Q$ | $(Hd_h)\times d$ | $\mathbf{Q}_{\text{flat}}=\mathbf{X}\mathbf{W}_Q^{\mathsf T}$ |
+| $\mathbf{W}_K,\mathbf{W}_V$ | $(H_{kv}d_h)\times d$ | $\mathbf{K}_{\text{flat}}=\mathbf{X}\mathbf{W}_K^{\mathsf T}$，$\mathbf{V}_{\text{flat}}=\mathbf{X}\mathbf{W}_V^{\mathsf T}$ |
+| $\mathbf{W}_O$ | $d\times(Hd_h)$ | $\mathbf{C}=\mathbf{O}_{\mathrm{cat}}\mathbf{W}_O^{\mathsf T}$ |
+| $\mathbf{W}_{\mathrm{gate}},\mathbf{W}_{\mathrm{up}}$ | $d_{ff}\times d$ | $\mathbf{G}=\mathbf{X}\mathbf{W}_{\mathrm{gate}}^{\mathsf T}$，$\mathbf{A}=\mathbf{X}\mathbf{W}_{\mathrm{up}}^{\mathsf T}$ |
+| $\mathbf{W}_{\mathrm{down}}$ | $d\times d_{ff}$ | $\mathbf{F}=\mathbf{P}\mathbf{W}_{\mathrm{down}}^{\mathsf T}$ |
+| $\mathbf{W}_{\mathrm{lm}}$ | $V\times d$ | $\mathbf{Z}=\mathbf{H}\mathbf{W}_{\mathrm{lm}}^{\mathsf T}$ |
+| $\mathbf{E}$ | $V\times d$ | $\mathbf{h}_t=\mathbf{E}[x_t]$ |
+
+`lm_head` 不再是特殊例外：它也是 `nn.Linear(d, V, bias=False)`，所以
+`lm_head.weight` 和本文的 $\mathbf{W}_{\mathrm{lm}}$ 都是
+$V\times d$。它同时又和输入 embedding $\mathbf{E}\in\mathbb R^{V\times d}$
+同形，因此可以做 weight tying。
+
+### 记号：用 $\boldsymbol{\Delta}$ 表示从右侧传回的梯度
+
+要继续把梯度推过 decoder block，关键是区分“某个张量的值”和“损失对它的梯度”。下面记：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{A}}
+=\frac{\partial\mathcal L}{\partial\mathbf{A}},
+$$
+
+它与 $\mathbf{A}$ 形状相同，表示从计算图右侧传回的梯度。为了让线性层公式简洁，凡是不需要保留头维或序列依赖的张量，都把 batch、序列两维合并为：
+
+$$
+N=BT,\qquad
+\mathbf{X}\in\mathbb R^{N\times d}.
+$$
+
+这只是记号上的 `reshape`：第 $n=bT+t$ 行仍对应原来的第 $b$ 个样本、第 $t$ 个 token。`reshape`、`transpose` 和把多头拼接/拆开都只是在重新解释同一批数字的轴，不含可学习参数；反向时只需按相反方式变回原形状。
+
+后面 attention 和 MLP 的普通投影都沿用上一节的源码权重约定
+$\mathbf{Y}=\mathbf{X}\mathbf{W}^{\mathsf T}$。特别地，参数被所有
+$N=BT$ 个 token 共享，所以
+$\boldsymbol{\Delta}_{\mathbf{Y}}^{\mathsf T}\mathbf{X}$ 中的矩阵乘法已经自动累加了所有 token 对同一参数的贡献。
+
+### RMSNorm 的局部反向公式
+
+先推一个 token 的 RMSNorm。这里的输入不是 token id，而是某个位置已经得到的隐藏向量：
+
+$$
+\mathbf{x}_{b,t}
+=
+(x_{b,t,1},x_{b,t,2},\ldots,x_{b,t,d})
+\in\mathbb R^d.
+$$
+
+也就是说，$x_i$ 指的是**一个 token 的 $d$ 维隐藏向量里的第 $i$ 个坐标值**。为了先把公式写清楚，暂时省略 batch 和位置下标 $(b,t)$，记这个 token 的输入为 $\mathbf{x}$：
+
+$$
+r=\sqrt{\frac1d\sum_{i=1}^{d}x_i^2+\varepsilon},
+\qquad
+y_i=\gamma_i\frac{x_i}{r}.
+$$
+
+假设从后续计算收到：
+
+$$
+\delta_i=\frac{\partial\mathcal L}{\partial y_i}.
+$$
+
+它同样是这个 token 第 $i$ 个输出坐标上的梯度。由于 $r$ 依赖同一个 token 的全部 $d$ 个坐标，不能只把梯度逐元素除以 $r$；完整结果是：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial x_i}
+=\frac{\gamma_i\delta_i}{r}
+-\frac{x_i}{r^3}
+\left(
+\frac1d\sum_{k=1}^{d}\gamma_k\delta_kx_k
+\right).
+}
+$$
+
+第一项来自分子里的 $x_i$，第二项来自分母 $r$。它正是 RMSNorm 会耦合同一 token 内各隐藏维度梯度的原因。缩放参数的梯度为：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial\gamma_i}
+=\delta_i\frac{x_i}{r}.
+}
+$$
+
+如果把 batch 和序列维放回来，输入、输出和上游梯度都是三维张量：
+
+$$
+\mathbf{X},\mathbf{Y},\boldsymbol{\Delta}_{\mathbf{Y}}
+\in\mathbb R^{B\times T\times d}.
+$$
+
+RMSNorm 对每个 $(b,t)$ 位置独立计算均方根，只沿最后的隐藏维 $d$ 做归一化：
+
+$$
+r_{b,t}
+=
+\sqrt{
+\frac1d
+\sum_{i=1}^{d}x_{b,t,i}^2
++\varepsilon
+},
+\qquad
+y_{b,t,i}
+=
+\gamma_i\frac{x_{b,t,i}}{r_{b,t}}.
+$$
+
+因此整批输入的梯度是：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial x_{b,t,i}}
+=
+\frac{\gamma_i\delta_{b,t,i}}{r_{b,t}}
+-
+\frac{x_{b,t,i}}{r_{b,t}^{3}}
+\left(
+\frac1d
+\sum_{k=1}^{d}
+\gamma_k\delta_{b,t,k}x_{b,t,k}
+\right).
+}
+$$
+
+这个公式的含义很重要：对固定的 $(b,t)$，第 $i$ 维梯度会用到同一个 token 内所有 $k=1,\ldots,d$ 维的信息；但它不会用到别的样本、别的位置的 token。也就是 **RMSNorm 在隐藏维内部耦合梯度，但不跨 token 耦合梯度**。
+
+写成更接近 PyTorch 实现的向量化形式，令 $\boldsymbol\gamma$ 在 batch 和序列维上广播：
+
+$$
+\mathbf{R}
+=
+\sqrt{
+\operatorname{mean}(\mathbf{X}\odot\mathbf{X},\operatorname{dim}=-1,\operatorname{keepdim}=\mathrm{true})
++\varepsilon
+}
+\in\mathbb R^{B\times T\times 1},
+$$
+
+$$
+\mathbf{S}
+=
+\operatorname{mean}
+\left(
+(\boldsymbol{\Delta}_{\mathbf{Y}}\odot\boldsymbol\gamma)\odot\mathbf{X},
+\operatorname{dim}=-1,
+\operatorname{keepdim}=\mathrm{true}
+\right)
+\in\mathbb R^{B\times T\times 1}.
+$$
+
+则整个 $\mathbf{X}$ 的梯度可以一次写成：
+
+$$
+\boxed{
+\boldsymbol{\Delta}_{\mathbf{X}}
+=
+\frac{\boldsymbol{\Delta}_{\mathbf{Y}}\odot\boldsymbol\gamma}{\mathbf{R}}
+-
+\frac{\mathbf{X}\odot\mathbf{S}}{\mathbf{R}^{3}}.
+}
+$$
+
+这里所有除法、乘法都是逐元素运算；$\mathbf{R}$ 和 $\mathbf{S}$ 的最后一维是 $1$，会广播到 $d$ 个隐藏维。
+
+一层 RMSNorm 的 $\boldsymbol\gamma$ 被 $B\times T$ 个 token 共用，因此实现中还要对所有 $(b,t)$ 的上述参数梯度求和：
+
+$$
+\frac{\partial\mathcal L}{\partial\gamma_i}
+=\sum_{b=0}^{B-1}\sum_{t=0}^{T-1}
+\delta_{b,t,i}\frac{x_{b,t,i}}{r_{b,t}}.
+$$
+
+向量化地写，就是：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial\boldsymbol\gamma}
+=
+\sum_{b,t}
+\left(\boldsymbol{\Delta}_{\mathbf{Y}}\right)_{b,t,:}
+\odot
+\frac{\mathbf{X}_{b,t,:}}{r_{b,t}}
+\in\mathbb R^d.
+}
+$$
+
+最终 RMSNorm、每个 block 内的两个 Pre-RMSNorm 都使用同一局部公式，只是各自有独立的 $\boldsymbol\gamma$ 参数。
+
+### 从一个 decoder block 的输出倒推回输入
+
+先把第 $\ell$ 个 block 的前向路径压缩为五个节点：
+
+$$
+\begin{aligned}
+\mathbf{N}_1&=\operatorname{RMSNorm}_{\ell,1}(\mathbf{H}^{(\ell)}),\\
+\mathbf{C}&=\operatorname{Attn}_{\ell}(\mathbf{N}_1),\\
+\mathbf{U}&=\mathbf{H}^{(\ell)}+\mathbf{C},\\
+\mathbf{N}_2&=\operatorname{RMSNorm}_{\ell,2}(\mathbf{U}),\\
+\mathbf{F}&=\operatorname{MLP}_{\ell}(\mathbf{N}_2),\\
+\mathbf{H}^{(\ell+1)}&=\mathbf{U}+\mathbf{F}.
+\end{aligned}
+$$
+
+设从下一层传回的梯度为：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{H}^{(\ell+1)}}
+=\frac{\partial\mathcal L}{\partial\mathbf{H}^{(\ell+1)}}.
+$$
+
+最右侧的 MLP 残差是 $\mathbf{H}^{(\ell+1)}=\mathbf{U}+\mathbf{F}$，所以加法把同一份上游梯度复制给两条输入边：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{F}}
+=\boldsymbol{\Delta}_{\mathbf{H}^{(\ell+1)}},
+\qquad
+\boldsymbol{\Delta}_{\mathbf{U}}^{\text{skip}}
+=\boldsymbol{\Delta}_{\mathbf{H}^{(\ell+1)}}.
+$$
+
+把 $\boldsymbol{\Delta}_{\mathbf{F}}$ 穿过 MLP 得到
+$\boldsymbol{\Delta}_{\mathbf{N}_2}$，再按上一节 RMSNorm 公式得到
+$\boldsymbol{\Delta}_{\mathbf{U}}^{\text{norm}}$。两条依赖路径在 $\mathbf{U}$ 汇合：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{U}}
+=\boldsymbol{\Delta}_{\mathbf{U}}^{\text{skip}}
++\boldsymbol{\Delta}_{\mathbf{U}}^{\text{norm}}.
+$$
+
+接着是注意力残差 $\mathbf{U}=\mathbf{H}^{(\ell)}+\mathbf{C}$：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{C}}
+=\boldsymbol{\Delta}_{\mathbf{U}},
+\qquad
+\boldsymbol{\Delta}_{\mathbf{H}^{(\ell)}}^{\text{skip}}
+=\boldsymbol{\Delta}_{\mathbf{U}}.
+$$
+
+把 $\boldsymbol{\Delta}_{\mathbf{C}}$ 完整穿过 attention 得到
+$\boldsymbol{\Delta}_{\mathbf{N}_1}$，再穿过第一个 RMSNorm 得到
+$\boldsymbol{\Delta}_{\mathbf{H}^{(\ell)}}^{\text{norm}}$。本层最终交给更浅层的梯度是：
+
+$$
+\boxed{
+\boldsymbol{\Delta}_{\mathbf{H}^{(\ell)}}
+=\boldsymbol{\Delta}_{\mathbf{H}^{(\ell)}}^{\text{skip}}
++\boldsymbol{\Delta}_{\mathbf{H}^{(\ell)}}^{\text{norm}}.
+}
+$$
+
+这不是“残差让梯度原封不动穿过”的意思；它提供一条恒等梯度
+$\boldsymbol{\Delta}^{\text{skip}}$，同时仍要加上 attention、RMSNorm、MLP 路径的梯度。反向会按 $\ell=L-1,L-2,\ldots,0$ 重复这个过程。
+
+### SwiGLU MLP 的反向传播
+
+把 $\mathbf{N}_2$ 展平为 $\mathbf{X}\in\mathbb R^{N\times d}$，沿用前向部分的记号：
+
+$$
+\begin{aligned}
+\mathbf{G}&=\mathbf{X}\mathbf{W}_{\mathrm{gate}}^{\mathsf T},&
+\mathbf{A}&=\mathbf{X}\mathbf{W}_{\mathrm{up}}^{\mathsf T},\\
+\mathbf{P}&=\operatorname{SiLU}(\mathbf{G})\odot\mathbf{A},&
+\mathbf{F}&=\mathbf{P}\mathbf{W}_{\mathrm{down}}^{\mathsf T}.
+\end{aligned}
+$$
+
+给定 MLP 输出梯度 $\boldsymbol{\Delta}_{\mathbf{F}}$，最后一个下投影先按普通线性层反传：
+
+$$
+\begin{aligned}
+\boldsymbol{\Delta}_{\mathbf{P}}
+&=\boldsymbol{\Delta}_{\mathbf{F}}
+\mathbf{W}_{\mathrm{down}},\\
+\frac{\partial\mathcal L}{\partial\mathbf{W}_{\mathrm{down}}}
+&=\boldsymbol{\Delta}_{\mathbf{F}}^{\mathsf T}\mathbf{P}.
+\end{aligned}
+$$
+
+逐元素乘法 $\mathbf{P}=\operatorname{SiLU}(\mathbf{G})\odot\mathbf{A}$ 有两条输入支路：
+
+$$
+\begin{aligned}
+\boldsymbol{\Delta}_{\mathbf{A}}
+&=\boldsymbol{\Delta}_{\mathbf{P}}\odot\operatorname{SiLU}(\mathbf{G}),\\
+\boldsymbol{\Delta}_{\mathbf{G}}
+&=\boldsymbol{\Delta}_{\mathbf{P}}\odot\mathbf{A}
+\odot\operatorname{SiLU}'(\mathbf{G}).
+\end{aligned}
+$$
+
+其中：
+
+$$
+\operatorname{SiLU}'(z)
+=\sigma(z)+z\sigma(z)(1-\sigma(z))
+=\sigma(z)\bigl(1+z(1-\sigma(z))\bigr).
+$$
+
+于是两个上投影的参数梯度，以及送回 MLP 输入的梯度为：
+
+$$
+\boxed{
+\begin{aligned}
+\frac{\partial\mathcal L}{\partial\mathbf{W}_{\mathrm{gate}}}
+&=\boldsymbol{\Delta}_{\mathbf{G}}^{\mathsf T}\mathbf{X},&
+\frac{\partial\mathcal L}{\partial\mathbf{W}_{\mathrm{up}}}
+&=\boldsymbol{\Delta}_{\mathbf{A}}^{\mathsf T}\mathbf{X},\\
+\boldsymbol{\Delta}_{\mathbf{X}}
+&=\boldsymbol{\Delta}_{\mathbf{G}}\mathbf{W}_{\mathrm{gate}}
++\boldsymbol{\Delta}_{\mathbf{A}}\mathbf{W}_{\mathrm{up}}.
+\end{aligned}
+}
+$$
+
+最后一行中的加号来自 $\mathbf{X}$ 同时喂给 `gate_proj` 和 `up_proj`。这与残差的“分支梯度相加”是同一条链式法则，只是分支发生在线性投影之前。
+
+### GQA 自注意力的反向传播
+
+注意力的反向最容易看清三个事实：Value 决定“取什么”，$Q,K$ 决定“看哪里”，softmax 把同一 Query 行的所有 Key 耦合起来。下面固定一个 batch 下标；batch 维只是在相同公式上独立重复。对 Query 头 $a$，令 $g=g(a)$ 为它使用的 KV 头，前向为：
+
+$$
+\begin{aligned}
+s_{t,j}^{a}
+&=\frac{\langle\widehat{\mathbf{q}}_{t}^{a},
+\widehat{\mathbf{k}}_{j}^{g}\rangle}{\sqrt{d_h}}+M_{t,j},\\
+\alpha_{t,:}^{a}
+&=\operatorname{softmax}(\mathbf{s}_{t,:}^{a}),\\
+\mathbf{o}_t^a
+&=\sum_{j\in\mathcal V_t}\alpha_{t,j}^{a}\mathbf{v}_j^g,
+\end{aligned}
+$$
+
+其中 $\mathcal V_t$ 是位置 $t$ 可见的 Key 集合；纯因果情况为 $\{0,\ldots,t\}$，padding 或 packed sequence 会进一步删去不可见位置。反向公式里对 $j$ 的求和也只在 $\mathcal V_t$ 上进行。
+
+#### 输出投影、加权求和与 Value 梯度
+
+设多头拼接后的矩阵为 $\mathbf{O}_{\mathrm{cat}}\in\mathbb R^{N\times d}$，attention 输出为：
+
+$$
+\mathbf{C}=\mathbf{O}_{\mathrm{cat}}\mathbf{W}_O^{\mathsf T}.
+$$
+
+给定 $\boldsymbol{\Delta}_{\mathbf{C}}$：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{O}_{\mathrm{cat}}}
+=\boldsymbol{\Delta}_{\mathbf{C}}\mathbf{W}_O,
+\qquad
+\frac{\partial\mathcal L}{\partial\mathbf{W}_O}
+=\boldsymbol{\Delta}_{\mathbf{C}}^{\mathsf T}\mathbf{O}_{\mathrm{cat}}.
+$$
+
+把 $\boldsymbol{\Delta}_{\mathbf{O}_{\mathrm{cat}}}$ reshape 回
+$\boldsymbol{\Delta}_{\mathbf{o}_t^a}$ 后，对
+$\mathbf{o}_t^a=\sum_j\alpha_{t,j}^a\mathbf{v}_j^g$ 有：
+
+$$
+\begin{aligned}
+\frac{\partial\mathcal L}{\partial\alpha_{t,j}^a}
+&=\left\langle
+\boldsymbol{\Delta}_{\mathbf{o}_t^a},\mathbf{v}_j^g
+\right\rangle,\\
+\boldsymbol{\Delta}_{\mathbf{v}_j^g}
+&\mathrel{+}=
+\sum_{\substack{a:\,g(a)=g\\t:\,j\in\mathcal V_t}}
+\alpha_{t,j}^a\boldsymbol{\Delta}_{\mathbf{o}_t^a}.
+\end{aligned}
+$$
+
+第一行说明：若改变权重 $\alpha_{t,j}^a$，输出沿着对应 Value 向量变化。第二行的 $\mathrel{+}=$ 非常重要：同一个 KV 头的 $\mathbf{v}_j^g$ 被同组多个 Query 头、以及所有能看见位置 $j$ 的 Query 位置复用，因此梯度必须累加。普通 MHA 也按位置累加；GQA 额外沿 Query 头组累加。
+
+#### 行 softmax 如何把梯度传回分数
+
+对固定的 $(a,t)$，softmax 的一整行输入是
+$\mathbf{s}_{t,:}^a$，输出是 $\boldsymbol\alpha_{t,:}^a$。令：
+
+$$
+d_{t,j}^a
+=\frac{\partial\mathcal L}{\partial\alpha_{t,j}^a}.
+$$
+
+softmax 的 Jacobian 与上一篇分类部分相同，化简后的逐元素 VJP 为：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial s_{t,j}^a}
+=\alpha_{t,j}^a
+\left(
+d_{t,j}^a
+-\sum_{r\in\mathcal V_t}\alpha_{t,r}^a d_{t,r}^a
+\right),
+\qquad j\in\mathcal V_t.
+}
+$$
+
+因此一个 $\alpha_{t,j}$ 的变化会影响同一行所有 score，而不是只影响 $s_{t,j}$ 自己。对 $j\notin\mathcal V_t$，mask 使前向概率为零，在数学上可直接规定该边的
+$\partial\mathcal L/\partial s_{t,j}^a=0$。$M_{t,j}$ 是常量 mask，故没有可训练梯度。
+
+#### 分数、RoPE 与 \(Q/K\) 梯度
+
+记：
+
+$$
+\delta s_{t,j}^a
+=\frac{\partial\mathcal L}{\partial s_{t,j}^a}.
+$$
+
+由点积的局部导数：
+
+$$
+\begin{aligned}
+\boldsymbol{\Delta}_{\widehat{\mathbf{q}}_t^a}
+&=
+\sum_{j\in\mathcal V_t}
+\frac{\delta s_{t,j}^a}{\sqrt{d_h}}
+\widehat{\mathbf{k}}_j^{g(a)},\\
+\boldsymbol{\Delta}_{\widehat{\mathbf{k}}_j^g}
+&\mathrel{+}=
+\sum_{\substack{a:\,g(a)=g\\t:\,j\in\mathcal V_t}}
+\frac{\delta s_{t,j}^a}{\sqrt{d_h}}
+\widehat{\mathbf{q}}_t^a.
+\end{aligned}
+$$
+
+第二行再次体现 GQA：一个 $\mathbf{k}_j^g$ 服务多个 Query 头，其梯度要沿这些头求和。
+
+RoPE 在前向中对每个位置做的是正交旋转：
+
+$$
+\widehat{\mathbf{q}}_t=\mathbf{R}_t\mathbf{q}_t,
+\qquad
+\widehat{\mathbf{k}}_t=\mathbf{R}_t\mathbf{k}_t,
+\qquad
+\mathbf{R}_t^{\mathsf T}\mathbf{R}_t=\mathbf{I}.
+$$
+
+所以反向只需乘逆旋转（也就是转置）：
+
+$$
+\boxed{
+\boldsymbol{\Delta}_{\mathbf{q}_t}
+=\mathbf{R}_t^{\mathsf T}
+\boldsymbol{\Delta}_{\widehat{\mathbf{q}}_t}
+=\mathbf{R}_{-t}
+\boldsymbol{\Delta}_{\widehat{\mathbf{q}}_t},
+\qquad
+\boldsymbol{\Delta}_{\mathbf{k}_t}
+=\mathbf{R}_{-t}
+\boldsymbol{\Delta}_{\widehat{\mathbf{k}}_t}.
+}
+$$
+
+用 Transformers 的 half-split 实现写，不必显式构造 $\mathbf{R}_t$：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{q}}
+=\boldsymbol{\Delta}_{\widehat{\mathbf{q}}}\odot\cos\boldsymbol\phi
+-\operatorname{rotate\_half}
+(\boldsymbol{\Delta}_{\widehat{\mathbf{q}}})
+\odot\sin\boldsymbol\phi,
+$$
+
+$K$ 完全同理。这里 $\cos\boldsymbol\phi,\sin\boldsymbol\phi$ 与 `position_ids` 都是固定前向数据，不是可训练参数；它们只决定如何旋转梯度。
+
+#### 回到 \(Q/K/V\) 投影与 attention 输入
+
+把 $\boldsymbol{\Delta}_{\mathbf{Q}}$、
+$\boldsymbol{\Delta}_{\mathbf{K}}$、$\boldsymbol{\Delta}_{\mathbf{V}}$
+按分头的相反顺序 transpose、reshape 成
+$\boldsymbol{\Delta}_{\mathbf{Q}_{\mathrm{flat}}}$、
+$\boldsymbol{\Delta}_{\mathbf{K}_{\mathrm{flat}}}$、
+$\boldsymbol{\Delta}_{\mathbf{V}_{\mathrm{flat}}}$。令展平后的 attention 输入为
+$\mathbf{X}=\operatorname{flatten}(\mathbf{N}_1)\in\mathbb R^{N\times d}$，则：
+
+$$
+\begin{aligned}
+\frac{\partial\mathcal L}{\partial\mathbf{W}_Q}
+&=\boldsymbol{\Delta}_{\mathbf{Q}_{\mathrm{flat}}}^{\mathsf T}\mathbf{X},&
+\frac{\partial\mathcal L}{\partial\mathbf{W}_K}
+&=\boldsymbol{\Delta}_{\mathbf{K}_{\mathrm{flat}}}^{\mathsf T}\mathbf{X},&
+\frac{\partial\mathcal L}{\partial\mathbf{W}_V}
+&=\boldsymbol{\Delta}_{\mathbf{V}_{\mathrm{flat}}}^{\mathsf T}\mathbf{X},\\
+\boldsymbol{\Delta}_{\mathbf{X}}
+&=\boldsymbol{\Delta}_{\mathbf{Q}_{\mathrm{flat}}}\mathbf{W}_Q
++\boldsymbol{\Delta}_{\mathbf{K}_{\mathrm{flat}}}\mathbf{W}_K
++\boldsymbol{\Delta}_{\mathbf{V}_{\mathrm{flat}}}\mathbf{W}_V.
+\end{aligned}
+$$
+
+$\boldsymbol{\Delta}_{\mathbf{X}}$ reshape 回 $[B,T,d]$，就是前面 block 链路中的
+$\boldsymbol{\Delta}_{\mathbf{N}_1}$。至此，attention 内部所有可训练矩阵
+$\mathbf{W}_Q,\mathbf{W}_K,\mathbf{W}_V,\mathbf{W}_O$ 的梯度都已得到。
+
+### 最终归一化、embedding 与跨层递推
+
+输出头已经给出了
+$\boldsymbol{\Delta}_{\mathbf{H}_{\mathrm{final}}}$。先按 RMSNorm 公式得到
+$\boldsymbol{\Delta}_{\mathbf{H}^{(L)}}$ 和最终 norm scale 的梯度；然后以上一节的 block 反向链路依次计算：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{H}^{(L)}}
+\longrightarrow
+\boldsymbol{\Delta}_{\mathbf{H}^{(L-1)}}
+\longrightarrow\cdots\longrightarrow
+\boldsymbol{\Delta}_{\mathbf{H}^{(0)}}.
+$$
+
+输入 embedding 前向是
+$\mathbf{h}_{b,t}^{(0)}=\mathbf{E}[x_{b,t}]$，所以 lookup 的反向是稀疏行累加：
+
+$$
+\boxed{
+\frac{\partial\mathcal L}{\partial\mathbf{E}[r,:]}
+=\sum_{(b,t):\,x_{b,t}=r}
+\boldsymbol{\Delta}_{\mathbf{H}^{(0)}_{b,t,:}},
+\qquad r\in\{0,\ldots,V-1\}.
+}
+$$
+
+即一个 token id 出现 $k$ 次，就有 $k$ 条计算路径给 embedding 表的同一行贡献梯度。若启用 weight tying，$\mathbf{W}_{\mathrm{lm}}=\mathbf{E}$，同一块参数还会收到输出头的梯度：
+
+$$
+\frac{\partial\mathcal L}{\partial\mathbf{E}}
+=\left.\frac{\partial\mathcal L}{\partial\mathbf{E}}\right|_{\text{input lookup}}
++\frac{\partial\mathcal L}{\partial\mathbf{W}_{\mathrm{lm}}}.
+$$
+
+这也解释了为何输入侧 lookup 本身只访问少数 token 行，而绑定的输出 softmax 仍可能给词表的许多行提供梯度。
+
+### 这些公式在 autograd 中如何执行
 
 把整个模型写成：
 

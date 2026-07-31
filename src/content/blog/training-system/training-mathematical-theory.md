@@ -2028,6 +2028,56 @@ $$
 
 它表示：一个权重的梯度等于“这个输出神经元收到的误差信号”乘以“这个权重在前向时看到的输入”。
 
+为什么输入梯度和原始公式差了一个转置？
+
+注意，这一行里的
+$\boldsymbol{\delta}^{\mathsf T}\mathbf{W}\,\mathrm{d}\mathbf{x}$ 它的形状是：
+
+$$
+\underbrace{\boldsymbol{\delta}^{\mathsf T}}_{1\times m}
+\underbrace{\mathbf{W}}_{m\times d}
+\underbrace{\mathrm{d}\mathbf{x}}_{d\times1}
+\in\mathbb R.
+$$
+
+它已经是一个标量。真正出现转置的是下一步：我们要把它整理成“梯度定义”的标准形式。由于本文把梯度也当作列向量，关于 $\mathbf{x}$ 的损失微分应写成：
+
+$$
+\mathrm{d}L
+=
+\left(\nabla_{\mathbf{x}}L\right)^{\mathsf T}
+\mathrm{d}\mathbf{x}.
+$$
+
+因此要比较的是：
+
+$$
+\left(\nabla_{\mathbf{x}}L\right)^{\mathsf T}
+\mathrm{d}\mathbf{x}
+=
+\boldsymbol{\delta}^{\mathsf T}\mathbf{W}\,\mathrm{d}\mathbf{x}.
+$$
+
+因为这个等式要对任意 $\mathrm{d}\mathbf{x}$ 都成立，所以：
+
+$$
+\left(\nabla_{\mathbf{x}}L\right)^{\mathsf T}
+=
+\boldsymbol{\delta}^{\mathsf T}\mathbf{W}.
+$$
+
+两边再转置，才得到：
+
+$$
+\nabla_{\mathbf{x}}L
+=
+\left(\boldsymbol{\delta}^{\mathsf T}\mathbf{W}\right)^{\mathsf T}
+=
+\mathbf{W}^{\mathsf T}\boldsymbol{\delta}.
+$$
+
+所以 $\mathbf{W}^{\mathsf T}$ 不是前向微分里额外塞进去的东西，而是**把行向量形式的系数转换成列向量梯度**时自然出现的。
+
 ## 神经网络为什么需要非线性
 
 ### 单个神经元
