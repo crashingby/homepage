@@ -2078,6 +2078,304 @@ $$
 
 所以 $\mathbf{W}^{\mathsf T}$ 不是前向微分里额外塞进去的东西，而是**把行向量形式的系数转换成列向量梯度**时自然出现的。
 
+#### 批量矩阵形式：完整推导 $\mathbf{X}\mathbf{W}^{\mathsf T}$ 的三个梯度
+
+上面的推导只处理了一个列向量样本。真实训练和 PyTorch 里的 `nn.Linear` 通常使用 batch 矩阵：每个样本占一行。
+
+设：
+
+$$
+\mathbf{X}
+=
+\begin{bmatrix}
+\mathbf{x}_1^{\mathsf T}\\
+\mathbf{x}_2^{\mathsf T}\\
+\vdots\\
+\mathbf{x}_B^{\mathsf T}
+\end{bmatrix}
+\in\mathbb R^{B\times d},
+\qquad
+\mathbf{W}\in\mathbb R^{m\times d},
+\qquad
+\mathbf{b}\in\mathbb R^m.
+$$
+
+这里 $B$ 是 batch size，$d$ 是输入特征数，$m$ 是输出特征数。权重仍然保持单样本列向量公式里的形状：**每一行对应一个输出神经元**。批量前向是：
+
+$$
+\boxed{
+\mathbf{Z}
+=
+\mathbf{X}\mathbf{W}^{\mathsf T}
++\mathbf{1}_B\mathbf{b}^{\mathsf T}
+\in\mathbb R^{B\times m}.
+}
+$$
+
+其中 $\mathbf{1}_B\in\mathbb R^{B\times1}$ 是全 $1$ 列向量，用来把同一个偏置复制到 batch 的每一行。逐元素展开为：
+
+$$
+Z_{rj}
+=
+\sum_{i=1}^{d}X_{ri}W_{ji}+b_j,
+\qquad
+r=1,\ldots,B,\quad j=1,\ldots,m.
+$$
+
+这说明第 $r$ 个样本、第 $j$ 个输出神经元的结果，正是样本行
+$\mathbf{X}_{r,:}$ 和权重第 $j$ 行 $\mathbf{W}_{j,:}$ 的点积。
+
+现在假设后续计算已经传回 logits / 输出矩阵的梯度：
+
+$$
+\boldsymbol{\Delta}_{\mathbf{Z}}
+=
+\nabla_{\mathbf{Z}}L
+=
+\frac{\partial L}{\partial\mathbf{Z}}
+\in\mathbb R^{B\times m}.
+$$
+
+其中 $\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+=\partial L/\partial Z_{rj}$。矩阵变量的损失微分使用 Frobenius 内积：
+
+$$
+\mathrm{d}L
+=
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathrm{d}\mathbf{Z}
+\right\rangle_F
+=
+\sum_{r=1}^{B}\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+\mathrm{d}Z_{rj}.
+$$
+
+先对批量前向式取微分：
+
+$$
+\mathrm{d}\mathbf{Z}
+=
+\mathrm{d}\mathbf{X}\mathbf{W}^{\mathsf T}
++\mathbf{X}\,\mathrm{d}\mathbf{W}^{\mathsf T}
++\mathbf{1}_B\,\mathrm{d}\mathbf{b}^{\mathsf T}.
+$$
+
+这里同样没有
+$\mathrm{d}\mathbf{X}\,\mathrm{d}\mathbf{W}^{\mathsf T}$，因为微分只保留一阶小量。代入损失微分：
+
+$$
+\begin{aligned}
+\mathrm{d}L
+&=
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathrm{d}\mathbf{X}\mathbf{W}^{\mathsf T}
+\right\rangle_F\\
+&\quad+
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathbf{X}\,\mathrm{d}\mathbf{W}^{\mathsf T}
+\right\rangle_F\\
+&\quad+
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathbf{1}_B\,\mathrm{d}\mathbf{b}^{\mathsf T}
+\right\rangle_F.
+\end{aligned}
+$$
+
+先看权重项。逐元素展开：
+
+$$
+\begin{aligned}
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathbf{X}\,\mathrm{d}\mathbf{W}^{\mathsf T}
+\right\rangle_F
+&=
+\sum_{r=1}^{B}\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+\left(
+\sum_{i=1}^{d}X_{ri}\,\mathrm{d}W_{ji}
+\right)\\
+&=
+\sum_{j=1}^{m}\sum_{i=1}^{d}
+\left(
+\sum_{r=1}^{B}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}X_{ri}
+\right)
+\mathrm{d}W_{ji}.
+\end{aligned}
+$$
+
+因为每个 $W_{ji}$ 都是独立变量，所以 $\mathrm{d}W_{ji}$ 前面的系数就是
+$\partial L/\partial W_{ji}$：
+
+$$
+\frac{\partial L}{\partial W_{ji}}
+=
+\sum_{r=1}^{B}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}X_{ri}.
+$$
+
+把所有元素排回矩阵，就是：
+
+$$
+\boxed{
+\nabla_{\mathbf{W}}L
+=
+\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{X}
+\in\mathbb R^{m\times d}.
+}
+$$
+
+这就是“batch 内所有样本对同一权重的贡献要相加”。矩阵乘法
+$\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{X}$ 中间的 batch 维
+$B$ 被求和掉了。
+
+再看输入项：
+
+$$
+\begin{aligned}
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathrm{d}\mathbf{X}\mathbf{W}^{\mathsf T}
+\right\rangle_F
+&=
+\sum_{r=1}^{B}\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+\left(
+\sum_{i=1}^{d}\mathrm{d}X_{ri}W_{ji}
+\right)\\
+&=
+\sum_{r=1}^{B}\sum_{i=1}^{d}
+\left(
+\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}W_{ji}
+\right)
+\mathrm{d}X_{ri}.
+\end{aligned}
+$$
+
+因此：
+
+$$
+\frac{\partial L}{\partial X_{ri}}
+=
+\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}W_{ji},
+$$
+
+写成矩阵形式：
+
+$$
+\boxed{
+\nabla_{\mathbf{X}}L
+=
+\boldsymbol{\Delta}_{\mathbf{Z}}\mathbf{W}
+\in\mathbb R^{B\times d}.
+}
+$$
+
+最后看偏置项：
+
+$$
+\begin{aligned}
+\left\langle
+\boldsymbol{\Delta}_{\mathbf{Z}},
+\mathbf{1}_B\,\mathrm{d}\mathbf{b}^{\mathsf T}
+\right\rangle_F
+&=
+\sum_{r=1}^{B}\sum_{j=1}^{m}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+\mathrm{d}b_j\\
+&=
+\sum_{j=1}^{m}
+\left(
+\sum_{r=1}^{B}
+\left(\boldsymbol{\Delta}_{\mathbf{Z}}\right)_{rj}
+\right)
+\mathrm{d}b_j.
+\end{aligned}
+$$
+
+所以：
+
+$$
+\boxed{
+\nabla_{\mathbf{b}}L
+=
+\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{1}_B
+\in\mathbb R^m.
+}
+$$
+
+也就是对 batch 维求和。实际代码中常写成 `grad_b = grad_Z.sum(dim=0)`。
+
+三个梯度汇总如下：
+
+$$
+\boxed{
+\begin{aligned}
+\nabla_{\mathbf{X}}L
+&=
+\boldsymbol{\Delta}_{\mathbf{Z}}\mathbf{W},\\
+\nabla_{\mathbf{W}}L
+&=
+\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{X},\\
+\nabla_{\mathbf{b}}L
+&=
+\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{1}_B.
+\end{aligned}
+}
+$$
+
+形状检查：
+
+| 梯度 | 计算 | 结果形状 |
+| --- | --- | --- |
+| $\nabla_{\mathbf{X}}L$ | $(B\times m)(m\times d)$ | $B\times d$，与 $\mathbf{X}$ 相同 |
+| $\nabla_{\mathbf{W}}L$ | $(m\times B)(B\times d)$ | $m\times d$，与 $\mathbf{W}$ 相同 |
+| $\nabla_{\mathbf{b}}L$ | $(m\times B)(B\times1)$ | $m$，与 $\mathbf{b}$ 相同 |
+
+它和单样本公式完全一致。若 $B=1$，则
+$\mathbf{X}=\mathbf{x}^{\mathsf T}$，
+$\boldsymbol{\Delta}_{\mathbf{Z}}=\boldsymbol{\delta}^{\mathsf T}$，于是：
+
+$$
+\nabla_{\mathbf{W}}L
+=
+\boldsymbol{\Delta}_{\mathbf{Z}}^{\mathsf T}\mathbf{X}
+=
+\boldsymbol{\delta}\mathbf{x}^{\mathsf T},
+$$
+
+$$
+\nabla_{\mathbf{X}}L
+=
+\boldsymbol{\Delta}_{\mathbf{Z}}\mathbf{W}
+=
+\boldsymbol{\delta}^{\mathsf T}\mathbf{W}.
+$$
+
+因为单样本部分把输入梯度写成列向量，所以还要转置回来：
+
+$$
+\left(\nabla_{\mathbf{X}}L\right)^{\mathsf T}
+=
+\mathbf{W}^{\mathsf T}\boldsymbol{\delta}.
+$$
+
+这正好回到前面的
+$\nabla_{\mathbf{x}}L=\mathbf{W}^{\mathsf T}\boldsymbol{\delta}$。因此，
+批量公式不是新规则，而是把 $B$ 个单样本外积和输入梯度并行堆起来；它也是
+PyTorch `Linear` 和 Llama 线性投影最常见的形状约定。
+
+如果损失定义为 batch 平均，$\boldsymbol{\Delta}_{\mathbf{Z}}$ 本身通常已经带有
+$1/B$ 的缩放；此时上面的矩阵公式不要再额外除以 $B$。若损失定义为 batch 求和，则没有这个平均缩放。
+
 ## 神经网络为什么需要非线性
 
 ### 单个神经元
@@ -4611,7 +4909,7 @@ $$
 这称为 inverted dropout。训练时除以保留概率 $q$，推理时可直接使用原激活。Dropout 给训练注入结构化噪声，常被解释为减少特征间脆弱的共同适应，同时也会增大梯度噪声。
 
 上式只保证当前激活在 mask 上的条件期望不变。经过后续非线性函数后，一般有
-$\mathbb{E}[f(\widetilde{\mathbf h})]\ne f(\mathbb{E}[\widetilde{\mathbf h}])$，所以它不表示训练时随机网络输出的期望严格等于推理网络输出。
+$\mathbb{E}[f(\widetilde{\mathbf{h}})]\ne f(\mathbb{E}[\widetilde{\mathbf{h}}])$，所以它不表示训练时随机网络输出的期望严格等于推理网络输出。
 
 ### 标签平滑
 

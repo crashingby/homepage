@@ -9328,3 +9328,342 @@ $$
 - **完全背包正序**：允许本轮更新继续参与后续转移，从而重复使用当前物品。
 
 完全背包不是一个新框架，它只是把 0-1 背包里的“选一次后去下一行”，改成了“选一次后还留在当前行”。
+
+## [322. 零钱兑换 - 力扣（LeetCode）](https://leetcode.cn/problems/coin-change/description/)
+
+给你一个整数数组 `coins`，表示不同面额的硬币；以及一个整数 `amount`，表示总金额。
+
+请计算并返回可以凑成总金额所需的**最少硬币个数**。如果没有任何一种硬币组合能组成总金额，返回 `-1`。
+
+你可以认为每种硬币的数量是无限的。
+
+示例 1：
+
+```text
+输入：coins = [1, 2, 5], amount = 11
+输出：3
+解释：11 = 5 + 5 + 1
+```
+
+示例 2：
+
+```text
+输入：coins = [2], amount = 3
+输出：-1
+```
+
+示例 3：
+
+```text
+输入：coins = [1], amount = 0
+输出：0
+```
+
+提示：
+
+- `1 <= coins.length <= 12`
+- `1 <= coins[i] <= 2^31 - 1`
+- `0 <= amount <= 10^4`
+
+这题是完全背包的经典入门题。它和“基础完全背包”的区别是：
+
+- 基础完全背包：容量不超过 `capacity` 时，最大化总价值。
+- 零钱兑换：金额必须**刚好等于** `amount`，并且最小化硬币数量。
+
+所以它是：
+
+> 完全背包 + 刚好装满 + 最小数量。
+
+### 题目如何转成完全背包？
+
+每种硬币可以使用无限次，所以它天然是完全背包：
+
+- **物品**：每一种硬币面额 `coins[i]`。
+- **重量 / 费用**：硬币面额本身，也就是 `coins[i]`。
+- **价值 / 代价**：使用一枚硬币，硬币数量增加 1。
+- **背包容量**：`amount`。
+- **完全约束**：每种硬币可以使用任意多次。
+- **目标**：刚好凑出 `amount` 时，使用硬币数量最少。
+
+这里的 `dp` 不是最大价值，而是最小硬币数。
+
+### 递归切入（探索逻辑）
+
+先从递归想。定义 `dfs(index, remain)` 表示：从第 `index` 种硬币开始考虑，还需要凑出金额 `remain` 时，最少需要多少枚硬币。
+
+站在第 `index` 种硬币面前，有两个选择：
+
+- **不选当前硬币**：跳到下一种硬币，答案来自 `dfs(index + 1, remain)`。
+- **选当前硬币**：前提是 `remain >= coins[index]`，答案来自 `dfs(index, remain - coins[index]) + 1`。
+
+注意第二项仍然是 `dfs(index, ...)`，因为当前硬币可以继续使用。
+
+递归边界：
+
+- 如果 `remain == 0`，说明金额已经刚好凑出，返回 0。
+- 如果 `index == coins.size()`，说明硬币种类都看完了还没凑出金额，返回无效大值 `kInf`。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+\min(
+dfs(index + 1, remain),\
+dfs(index, remain - coins[index]) + 1
+)
+$$
+
+第二项需要满足 `remain >= coins[index]`，并且子问题不能是无效状态。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求凑成 amount 的最少硬币数。
+     *
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @param amount 目标总金额。
+     * @return 凑成 amount 的最少硬币数；如果无法凑出，返回 -1。
+     */
+    int coinChange(vector<int>& coins, int amount) {
+        vector<vector<int>> memo(coins.size(), vector<int>(amount + 1, kUnknown));
+        const int answer = dfs(coins, memo, 0, amount);
+        return answer >= kInf ? -1 : answer;
+    }
+
+private:
+    static constexpr int kInf = 1000000000;
+    static constexpr int kUnknown = -1;
+
+    int dfs(const vector<int>& coins, vector<vector<int>>& memo, int index, int remain) {
+        if (remain == 0) {
+            return 0;
+        }
+        if (index == static_cast<int>(coins.size())) {
+            return kInf;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        // 不选当前硬币：进入下一种硬币。
+        cached = dfs(coins, memo, index + 1, remain);
+
+        if (remain >= coins[index]) {
+            // 选当前硬币：仍然停留在当前硬币种类，允许继续使用它。
+            const int next_count = dfs(coins, memo, index, remain - coins[index]);
+            if (next_count < kInf) {
+                cached = min(cached, next_count + 1);
+            }
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归里，`remain` 是剩余金额，返回值是“最少硬币数”。和基础完全背包一样，选当前硬币后仍然停留在当前 `index`。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][sum]` 表示只考虑前 `i` 种硬币时，刚好凑出金额 `sum` 所需的最少硬币数。
+
+如果无法凑出 `sum`，就让 `dp[i][sum] = kInf`。
+
+最终答案是：
+
+$$
+dp[coins.size()][amount]
+$$
+
+如果它仍然是无效大值，就返回 `-1`。
+
+### 状态转移
+
+继续使用安全垫写法，处理真实硬币 `coins[item]`。
+
+`dp[item]` 表示还没处理 `coins[item]` 之前的状态，`dp[item + 1]` 表示处理完 `coins[item]` 之后的状态。
+
+- **不选当前硬币**：最少硬币数继承上一行。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前硬币**：如果金额足够，就从当前行的剩余金额转移过来。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item + 1][sum - coins[item]] + 1
+$$
+
+注意这里和完全背包基础小节一样，来源是当前行 `dp[item + 1]`，因为当前硬币可以重复使用。
+
+合起来就是：
+
+$$
+dp[item + 1][sum] =
+\min(
+dp[item][sum],\
+dp[item + 1][sum - coins[item]] + 1
+)
+$$
+
+第二项需要满足 `sum >= coins[item]`，并且 `dp[item + 1][sum - coins[item]]` 不是无效状态。
+
+### 初始化
+
+- `dp[0][0] = 0`：不使用任何硬币，凑出金额 0 需要 0 枚硬币。
+- `dp[0][sum] = kInf`，其中 `sum > 0`：不使用任何硬币，不可能凑出正数金额。
+
+这里不能把所有状态都初始化为 0。因为这题要求**刚好凑出金额**，凑不出来的状态必须明确标记为无效。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `coins.size() - 1`，逐个处理真实硬币面额。
+- 内层从 `sum = 0` 到 `amount`，枚举当前要凑出的金额。
+
+这里内层必须正序。因为 `dp[item + 1][sum]` 会依赖当前行更小金额的 `dp[item + 1][sum - coins[item]]`，正序遍历才能保证它已经算好。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维完全背包求凑成 amount 的最少硬币数。
+     *
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @param amount 目标总金额。
+     * @return 凑成 amount 的最少硬币数；如果无法凑出，返回 -1。
+     */
+    int coinChange(vector<int>& coins, int amount) {
+        constexpr int kInf = 1000000000;
+        const int coin_count = static_cast<int>(coins.size());
+        vector<vector<int>> dp(coin_count + 1, vector<int>(amount + 1, kInf));
+        dp[0][0] = 0;
+
+        for (int item = 0; item < coin_count; item++) {
+            const int coin = coins[item];
+
+            for (int sum = 0; sum <= amount; sum++) {
+                // 不选当前硬币：继承上一行结果。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= coin && dp[item + 1][sum - coin] != kInf) {
+                    // 选当前硬币：来源是当前行，允许当前硬币被重复使用。
+                    dp[item + 1][sum] = min(
+                        dp[item + 1][sum],
+                        dp[item + 1][sum - coin] + 1);
+                }
+            }
+        }
+
+        return dp[coin_count][amount] == kInf ? -1 : dp[coin_count][amount];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(coins.size() \times amount)$。
+- 空间复杂度：$O(coins.size() \times amount)$。
+
+### 空间优化
+
+二维转移只依赖：
+
+- 上一行同金额：`dp[item][sum]`。
+- 当前行较小金额：`dp[item + 1][sum - coins[item]]`。
+
+压成一维后，`dp[sum]` 表示当前已经处理过的硬币种类中，刚好凑出金额 `sum` 的最少硬币数。
+
+处理当前硬币 `coin` 时：
+
+$$
+dp[sum] = \min(dp[sum],\ dp[sum - coin] + 1)
+$$
+
+因为硬币可以无限使用，所以一维金额必须正序遍历：
+
+```cpp
+for (int sum = coin; sum <= amount; sum++)
+```
+
+正序遍历时，`dp[sum - coin]` 可能已经在本轮被当前硬币更新过，再用它更新 `dp[sum]`，正好表示“当前硬币再用一枚”。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维完全背包求凑成 amount 的最少硬币数。
+     *
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @param amount 目标总金额。
+     * @return 凑成 amount 的最少硬币数；如果无法凑出，返回 -1。
+     */
+    int coinChange(vector<int>& coins, int amount) {
+        constexpr int kInf = 1000000000;
+        vector<int> dp(amount + 1, kInf);
+        dp[0] = 0;
+
+        for (const int coin : coins) {
+            // 正序遍历金额，允许当前硬币在同一轮中被重复使用。
+            for (int sum = coin; sum <= amount; sum++) {
+                if (dp[sum - coin] != kInf) {
+                    dp[sum] = min(dp[sum], dp[sum - coin] + 1);
+                }
+            }
+        }
+
+        return dp[amount] == kInf ? -1 : dp[amount];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(coins.size() \times amount)$。
+- 空间复杂度：$O(amount)$。
+
+### 这题的核心手感
+
+322 的核心，是把“每种硬币数量无限”直接翻译成完全背包：
+
+> 从硬币面额中选择若干枚，允许重复选择同一种面额，刚好凑出 `amount`，并让硬币数量最少。
+
+它和基础完全背包的关系非常直接：
+
+- 基础完全背包：每个物品可重复选，目标是最大价值。
+- 零钱兑换：每个硬币可重复选，目标是最小硬币数。
+
+所以转移从 `max` 变成了 `min`：
+
+$$
+dp[sum] = \min(dp[sum],\ dp[sum - coin] + 1)
+$$
+
+但完全背包的骨架不变：
+
+- 二维安全垫写法里，选当前硬币时看当前行：`dp[item + 1][...]`。
+- 一维压缩后，金额正序遍历，允许当前硬币在本轮继续参与转移。
+
+如果你能看出 `dp[item + 1][sum - coin] + 1` 里的 `item + 1`，就说明你真正抓住了完全背包和 0-1 背包的分界线。

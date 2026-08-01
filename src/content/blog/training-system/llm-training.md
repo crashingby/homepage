@@ -931,7 +931,7 @@ $\mathbf{1}\mathbf{b}^{\mathsf T}$。这就是源码里
 `self.q_proj(hidden_states)`、`self.gate_proj(x)`、`self.lm_head(hidden_states)`
 背后的矩阵乘法语义。
 
-这和上一篇 `training-mathematical-theory.md` 的列向量公式并不矛盾。上一篇先讲单个样本：
+这和上一篇 `训练理论` 的列向量公式并不矛盾。上一篇先讲单个样本：
 
 $$
 \mathbf{z}_{\mathrm{col}}
