@@ -15,7 +15,7 @@ FA2 的 Python 前向接口名字很多，但核心不是“有很多套注意�
 
 ## 源码阅读路线
 
-这一节对应路线图里的第一层：
+这一节对应路线图里的前三层：
 
 ```mermaid
 flowchart TD
@@ -29,7 +29,42 @@ flowchart TD
 
 本节先回答：调用方应该选哪个 Python 前向接口，每个接口的参数和返回值是什么意思，以及这些接口如何收敛到底层 CUDA forward。后续章节会继续沿着这张图往下读。
 
-## 接口总览
+## 从公开 API 到 CUDA 的完整分层
+
+上一张图把 `FlashAttnFunc` 当作入口后的第一层；但真实调用从用户直接调用的 `flash_attn_func` 才开始。`flash_attn_interface.py` 同时承担了接口适配、PyTorch autograd 接入、`torch.compile` 接入和 CUDA extension 边界适配四件事。以最通用的定长前向 `flash_attn_func(q, k, v)` 为例，完整链路是：
+
+```mermaid
+flowchart TD
+    A["公开 API<br/>flash_attn_func(q, k, v)"] --> B["Autograd 入口<br/>FlashAttnFunc.apply(...)"]
+    B --> C["自定义求导规则<br/>FlashAttnFunc.forward / backward"]
+    C --> D{"PyTorch 版本"}
+    D -- "&gt;= 2.4" --> E["Dispatcher 自定义算子<br/>torch.ops.flash_attn._flash_attn_forward"]
+    D -- "&lt; 2.4" --> F["Python 函数<br/>_flash_attn_forward"]
+    E --> G["包装层<br/>_flash_attn_forward"]
+    F --> G
+    G --> H["后端模块<br/>flash_attn_gpu.fwd"]
+    H --> I["PyBind11 导出<br/>mha_fwd"]
+    I --> J["C++ 参数检查与 dispatch<br/>run_mha_fwd"]
+    J --> K["CUDA 模板实例<br/>run_mha_fwd_ / split-KV"]
+    K --> L["CUDA kernel<br/>flash_fwd_kernel.h"]
+```
+
+这不是每一层都重新计算 attention：前半段主要是在**重组输入布局、保存反向所需状态，并告诉 PyTorch 如何认识这个算子**；真正的 GPU 计算从 `flash_attn_gpu.fwd` 进入已编译 extension 后才开始。`flash_attn_with_kvcache` 是唯一例外：它不支持 backward，因此公开函数经过少量输入规范化后直接调用 `flash_attn_gpu.fwd_kvcache`。
+
+### 层次与职责速查
+
+| 层次 | 定长普通路径中的符号 | 主要职责 | 是否参与 CUDA 计算 |
+| --- | --- | --- | --- |
+| 公开 API | `flash_attn_func` | 提供稳定、易用的签名；传入 `torch.is_grad_enabled()`。 | 否 |
+| autograd wrapper | `FlashAttnFunc.apply`、`FlashAttnFunc` | 建立 PyTorch 反向节点，组织 `forward` 保存的状态和 `backward` 返回的梯度。 | 否 |
+| 编译 / dispatcher 包装 | `_wrapped_flash_attn_forward` | 在 PyTorch 2.4+ 走 `torch.ops`，让 dispatcher 和 `torch.compile` 能识别自定义算子。 | 否 |
+| Python 后端边界 | `_flash_attn_forward` | 保证最后一维连续，调用 extension 的 `fwd`。 | 否 |
+| 已编译 extension | `flash_attn_gpu.fwd` | Python 绑定名；对应 C++ 的 `mha_fwd`。 | 进入 CUDA |
+| C++ / CUDA dispatch | `mha_fwd`、`run_mha_fwd` | 检查约束、准备 `Flash_fwd_params`、按 dtype/head dim/causal 等选择模板。 | 发射 kernel |
+
+其它训练接口只是在第一、二层不同：packed 接口切分或合并 Q/K/V 梯度，`varlen` 接口多传 `cu_seqlens_*` 与最大长度；它们分别收敛到 `varlen_fwd` / `varlen_bwd`。因此读源码时应把“接口形态差异”和“底层 attention 算法差异”分开：前者多数在 Python wrapper 消化，后者在 C++/CUDA dispatch 中决定。
+
+## 公开 API 接口总览
 
 | 接口 | 输入布局 | 主要场景 | 是否支持 backward | 备注 |
 | --- | --- | --- | --- | --- |
@@ -53,6 +88,115 @@ flowchart TD
 | `with_kvcache` | 使用已有 KV cache 做 decode 或增量推理 | `k_cache/v_cache` 保存历史 token 的 K/V |
 
 换句话说，普通接口解决“怎么传 Q/K/V”，`varlen` 解决“怎么表示不等长序列”，`with_kvcache` 解决“推理时怎么复用历史 K/V”。
+
+### 维度顺序：接口布局和计算视角
+
+学习 attention 公式时，经常把 Q/K/V 写成：
+
+```text
+(B, H, L, D)
+```
+
+这个写法很适合数学推导，因为每个 `(b, h)` 对应一张 attention score 矩阵：
+
+```text
+Q[b, h]: (Lq, D)
+K[b, h]: (Lk, D)
+S[b, h]: (Lq, Lk)
+```
+
+但是 FA2 的公开 Python 接口采用的是：
+
+```text
+(B, L, H, D)
+```
+
+这里不是算法视角变了，而是**接口布局更贴近 Transformer 上游线性层的输出**。典型模型里，hidden states 先是：
+
+```text
+x: (B, L, hidden_size)
+```
+
+经过 QKV projection 后通常得到：
+
+```text
+qkv_proj(x): (B, L, 3 * H * D)
+```
+
+最自然的 reshape 是：
+
+```text
+qkv: (B, L, 3, H, D)
+q:   (B, L, H, D)
+k:   (B, L, H, D)
+v:   (B, L, H, D)
+```
+
+如果接口强制使用 `(B, H, L, D)`，上游通常还要做一次 `transpose(1, 2)`，很多情况下再接 `.contiguous()` 就会触发真实内存重排。FA2 作为性能库，更希望调用方保持 projection 后自然得到的 `(B, L, H, D)`，然后 kernel 自己通过 stride（步幅）取出需要的 head 视图。
+
+所以这里要分清两层：
+
+| 层次 | 常用写法 | 含义 |
+| --- | --- | --- |
+| 数学 / 逻辑视角 | `(B, H, L, D)` | 固定 `(b, h)` 后，一张 head 内 attention 是 `(Lq, D) @ (D, Lk)`。 |
+| FA2 Python 接口布局 | `(B, L, H, D)` | 贴近 `Linear(B, L, hidden)` 后的 reshape，最后一维 `D` 连续。 |
+| CUDA kernel 内部视角 | 固定 `bidb` 和 `bidh` 后取 `(L, D)` tile | kernel 不需要整体 transpose，只根据 stride 在原布局里寻址。 |
+
+对于 contiguous 的 `(B, L, H, D)` tensor，元素地址可以理解成：
+
+$$
+\operatorname{offset}(b, i, h, d)
+= (((b \cdot L + i) \cdot H + h) \cdot D + d)
+$$
+
+固定 `b` 和 `h` 后，kernel 访问的是：
+
+```text
+q[b, :, h, :] -> 逻辑形状 (L, D)
+```
+
+这个 `(L, D)` 视图不一定是一整块连续矩阵，因为相邻 token 之间隔着 `H * D` 个元素；但每个 token 的 head vector：
+
+```text
+q[b, i, h, 0:D]
+```
+
+最后一维 `D` 是连续的，这正是 kernel 做向量化加载和按 `headdim` 计算时最关心的局部连续性。
+
+在 C++ `mha_fwd` 中，这个布局会被拆成：
+
+```cpp
+batch_size = q.size(0);  // B
+seqlen_q   = q.size(1);  // Lq
+num_heads  = q.size(2);  // Hq
+head_size  = q.size(3);  // D
+```
+
+然后保存 stride：
+
+```cpp
+q_batch_stride = q.stride(0);
+q_row_stride   = q.stride(-3);  // L 维 stride
+q_head_stride  = q.stride(-2);  // H 维 stride
+```
+
+进入 CUDA kernel 后，`blockIdx.y` 选择 batch，`blockIdx.z` 选择 query head。kernel 会构造当前 head 的二维视图：
+
+```cpp
+mQ: (actual_seqlen_q, h, d)
+gQ = mQ(_, bidh, _) -> (kBlockM, kHeadDim)
+
+mK: (actual_seqlen_k, h_k, d)
+gK = mK(_, bidh / h_h_k_ratio, _) -> (kBlockN, kHeadDim)
+```
+
+也就是说，FA2 的设计可以概括成：
+
+```text
+对外接口：保持上游友好的 (B, L, H, D)
+对内计算：仍然固定 (b, h)，按数学上的 (L, D) head 平面做 attention
+实现方式：不做全量 transpose，只用 stride 和 blockIdx 定位数据
+```
 
 ## 常见参数语义
 
@@ -305,6 +449,20 @@ causal 场景下，由于合法区域里 key 都在 query 的左侧，距离公�
 - 位置关系不一定要通过绝对位置 embedding 注入，也可以直接作为 attention score bias。
 - ALiBi 让不同 head 带有不同的距离偏好：有些 head 更关注近处，有些 head 可以看得更远。
 - 对长上下文外推有帮助，因为它使用相对距离的线性 bias，不依赖固定长度的位置表。
+
+**与绝对位置编码、RoPE 的关系**
+
+三者都是让模型知道 token 位置的方案，但**注入位置不同**：
+
+| 方案 | 位置在哪里进入计算 | 相对于 attention score 的时机 | FA2 接口中的表现 |
+| --- | --- | --- | --- |
+| 绝对位置编码 | 在进入 Q/K/V projection 前，把位置向量加到 token hidden state：`x_i = token_i + p_i`。 | `QK^T` 之前很早的上游网络。 | FA2 看不到 `p_i`；调用前传入的 `q/k/v` 已经带有它的影响。 |
+| RoPE（旋转位置编码） | 按位置分别旋转 `Q_i` 和 `K_j`，再计算内积。 | `QK^T` 之前、attention 内积紧邻的一步。 | 普通 `flash_attn_*_func` 要求上游先旋转 Q/K；只有 `flash_attn_with_kvcache` 接收 `rotary_cos` / `rotary_sin`，可在写 cache 和计算时融合旋转。 |
+| ALiBi | 给已算出的 score 加上与相对距离成线性的 bias：`S' = QK^T / sqrt(d) + bias(i, j)`。 | `QK^T` 之后、softmax 之前。 | 通过 `alibi_slopes` 传入，由 FA2 在 score 计算路径中融合。 |
+
+因此，原始 ALiBi 架构通常把它作为**主要的位置方案**，不再额外使用绝对位置 embedding 或 RoPE；对某个已经训练好的模型，也应严格遵守它的 checkpoint/config 采用的方案。例如，RoPE 模型不应仅因为 FA2 支持 `alibi_slopes` 就额外打开 ALiBi，否则推理函数与训练时的 attention 定义不一致。
+
+但三者在数学和 FA2 API 上**并非强制互斥**：绝对位置编码或预先完成的 RoPE 都可以与额外的 score bias 叠加。尤其 `flash_attn_with_kvcache` 同时接受 `rotary_cos`、`rotary_sin` 和 `alibi_slopes`，其 C++ 实现分别设置 rotary 参数和 ALiBi 参数，并没有互斥检查。这说明“技术上可以同时用”；是否应该同时用则是模型架构与训练设计的选择，通常只有专门以组合方案训练的模型才会这么做。
 
 **和 mask 的区别**
 
@@ -742,19 +900,152 @@ flowchart TD
 
 这张图只按 Python 接口选择来理解。真正的 CUDA kernel dispatch 还会继续根据 dtype、head_dim、causal、dropout、local attention、是否 split-KV 等条件选择模板实例。
 
-## 从源码推断的内部包装关系
+## 公开函数、`torch.autograd.Function` 与底层接口
 
-公开接口本身不直接调用 C++ extension，而是先进入对应的 `torch.autograd.Function`。这样 Python 层可以保存 backward 需要的 tensor，例如 `q`、`k`、`v`、`out_padded`、`softmax_lse`、`rng_state`。
+### 公开 API：真正由模型代码调用的入口
 
-| 公开接口 | Autograd wrapper | 底层 forward |
+模型代码不应该直接调用 `_flash_attn_forward` 或 `flash_attn_gpu.fwd`；它们是模块内部接口。真正对外的是没有下划线的七个函数：
+
+| 公开 API | `.apply()` 的 autograd 类 | forward 自定义算子 | backward 自定义算子 | extension 最终入口 |
+| --- | --- | --- | --- | --- |
+| `flash_attn_func` | `FlashAttnFunc` | `_wrapped_flash_attn_forward` | `_wrapped_flash_attn_backward` | `fwd` / `bwd` |
+| `flash_attn_qkvpacked_func` | `FlashAttnQKVPackedFunc` | `_wrapped_flash_attn_forward` | `_wrapped_flash_attn_backward` | `fwd` / `bwd` |
+| `flash_attn_kvpacked_func` | `FlashAttnKVPackedFunc` | `_wrapped_flash_attn_forward` | `_wrapped_flash_attn_backward` | `fwd` / `bwd` |
+| `flash_attn_varlen_func` | `FlashAttnVarlenFunc` | `_wrapped_flash_attn_varlen_forward` | `_wrapped_flash_attn_varlen_backward` | `varlen_fwd` / `varlen_bwd` |
+| `flash_attn_varlen_qkvpacked_func` | `FlashAttnVarlenQKVPackedFunc` | `_wrapped_flash_attn_varlen_forward` | `_wrapped_flash_attn_varlen_backward` | `varlen_fwd` / `varlen_bwd` |
+| `flash_attn_varlen_kvpacked_func` | `FlashAttnVarlenKVPackedFunc` | `_wrapped_flash_attn_varlen_forward` | `_wrapped_flash_attn_varlen_backward` | `varlen_fwd` / `varlen_bwd` |
+| `flash_attn_with_kvcache` | 无 | 无 | 无 | `fwd_kvcache` |
+
+以 `flash_attn_func` 为例，它的实现本质上是一个很薄的入口：
+
+```python
+return FlashAttnFunc.apply(
+    q, k, v,
+    dropout_p, softmax_scale, causal, window_size,
+    softcap, alibi_slopes, deterministic,
+    return_attn_probs, torch.is_grad_enabled(),
+)
+```
+
+最后的 `torch.is_grad_enabled()` 不是普通 attention 参数。它把调用点是否处于 `torch.no_grad()` / inference mode 的状态显式传给 `forward`：wrapper 只有在“当前允许求导”并且至少一个输入 `requires_grad=True` 时，才保存反向状态。`flash_attn_with_kvcache` 因为会原地更新 cache 且源码明确不支持 backward，所以不经过 `.apply()`。
+
+### `torch.autograd.Function`：把 CUDA 前向接进 PyTorch 自动求导
+
+`torch.autograd.Function` 是 PyTorch 为“PyTorch 不知道如何自动微分的运算”提供的扩展点。普通 PyTorch 运算会由 autograd 根据已登记的梯度规则自动串成计算图；FA2 的核心计算在自定义 CUDA extension 中，PyTorch 无法从 `flash_attn_gpu.fwd` 的内部推导梯度。因此 FA2 定义 `FlashAttnFunc` 等类，并以 `Class.apply(...)` 作为调用入口：
+
+```text
+输入 requires_grad=True
+        │
+        ▼
+FlashAttnFunc.apply(...)
+        │  调用静态 forward(ctx, ...)
+        ▼
+输出 out（其 grad_fn 关联到这个 Function）
+        │
+        ▼
+loss.backward()
+        │  autograd 将 dout 传给静态 backward(ctx, dout)
+        ▼
+返回与 apply 输入逐一对应的 dq、dk、dv 或 None
+```
+
+`ctx` 是本次 `.apply()` 调用专属的上下文对象，不是类的实例状态。FA2 用它保存两类数据：
+
+| 保存方式 | `FlashAttnFunc` 中的内容 | 为什么要保存 |
 | --- | --- | --- |
-| `flash_attn_func` | `FlashAttnFunc` | `_wrapped_flash_attn_forward` -> `flash_attn_gpu.fwd` |
-| `flash_attn_qkvpacked_func` | `FlashAttnQKVPackedFunc` | `_wrapped_flash_attn_forward` -> `flash_attn_gpu.fwd` |
-| `flash_attn_kvpacked_func` | `FlashAttnKVPackedFunc` | `_wrapped_flash_attn_forward` -> `flash_attn_gpu.fwd` |
-| `flash_attn_varlen_func` | `FlashAttnVarlenFunc` | `_wrapped_flash_attn_varlen_forward` -> `flash_attn_gpu.varlen_fwd` |
-| `flash_attn_varlen_qkvpacked_func` | `FlashAttnVarlenQKVPackedFunc` | `_wrapped_flash_attn_varlen_forward` -> `flash_attn_gpu.varlen_fwd` |
-| `flash_attn_varlen_kvpacked_func` | `FlashAttnVarlenKVPackedFunc` | `_wrapped_flash_attn_varlen_forward` -> `flash_attn_gpu.varlen_fwd` |
-| `flash_attn_with_kvcache` | 无 autograd wrapper | `flash_attn_gpu.fwd_kvcache` |
+| `ctx.save_for_backward(...)` | `q`、`k`、`v`、`out_padded`、`softmax_lse`、`rng_state` | 这些是 tensor；PyTorch 会将其作为 saved tensors 管理，并在 backward 时通过 `ctx.saved_tensors` 取回。`rng_state` 用于让 dropout backward 复现 forward 的随机掩码。 |
+| `ctx.<field> = ...` | `dropout_p`、`softmax_scale`、`causal`、`window_size`、`softcap`、`alibi_slopes`、`deterministic` | 这些是标量、元组或配置，backward 调用 extension 时必须保持与 forward 一致。 |
+
+`FlashAttnFunc.forward` 会将 `headdim` 补齐到 8 的倍数，调用前向算子，并在输出前裁回原来的维度。其 `backward` 则先创建 `dq/dk/dv`，把这些**预分配的输出 buffer**交给 `_wrapped_flash_attn_backward` 原地写入，最后裁掉 padding，并按 `.apply()` 的参数顺序返回：
+
+```python
+# 与 q、k、v 对应的三个梯度；后面的非 tensor 或不可导参数均为 None。
+return dq, dk, dv, None, None, None, None, None, None, None, None, None
+```
+
+这个“返回值位置必须对齐 `apply` 输入位置”的规则很重要。packed 版本正是利用它避免额外拼接：`FlashAttnQKVPackedFunc.backward` 分配一个 `dqkv`，把三个视图 `dqkv[:, :, 0:3]` 传给底层 backward，最后只返回一个与 `qkv` 对齐的梯度；`KVPacked` 版本类似地返回 `dq, dkv`。变长类仅额外保存 `cu_seqlens_*` 和 `max_seqlen_*`，其机制完全相同。
+
+### `_flash_attn_*`：Python 后端边界与连续性规范化
+
+`FlashAttnFunc` 并不直接调用 extension，而是调用 `_wrapped_flash_attn_forward`。在 PyTorch 2.4 以下，它就是 `_flash_attn_forward`；该函数才是 Python 与已编译模块之间的直接边界：
+
+```python
+def _flash_attn_forward(...) -> tuple[torch.Tensor, ...]:
+    # 若最后一维不是连续存储，先复制为最后一维 stride 为 1 的 tensor。
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    return flash_attn_gpu.fwd(q, k, v, None, alibi_slopes, ...)
+```
+
+`maybe_contiguous` 只在 `x.stride(-1) != 1` 时调用 `.contiguous()`，因此不会无条件复制。C++ 的 `mha_fwd` / `mha_varlen_fwd` 同样检查最后一维连续；这里提前规范化是为了把常见的非连续输入转换为 extension 可接受的布局。注意，这不要求整个 tensor 连续，batch、sequence、head 维仍可以由 stride 描述。
+
+四个内部算子及其返回 / 写入关系如下：
+
+| 内部函数 | 调用的 extension 符号 | 返回值或副作用 |
+| --- | --- | --- |
+| `_flash_attn_forward` | `flash_attn_gpu.fwd` | 返回 `out, softmax_lse, S_dmask, rng_state`。 |
+| `_flash_attn_varlen_forward` | `flash_attn_gpu.varlen_fwd` | 返回同样四项，另外接收 `cu_seqlens_*`、`block_table` 等变长元数据。 |
+| `_flash_attn_backward` | `flash_attn_gpu.bwd` | 原地写入传入的 `dq/dk/dv`，Python 侧只返回 `softmax_d`。 |
+| `_flash_attn_varlen_backward` | `flash_attn_gpu.varlen_bwd` | 原地写入传入的 `dq/dk/dv`，Python 侧只返回 `softmax_d`。 |
+
+这里“backward 只返回 `softmax_d`”不表示它没有算 `dq/dk/dv`：三者是作为传入 buffer 被 CUDA extension 修改的。这个约定也解释了后面的 `mutates_args=("dq", "dk", "dv")`。
+
+### `torch.library.custom_op`、`torch.ops` 与 fake 实现
+
+从源码可见，2.4 是这一层的分界点：
+
+```python
+if torch.__version__ >= "2.4.0":
+    _torch_custom_op_wrapper = torch.library.custom_op
+    _torch_register_fake_wrapper = torch.library.register_fake
+else:
+    _torch_custom_op_wrapper = noop_custom_op_wrapper
+    _torch_register_fake_wrapper = noop_register_fake_wrapper
+```
+
+随后 `_flash_attn_forward` 被统一的别名装饰，而不是总是直接写 `@torch.library.custom_op`：
+
+```python
+@_torch_custom_op_wrapper(
+    "flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda"
+)
+def _flash_attn_forward(...) -> tuple[torch.Tensor, ...]:
+    ...
+```
+
+| 机制 | PyTorch 2.4+ 的行为 | 旧版 PyTorch 的行为 |
+| --- | --- | --- |
+| `_torch_custom_op_wrapper` | 等于 `torch.library.custom_op`。它把 Python 函数登记为命名空间 `flash_attn` 中的自定义 operator，并依据注解建立 dispatcher 可见的 schema。 | 是一个 no-op 装饰器，只返回原函数；不登记 dispatcher operator。 |
+| `_torch_register_fake_wrapper` | 等于 `torch.library.register_fake`。它为同名 operator 登记“只推导元数据”的实现。 | no-op；不会登记 fake 实现。 |
+| `_wrapped_flash_attn_forward` | 绑定到 `torch.ops.flash_attn._flash_attn_forward`，经 PyTorch dispatcher 调用。 | 直接绑定到 Python 函数 `_flash_attn_forward`。 |
+
+`torch.ops.flash_attn._flash_attn_forward` 不是 CUDA extension 里 PyBind11 的 `fwd` 名字，而是 `torch.library` 登记后，由 PyTorch dispatcher 暴露的算子句柄；两者之间仍隔着 `_flash_attn_forward` 这个 Python 函数。这样分层能让 `torch.compile` 在编译图中把 FA2 当成具有明确输入输出和副作用的 operator，而不是一个无法分析的任意 Python 调用。
+
+四个 `*_fake` 函数不会运行 `flash_attn_gpu` 的 CUDA kernel。它们只根据输入的 shape、dtype 和 device 创建同形状或预期形状的空 tensor，例如定长 forward 的 `out` 与 `q` 同形、`softmax_lse` 为 `(batch_size, num_heads, seqlen_q)`。这让 FakeTensor / 编译期的形状传播可以得到输出元数据，同时不要求在 tracing 时真的有可执行 CUDA 计算。
+
+`mutates_args` 则是算子副作用契约：
+
+| 装饰的函数 | `mutates_args` | 含义 |
+| --- | --- | --- |
+| `_flash_attn_forward`、`_flash_attn_varlen_forward` | `()` | 不原地修改其参数。 |
+| `_flash_attn_backward`、`_flash_attn_varlen_backward` | `("dq", "dk", "dv")` | CUDA extension 会把梯度结果写入这三个调用方提供的 buffer；compiler / dispatcher 不能把它们当作纯函数输入。 |
+
+源码采用 `torch.__version__ >= "2.4.0"` 的**字符串比较**。它表达的意图是“只在新 API 可用时启用 custom op 和 fake registration”；如果维护这段代码，更稳妥的版本判断通常应使用版本解析对象，而不是字符串字典序（例如 `"2.10.0"` 与 `"2.4.0"` 的字典序并不符合数值版本顺序）。这是对源码维护性的观察，不影响本文所分析版本的层级关系。
+
+### 从 `flash_attn_gpu` 到 C++ / CUDA
+
+文件开头根据后端选择导入的模块：NVIDIA CUDA 主路径是 `import flash_attn_2_cuda as flash_attn_gpu`；ROCm/HIP 环境在不能导入该模块或显式开启开关时，可改走 Triton AMD 实现。后文沿用 `flash_attn_gpu` 这个统一别名讨论 NVIDIA 主路径。
+
+`flash_attn_2_cuda` 的 PyBind11 模块在 `csrc/flash_attn/flash_api.cpp` 导出下列 Python 名称：
+
+| Python extension 名称 | C++ 实现 | 用途 |
+| --- | --- | --- |
+| `fwd` | `mha_fwd` | 定长 forward。 |
+| `varlen_fwd` | `mha_varlen_fwd` | 变长 / 可选 paged KV forward。 |
+| `bwd` | `mha_bwd` | 定长 backward。 |
+| `varlen_bwd` | `mha_varlen_bwd` | 变长 backward。 |
+| `fwd_kvcache` | `mha_fwd_kvcache` | KV cache 推理 forward。 |
+
+以 `mha_fwd` 为例，它先检查 CUDA 设备、Ampere 及以上计算能力、`fp16` / `bf16` dtype、最后一维连续、`head_size <= 256`、`head_size % 8 == 0` 和 MQA/GQA 的整除关系；然后分配 `out`、`softmax_lse`、可选 `S_dmask`、`rng_state`，将地址和 stride 填入 `Flash_fwd_params`。最后 `run_mha_fwd` 通过 `FP16_SWITCH`、`HEADDIM_SWITCH` 和 `BOOL_SWITCH` 选择 element type、编译期 head dimension 与 causal 模板参数；根据 split-KV 条件再选择普通 kernel 或 `run_mha_fwd_splitkv_dispatch`。这正是 Python 的通用参数最终收敛为有限个 CUDA 模板实例的位置。
 
 注意 `qkvpacked` 和 `kvpacked` 的“打包”主要影响 Python 层如何从输入 tensor 中切出 `q/k/v`，以及 backward 如何组织梯度返回；进入底层 CUDA forward 时，仍然会把 Q、K、V 作为独立 tensor 传入。
 
@@ -793,7 +1084,11 @@ flash_attn_with_kvcache(q, k_cache, v_cache, k, v, cache_seqlens=cache_seqlens)
 ```text
 flash_attn_func
 -> FlashAttnFunc.apply
+-> FlashAttnFunc.forward
 -> _wrapped_flash_attn_forward
+-> torch.ops.flash_attn._flash_attn_forward  (PyTorch >= 2.4)
+   或 _flash_attn_forward                    (旧版 PyTorch)
+-> _flash_attn_forward
 -> flash_attn_gpu.fwd
 -> csrc/flash_attn/flash_api.cpp::mha_fwd
 -> csrc/flash_attn/flash_api.cpp::run_mha_fwd

@@ -541,23 +541,83 @@ docker volume inspect pg-data
 
 ## 创建自己的镜像
 
+### Dockerfile：先理解语法与执行模型
+
+Dockerfile 是按顺序执行的构建配方，基本语法为 `INSTRUCTION arguments`。第一个有效构建指令通常是 `FROM`，每个 `FROM` 会开启一个新的构建阶段；会改变文件系统的指令通常形成可缓存的镜像层。
+
+```dockerfile
+# 注释或 parser directive
+FROM ubuntu:22.04 AS builder
+RUN apt-get update && apt-get install -y cmake
+CMD ["/app/server"]
+```
+
+- Docker 从上到下匹配构建缓存；某一层失效后，后续层都会重建。因此先写变化少的基础依赖，再 `COPY` 经常变化的源码。
+- `RUN apt-get update && ...` 是 **shell 形式**，由 `/bin/sh -c` 执行，适合管道、变量与 `&&`。`CMD ["/app/server"]` 是 **exec 形式**，不会经过 shell，推荐用于长期运行服务的启动命令。
+- `docker build -f docker/Dockerfile.gateway .` 中，`-f` 只指定 Dockerfile；最后的 `.` 才是**构建上下文**。`COPY` / `ADD` 只能读取上下文内的文件。
+
 ### Dockerfile 的常用指令
 
-Dockerfile 是按顺序执行的构建配方；每条会改变文件系统的指令通常形成一个镜像层。合理安排顺序能提升缓存命中率：先复制不常变化的依赖清单、安装依赖，再复制经常变化的应用源码。
-
-| 指令 | 用途 | 示例 |
+| 指令与语法 | 用途与约束 | 示例 |
 | --- | --- | --- |
-| `FROM` | 指定基础镜像；每个构建阶段从它开始。 | `FROM python:3.13-slim` |
-| `WORKDIR` | 设置后续命令的工作目录；目录不存在会创建。 | `WORKDIR /app` |
-| `COPY` | 从构建上下文复制文件到镜像。优先于功能更多但语义较宽的 `ADD`。 | `COPY requirements.txt .` |
-| `RUN` | 构建时执行命令，通常用于安装依赖。 | `RUN pip install --no-cache-dir -r requirements.txt` |
-| `ENV` | 设置构建后仍存在的环境变量。 | `ENV PYTHONDONTWRITEBYTECODE=1` |
-| `ARG` | 构建期变量；默认不会保留为容器环境变量。**不要用来传递密钥。** | `ARG APP_VERSION` |
-| `EXPOSE` | 记录应用监听端口的元数据，不会自动发布端口。 | `EXPOSE 8000` |
-| `USER` | 指定后续命令和默认容器进程的用户。 | `USER app` |
-| `CMD` | 默认参数或默认命令；运行 `docker run 镜像 其他命令` 时通常会被覆盖。 | `CMD ["python", "app.py"]` |
-| `ENTRYPOINT` | 固定默认可执行程序；常与 `CMD` 组合提供默认参数。 | `ENTRYPOINT ["python"]` |
-| `HEALTHCHECK` | 定义健康检查命令和策略。 | `HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1` |
+| `FROM <镜像> [AS <阶段>]` | 指定基础镜像并开启新阶段；命名阶段可被 `COPY --from=<阶段>` 引用。 | `FROM python:3.13-slim AS runtime` |
+| `ARG <名称>[=<默认值>]` | 仅构建期可用。`FROM` 前的 ARG 只可供 `FROM` 使用；要在阶段内使用须重新声明。**不能传密钥。** | `ARG JOBS=4` |
+| `ENV <名称>=<值>` | 写入镜像配置，构建期和运行期都可见；不适合密码。 | `ENV LD_LIBRARY_PATH=/usr/local/lib` |
+| `WORKDIR <目录>` | 设置后续 `RUN`、`COPY`、`CMD` 工作目录；不存在会创建。 | `WORKDIR /app` |
+| `COPY [--from=<阶段>] <源>... <目标>` | 从构建上下文或前一阶段复制文件。普通复制优先于 `ADD`。 | `COPY --from=builder /out/server /app/server` |
+| `RUN <命令>` | 构建时执行命令并生成镜像层；安装 APT 包后应同层清理缓存。 | `RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*` |
+| `USER <用户>[:<组>]` | 设置后续构建命令和默认容器进程用户。 | `USER appuser` |
+| `EXPOSE <端口>[/tcp\|udp]` | 声明容器监听端口；**不会**自动发布到宿主机。 | `EXPOSE 8000` |
+| `VOLUME ["/路径"]` | 声明应持久化的数据目录；实际挂载通常由 Compose 控制。 | `VOLUME ["/app/Log"]` |
+| `CMD ["程序", "参数"]` | 默认启动命令，可被 `docker run` 或 Compose `command` 覆盖。 | `CMD ["./server"]` |
+| `ENTRYPOINT ["程序"]` | 固定主程序，运行时参数会附在其后。 | `ENTRYPOINT ["python"]` |
+| `HEALTHCHECK CMD <命令>` | 定义容器健康检查，可供 Compose 等待服务就绪。 | `HEALTHCHECK CMD curl -f http://localhost:8000/health || exit 1` |
+| `LABEL <键>=<值>` / `STOPSIGNAL <信号>` | 分别添加镜像元数据、定义 `docker stop` 的首个信号。 | `STOPSIGNAL SIGTERM` |
+
+`ARG` 与 `ENV` 的区别是：前者默认不会留在运行容器中，适合依赖版本、构建并行度；后者会保留，适合 `PATH`、运行库路径。`RUN` 发生在 `docker build`，而 `CMD` 只会在容器启动时执行。
+
+### 多阶段构建：`FROM ... AS ...` 的概念模型
+
+一条 `FROM <基础镜像> AS <阶段名>` 会创建一个独立的**构建阶段**。可以把阶段理解为同一份 Dockerfile 中的多个“小镜像环境”：每个阶段都有自己的基础文件系统，后面的阶段默认看不到前面阶段写入的文件。
+
+```mermaid
+flowchart LR
+    B["builder 阶段<br>编译器、CMake、源码、第三方依赖"]
+    B -->|"COPY --from=builder<br>只复制需要的产物"| R["runtime 阶段<br>二进制、运行库、默认配置"]
+    R --> I["最终镜像<br>默认是最后一个阶段"]
+    B -. "编译工具和中间文件<br>不进入最终镜像" .-> X["丢弃"]
+```
+
+多阶段构建的最小示例：
+
+```dockerfile
+# 第一个阶段：这里可以很重，专门负责编译
+FROM ubuntu:22.04 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends g++
+WORKDIR /src
+COPY main.cpp .
+RUN g++ -O2 main.cpp -o /out/hello
+
+# 第二个阶段：从一个全新的干净系统开始
+FROM ubuntu:22.04 AS runtime
+COPY --from=builder /out/hello /app/hello
+WORKDIR /app
+CMD ["./hello"]
+```
+
+执行 `docker build -t hello .` 后，交付的是最后的 `runtime` 阶段镜像，而不是 `builder`：其中只有 Ubuntu 基础文件、`/app/hello` 以及 runtime 阶段显式创建或复制的内容；`g++`、源码和 `/src` 下的中间文件都被留在 builder 阶段。
+
+| 概念 | 如何理解 | 常见用法 |
+| --- | --- | --- |
+| `AS builder` | 给当前阶段命名；名称是 Dockerfile 内部引用，不是最终镜像 tag。 | `FROM nvidia/cuda:...-devel AS builder` |
+| 第二个 `FROM` | 创建全新的阶段，不会自动继承 builder 文件。 | `FROM ubuntu:22.04 AS runtime` |
+| `COPY --from=builder <源> <目标>` | 跨阶段复制唯一的“数据通道”；只带走选定文件。 | 复制二进制、`/usr/local` 动态库、生成配置。 |
+| 最后一个阶段 | 默认成为 `docker build` 的最终镜像。 | 用作最小、可部署的 `runtime`。 |
+| `--target <阶段>` | 构建时在某个阶段停止，便于排查构建失败或进入 builder 调试。 | `docker build --target builder -t app:builder .` |
+
+阶段也可以多于两个，常见链路是：`base`（公共工具）→ `deps`（第三方依赖）→ `builder`（编译业务）→ `test`（运行测试）→ `runtime`（最终交付）。但阶段不是越多越好：只有在各阶段能明显隔离职责、复用缓存或缩小最终镜像时才值得拆分。
+
+`InferenceServers` 的 Gateway 与 Exec Dockerfile 都正是 `builder → runtime` 两阶段：前者在 builder 中编译 gRPC 等依赖及 C++ 服务，后者只带入可执行文件和运行库；Exec 的两个阶段分别使用 CUDA `devel` 与 CUDA `runtime` 基础镜像。
 
 ### 一个可运行的 Python Web 示例
 
@@ -651,6 +711,206 @@ docker run --rm --name hello -p 8000:8000 hello-docker:1.0.0
 | `--target <阶段>` | 多阶段构建时只构建到指定阶段。 | `--target production` |
 | `--platform linux/amd64` | 指定目标平台；跨平台构建通常结合 Buildx。 | `--platform linux/amd64` |
 
+### InferenceServers：多阶段 C++ / CUDA 服务镜像案例
+
+前面的 Flask 示例用于理解最小 Dockerfile。实际服务项目需要进一步拆分构建依赖、运行依赖、配置和数据。本节参考 个人项目：`AI推理服务系统` 当前的 Docker 配置：它把 HTTP Gateway 和 GPU 推理 Exec 拆为两个镜像，再用 Compose 编排 Redis、MySQL 与两个服务。
+
+```mermaid
+flowchart LR
+    C["HTTP Client"] --> G["gateway:10086<br>HTTP 网关"]
+    G --> R["redis:6379<br>状态 / 缓存"]
+    G --> M["mysql:33060<br>模型元数据"]
+    G --> E["exec:10087<br>gRPC 推理服务"]
+    E --> R
+    E --> GPU["CUDA + TensorRT + GPU"]
+    Models["宿主机 ModelFiles"] -->|"只读挂载"| E
+```
+
+项目的相关结构是：
+
+```text
+InferenceServers/
+├── CMakePresets.json                 # release-gateway / release-exec
+├── InferenceGatewayServer/           # HTTP 网关源码
+├── InferenceExecServer/              # CUDA / TensorRT 推理源码
+├── ModelFiles/                       # 运行时模型，不进入镜像
+└── docker/
+    ├── Dockerfile.gateway
+    ├── Dockerfile.exec
+    ├── Dockerfile.*.dockerignore
+    ├── config.gateway.ini
+    ├── config.exec.ini
+    ├── compose.yml
+    └── scripts/install-source-deps.sh
+```
+
+### 为什么要拆成 Gateway 与 Exec 两个镜像
+
+| 镜像 | 构建期依赖 | 运行期依赖 | 不应携带的内容 |
+| --- | --- | --- | --- |
+| `inference-gateway` | CMake、编译器、Boost、gRPC、jsoncpp、MySQL Connector、hiredis。 | 网关二进制、`/usr/local` 动态库、Boost / OpenSSL / Zlib 运行库。 | CUDA、TensorRT、模型文件、编译器和源码。 |
+| `inference-exec` | CUDA devel、TensorRT、CMake、编译器、gRPC、hiredis。 | Exec 二进制、CUDA runtime、TensorRT runtime、`/usr/local` 动态库。 | MySQL Connector、jsoncpp、模型文件、编译器和源码。 |
+
+这对应 CMake Preset 中的 `release-gateway` 与 `release-exec`：每个 Dockerfile 只构建自身服务需要的 target 与依赖，避免一个“全能镜像”体积大、构建慢、攻击面也更大。
+
+### Gateway Dockerfile：builder 与 runtime 的完整思路
+
+下面是根据项目 `docker/Dockerfile.gateway` 整理的核心版本。`install-source-deps.sh` 统一从源码安装 gRPC、hiredis 等依赖，`ARG` 则固定它们的版本和并行度。
+
+```dockerfile
+# 阶段 1：只负责编译，不会进入最终运行镜像
+FROM ubuntu:22.04 AS builder
+
+ARG JSONCPP_REF=1.9.6
+ARG HIREDIS_REF=v1.2.0
+ARG GRPC_REF=v1.65.5
+ARG MYSQL_CONCPP_REF=
+ARG JOBS=4
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates cmake git \
+    libboost-atomic-dev libboost-filesystem-dev libboost-system-dev \
+    libssl-dev pkg-config zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# 依赖脚本通常比业务源码稳定，先复制以提升缓存命中
+COPY docker/scripts/install-source-deps.sh /tmp/install-source-deps.sh
+RUN JSONCPP_REF="${JSONCPP_REF}" HIREDIS_REF="${HIREDIS_REF}" \
+    GRPC_REF="${GRPC_REF}" MYSQL_CONCPP_REF="${MYSQL_CONCPP_REF}" \
+    INSTALL_JSONCPP=ON INSTALL_MYSQL_CONCPP=ON JOBS="${JOBS}" \
+    bash /tmp/install-source-deps.sh
+
+# 源码变化只会使这里和后续 CMake 构建层失效
+COPY . /workspace
+RUN cmake --preset release-gateway && cmake --build --preset release-gateway
+
+# 阶段 2：只复制运行所需的产物
+FROM ubuntu:22.04 AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libboost-atomic1.74.0 libboost-filesystem1.74.0 \
+    libboost-system1.74.0 libssl3 zlib1g \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local /usr/local
+RUN ldconfig
+WORKDIR /app
+COPY --from=builder /workspace/build-release-gateway/bin/InferenceGatewayServer /app/InferenceGatewayServer
+COPY docker/config.gateway.ini /app/config.ini
+RUN mkdir -p /app/Log
+EXPOSE 10086
+CMD ["./InferenceGatewayServer"]
+```
+
+| 片段 | 意图 | 关键约束 |
+| --- | --- | --- |
+| `ARG *_REF` | 固定第三方版本，允许 `--build-arg` 覆盖。 | 不要把 token、密码传给 `ARG`，它可能出现在构建记录中。 |
+| `COPY install-source-deps.sh` 后再安装 | 源码未变化时复用昂贵的依赖编译缓存。 | 不能先 `COPY .`，否则任何源码变化都会导致依赖重编。 |
+| `cmake --preset release-gateway` | 复用本地与容器相同的 target 和 CMake 参数。 | Dockerfile 中产物路径必须匹配 preset 的 `binaryDir`。 |
+| 第二个 `FROM` | 丢弃 CMake、编译器、Git、源码和临时构建目录。 | 运行阶段仍须安装动态库所依赖的系统运行库。 |
+| `COPY --from=builder /usr/local` 与 `ldconfig` | 带入源码编译安装的 gRPC、hiredis、jsoncpp、MySQL Connector。 | `/usr/local/lib*` 新增后应刷新动态链接器缓存。 |
+| `COPY config.gateway.ini` | 镜像内配置使用 Compose 服务名。 | 不要复制本机可变的根目录 `config.ini`，更不要复制机密配置。 |
+
+> 当前项目镜像以 root 运行。生产环境可在 runtime 阶段创建 `appuser`，对 `/app/Log` 授权后再 `USER appuser`；密码等配置改由 `.env`、secrets 或部署平台的密钥系统提供。
+
+### Exec Dockerfile：CUDA、TensorRT 与模型目录
+
+`docker/Dockerfile.exec` 保持同样的两阶段结构，但 builder 基于 `nvidia/cuda:12.9.0-devel-ubuntu22.04`，runtime 基于更小的 `nvidia/cuda:12.9.0-runtime-ubuntu22.04`。它用构建参数选择本地 TensorRT 压缩包：
+
+```dockerfile
+ARG TENSORRT_ARCHIVE=docker/vendor/TensorRT-10.10.0.31.Linux.x86_64-gnu.cuda-12.9.tar.gz
+COPY ${TENSORRT_ARCHIVE} /tmp/tensorrt.tar.gz
+RUN tar -xzf /tmp/tensorrt.tar.gz -C /opt && mv /opt/TensorRT-* /opt/TensorRT
+
+ENV TRT_ROOT=/opt/TensorRT
+ENV LD_LIBRARY_PATH=/opt/TensorRT/lib:/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH}
+
+COPY --from=builder /opt/TensorRT /opt/TensorRT
+COPY --from=builder /workspace/build-release-exec/bin/InferenceExecServer /app/InferenceExecServer
+COPY docker/config.exec.ini /app/config.ini
+VOLUME ["/app/Log", "/app/ModelFiles"]
+EXPOSE 10087
+CMD ["./InferenceExecServer"]
+```
+
+- `devel` 镜像提供 CUDA 编译所需工具链，`runtime` 镜像只保留运行所需组件；这就是多阶段构建在 GPU 服务上的直接价值。
+- TensorRT 压缩包是**构建输入**，必须进入 Exec 的上下文；Gateway 不需要它，所以项目使用 `Dockerfile.gateway.dockerignore` 将其排除。`.dockerignore` 写错会导致 `COPY ${TENSORRT_ARCHIVE}` 失败。
+- `ModelFiles` 是**运行时数据**，不应 `COPY` 进镜像。Compose 将 `../ModelFiles` 只读挂载到 `/app/ModelFiles`，并与 `config.exec.ini` 的 `ModelRepository.Root=/app/ModelFiles` 对应。
+
+### 构建这两个镜像
+
+在 `InferenceServers` 项目根目录执行。Dockerfile 在 `docker/` 下，但上下文仍使用 `.`，使 Docker 能访问项目根目录的源码和 CMake 文件。
+
+```shell
+docker build -f docker/Dockerfile.gateway -t inference-gateway:ubuntu22.04 .
+
+docker build -f docker/Dockerfile.exec \
+  --build-arg TENSORRT_ARCHIVE=docker/vendor/TensorRT-10.10.0.31.Linux.x86_64-gnu.cuda-12.9.tar.gz \
+  -t inference-exec:cuda12.9 .
+```
+
+### Compose：将四个服务变成一个应用
+
+`docker/compose.yml` 中的 `redis`、`mysql`、`exec` 和 `gateway` 会处在同一个 Compose 网络中。因此服务配置使用 `redis:6379`、`mysql:33060`、`exec:10087`，而不是宿主机的 `localhost`。
+
+```yaml
+services:
+  exec:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.exec
+    image: inference-exec:cuda12.9
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "10087:10087"
+    volumes:
+      - ../ModelFiles:/app/ModelFiles:ro
+      - ../Log/docker-exec:/app/Log
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+```
+
+| Compose 字段 | 此项目中的作用 | 注意点 |
+| --- | --- | --- |
+| `build.context` / `build.dockerfile` | 使用项目根目录作上下文，选择服务专属 Dockerfile。 | `dockerfile` 相对 context 解析；context 过小会让 `COPY` 找不到源码。 |
+| `image` | 给 Compose 构建结果命名。 | 可在 Compose 外用 `docker run` 调试该镜像。 |
+| `depends_on.condition: service_healthy` | Exec 等 Redis、Gateway 等 MySQL / Redis 的健康检查通过再启动。 | `service_started` 只代表进程启动，不代表服务已经可用。 |
+| `ports` | 发布 HTTP / gRPC 端口给宿主机。 | 容器之间通信只需服务名，不需发布端口。 |
+| `volumes` | Redis / MySQL 用命名卷；日志和模型用 bind mount。 | 模型加 `:ro`，防止推理服务修改模型文件。 |
+| `environment` | 当前项目为容器设置 `NO_PROXY` / `no_proxy`，避免服务名访问错误走代理。 | 演示密码不要硬编码；应使用 `.env`、`env_file` 或 secrets。 |
+| `deploy.resources.reservations.devices` | 向 Exec 服务申请 NVIDIA GPU。 | 宿主机需要 NVIDIA 驱动与 NVIDIA Container Toolkit，Compose 实现也必须支持该字段。 |
+
+### 启动、检查和关闭完整链路
+
+```shell
+# 从项目根目录执行
+docker compose -f docker/compose.yml up --build -d
+
+# 先渲染最终 YAML，可尽早发现变量、路径和语法问题
+docker compose -f docker/compose.yml config
+
+docker compose -f docker/compose.yml ps
+docker compose -f docker/compose.yml logs -f gateway
+docker compose -f docker/compose.yml logs -f exec
+
+# 默认保留 Redis / MySQL 命名卷
+docker compose -f docker/compose.yml down
+
+# 谨慎：同时删除 Redis / MySQL 数据卷
+docker compose -f docker/compose.yml down -v
+```
+
+这个案例的核心原则是：**按服务拆镜像、按构建和运行拆阶段、把模型/日志/数据库数据放到运行时卷、用 Compose 服务名连接依赖，并让 CMake Preset、Dockerfile 与 Compose 的路径保持一致。**
+
 ## 发布镜像到 Docker Hub
 
 发布前，在 Docker Hub 网页创建一个仓库，例如 `<你的用户名>/hello-docker`。然后登录、给本地镜像打上目标仓库标签并推送：
@@ -738,3 +998,5 @@ flowchart LR
 - [`docker image pull` 参数参考](https://docs.docker.com/reference/cli/docker/image/pull/) / [`docker image build` 参数参考](https://docs.docker.com/reference/cli/docker/image/build/) / [`docker image push` 参数参考](https://docs.docker.com/reference/cli/docker/image/push/)
 - [Bind mount](https://docs.docker.com/engine/storage/bind-mounts/) / [Volume](https://docs.docker.com/engine/storage/volumes/)
 - [Dockerfile 指令参考](https://docs.docker.com/reference/dockerfile/)
+- [构建上下文与 `.dockerignore`](https://docs.docker.com/build/concepts/context/) / [构建缓存失效规则](https://docs.docker.com/build/cache/invalidation/)
+- [多阶段构建](https://docs.docker.com/build/building/multi-stage/) / [Compose 服务字段参考](https://docs.docker.com/reference/compose-file/services/)
