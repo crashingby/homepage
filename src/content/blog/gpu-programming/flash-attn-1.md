@@ -1,5 +1,5 @@
 ---
-title: FlashAttention-2 源码学习笔记
+title: FlashAttention-2 源码学习笔记一：接口一览
 date: 2026-08-01
 tags: [FlashAttention, CUDA, PyTorch, GPU 编程, Attention]
 summary: 从 flash_attn/flash_attn_interface.py 的前向入口开始，逐步追踪 FlashAttention-2 从 Python API、C++ dispatch 到 CUDA kernel 的源码路径。
@@ -7,7 +7,7 @@ summary: 从 flash_attn/flash_attn_interface.py 的前向入口开始，逐步�
 
 # FlashAttention-2 源码学习笔记
 
-本文是 FlashAttention-2 源码学习笔记。最终目标是一路追到 CUDA kernel：理解 Python API 如何进入 C++ extension，C++ dispatch 如何选择具体模板实例，以及 `flash_fwd_kernel.h` 里的 tile、softmax 和 PV 计算如何组织。
+本文是 FlashAttention-2 源码学习笔记。最终目标是一路追到 CUDA kernel：理解 Python API 如何进入 C++ extension，C++ dispatch 如何选择具体模板实例.
 
 这一节先从 `flash_attn/flash_attn_interface.py` 的公开前向入口开始。先把入口接口、参数语义和数据布局理顺，后面再沿着这些入口继续下钻到 `csrc/flash_attn/flash_api.cpp` 和 `csrc/flash_attn/src/flash_fwd_kernel.h`。这样读 CUDA kernel 时，能明确每个 kernel 参数来自哪个 Python API，以及不同接口为什么会走到同一类底层 forward。
 

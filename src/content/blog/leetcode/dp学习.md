@@ -9667,3 +9667,368 @@ $$
 - 一维压缩后，金额正序遍历，允许当前硬币在本轮继续参与转移。
 
 如果你能看出 `dp[item + 1][sum - coin] + 1` 里的 `item + 1`，就说明你真正抓住了完全背包和 0-1 背包的分界线。
+
+## [518. 零钱兑换 II - 力扣（LeetCode）](https://leetcode.cn/problems/coin-change-ii/description/)
+
+给你一个整数数组 `coins` 表示不同面额的硬币，另给一个整数 `amount` 表示总金额。
+
+请计算并返回可以凑成总金额的**硬币组合数**。如果任何硬币组合都无法凑出总金额，返回 `0`。
+
+假设每一种面额的硬币有无限个。
+
+示例 1：
+
+```text
+输入：amount = 5, coins = [1, 2, 5]
+输出：4
+解释：
+5 = 5
+5 = 2 + 2 + 1
+5 = 2 + 1 + 1 + 1
+5 = 1 + 1 + 1 + 1 + 1
+```
+
+示例 2：
+
+```text
+输入：amount = 3, coins = [2]
+输出：0
+解释：只用面额 2 的硬币不能凑成总金额 3。
+```
+
+示例 3：
+
+```text
+输入：amount = 10, coins = [10]
+输出：1
+```
+
+提示：
+
+- `1 <= coins.length <= 300`
+- `1 <= coins[i] <= 5000`
+- `coins` 中的所有值互不相同
+- `0 <= amount <= 5000`
+- 题目保证最终结果符合 32 位带符号整数
+
+这题和 322 非常像，都是完全背包。但 322 问的是：
+
+> 凑成 `amount` 的最少硬币数量是多少？
+
+518 问的是：
+
+> 凑成 `amount` 的不同组合有多少种？
+
+所以它是：
+
+> 完全背包 + 刚好装满 + 方案计数。
+
+这里要特别注意“组合数”的含义。`1 + 2 + 2` 和 `2 + 1 + 2` 不是两种方案，因为硬币顺序不重要。
+
+这也是为什么外层要枚举硬币，内层再枚举金额：这样每种组合只会按照硬币种类的固定顺序被统计一次。
+
+### 题目如何转成完全背包？
+
+每种硬币可以使用无限次，所以物品仍然是硬币面额：
+
+- **物品**：每一种硬币面额 `coins[i]`。
+- **重量 / 费用**：硬币面额本身，也就是 `coins[i]`。
+- **价值**：不是最大价值，也不是最少数量，而是“产生方案数”。
+- **背包容量**：`amount`。
+- **完全约束**：每种硬币可以使用任意多次。
+- **目标**：刚好凑出 `amount` 的组合数量。
+
+这里的 `dp` 表示方案数，不再表示最优值。
+
+### 递归切入（探索逻辑）
+
+继续从递归想。定义 `dfs(index, remain)` 表示：只从第 `index` 种硬币开始考虑，要凑出金额 `remain`，一共有多少种组合。
+
+站在第 `index` 种硬币面前，仍然只有两个选择：
+
+- **不选当前硬币**：跳到下一种硬币，方案数来自 `dfs(index + 1, remain)`。
+- **选当前硬币**：前提是 `remain >= coins[index]`，方案数来自 `dfs(index, remain - coins[index])`。
+
+第二项仍然是 `dfs(index, ...)`，因为当前硬币可以继续使用。
+
+递归边界：
+
+- 如果 `remain == 0`，说明已经刚好凑出目标金额，返回 1，表示找到了一种有效组合。
+- 如果 `index == coins.size()`，说明硬币种类都用完了还没凑出金额，返回 0。
+
+递归表达式：
+
+$$
+dfs(index, remain) =
+dfs(index + 1, remain) +
+dfs(index, remain - coins[index])
+$$
+
+第二项需要满足 `remain >= coins[index]`。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索计算凑成 amount 的硬币组合数。
+     *
+     * @param amount 目标总金额。
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @return 凑成 amount 的组合数。
+     */
+    int change(int amount, vector<int>& coins) {
+        vector<vector<int>> memo(coins.size(), vector<int>(amount + 1, kUnknown));
+        return dfs(coins, memo, 0, amount);
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(const vector<int>& coins, vector<vector<int>>& memo, int index, int remain) {
+        if (remain == 0) {
+            return 1;
+        }
+        if (index == static_cast<int>(coins.size())) {
+            return 0;
+        }
+
+        int& cached = memo[index][remain];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        // 不选当前硬币：后续只能使用下一种及之后的硬币。
+        cached = dfs(coins, memo, index + 1, remain);
+
+        if (remain >= coins[index]) {
+            // 选当前硬币：仍然停留在当前硬币种类，允许继续使用它。
+            cached += dfs(coins, memo, index, remain - coins[index]);
+        }
+
+        return cached;
+    }
+};
+```
+
+这个递归和 322 的形状几乎一样，区别只在返回值语义：
+
+- 322 返回“最少硬币数”，所以两条路之间取 `min`。
+- 518 返回“方案数”，所以两条路之间做加法。
+
+### 状态定义
+
+把递归翻译成 DP，可以定义：
+
+`dp[i][sum]` 表示只使用前 `i` 种硬币时，刚好凑出金额 `sum` 的组合数。
+
+最终答案是：
+
+$$
+dp[coins.size()][amount]
+$$
+
+### 状态转移
+
+继续使用安全垫写法，处理真实硬币 `coins[item]`。
+
+`dp[item]` 表示还没处理 `coins[item]` 之前的状态，`dp[item + 1]` 表示处理完 `coins[item]` 之后的状态。
+
+- **不选当前硬币**：组合数继承上一行。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item][sum]
+$$
+
+- **选当前硬币**：如果金额足够，就从当前行的剩余金额转移过来。
+
+$$
+dp[item + 1][sum] \leftarrow dp[item + 1][sum - coins[item]]
+$$
+
+注意这里仍然是当前行 `dp[item + 1]`。因为选了一枚当前硬币之后，还可以继续选当前硬币。
+
+合起来就是：
+
+$$
+dp[item + 1][sum] =
+dp[item][sum] +
+dp[item + 1][sum - coins[item]]
+$$
+
+第二项需要满足 `sum >= coins[item]`。
+
+### 初始化
+
+- `dp[0][0] = 1`：不使用任何硬币，凑出金额 0 有一种方案，也就是“什么都不选”。
+- `dp[0][sum] = 0`，其中 `sum > 0`：不使用任何硬币，不可能凑出正数金额。
+
+这里的 `dp[0][0] = 1` 很关键。它不是说有一枚硬币，而是说空组合是一种有效起点。后续所有方案数都是从这个起点长出来的。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `item = 0` 到 `coins.size() - 1`，逐个处理真实硬币面额。
+- 内层从 `sum = 0` 到 `amount`，枚举当前要凑出的金额。
+
+内层正序遍历，是因为 `dp[item + 1][sum]` 依赖当前行更小金额的 `dp[item + 1][sum - coins[item]]`。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维完全背包计算凑成 amount 的硬币组合数。
+     *
+     * @param amount 目标总金额。
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @return 凑成 amount 的组合数。
+     */
+    int change(int amount, vector<int>& coins) {
+        const int coin_count = static_cast<int>(coins.size());
+        vector<vector<int>> dp(coin_count + 1, vector<int>(amount + 1, 0));
+        dp[0][0] = 1;
+
+        for (int item = 0; item < coin_count; item++) {
+            const int coin = coins[item];
+
+            for (int sum = 0; sum <= amount; sum++) {
+                // 不选当前硬币：继承上一行组合数。
+                dp[item + 1][sum] = dp[item][sum];
+
+                if (sum >= coin) {
+                    // 选当前硬币：来源是当前行，允许当前硬币被重复使用。
+                    dp[item + 1][sum] += dp[item + 1][sum - coin];
+                }
+            }
+        }
+
+        return dp[coin_count][amount];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(coins.size() \times amount)$。
+- 空间复杂度：$O(coins.size() \times amount)$。
+
+### 空间优化
+
+二维转移只依赖：
+
+- 上一行同金额：`dp[item][sum]`。
+- 当前行较小金额：`dp[item + 1][sum - coins[item]]`。
+
+压成一维后，`dp[sum]` 表示当前已经处理过的硬币种类中，刚好凑出金额 `sum` 的组合数。
+
+处理当前硬币 `coin` 时：
+
+$$
+dp[sum] += dp[sum - coin]
+$$
+
+因为硬币可以无限使用，所以一维金额必须正序遍历：
+
+```cpp
+for (int sum = coin; sum <= amount; sum++)
+```
+
+正序遍历时，`dp[sum - coin]` 已经包含“当前硬币可以被重复使用”的方案数，所以继续加到 `dp[sum]` 上。
+
+```cpp
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维完全背包计算凑成 amount 的硬币组合数。
+     *
+     * @param amount 目标总金额。
+     * @param coins 不同面额的硬币数组，每种硬币可无限使用。
+     * @return 凑成 amount 的组合数。
+     */
+    int change(int amount, vector<int>& coins) {
+        vector<int> dp(amount + 1, 0);
+        dp[0] = 1;
+
+        for (const int coin : coins) {
+            // 正序遍历金额，允许当前硬币在同一轮中被重复使用。
+            for (int sum = coin; sum <= amount; sum++) {
+                dp[sum] += dp[sum - coin];
+            }
+        }
+
+        return dp[amount];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(coins.size() \times amount)$。
+- 空间复杂度：$O(amount)$。
+
+### 为什么这里统计的是组合数？
+
+这题最容易混淆的是“组合”和“排列”。
+
+如果外层枚举硬币，内层枚举金额：
+
+```cpp
+for (const int coin : coins) {
+    for (int sum = coin; sum <= amount; sum++) {
+        dp[sum] += dp[sum - coin];
+    }
+}
+```
+
+每种硬币只会按固定的硬币种类顺序进入方案。比如 `coins = [1, 2, 5]` 时，方案 `1 + 2 + 2` 只会在处理硬币 `2` 的阶段形成，不会再被当成 `2 + 1 + 2` 或 `2 + 2 + 1` 重新统计。
+
+如果把循环顺序反过来，外层枚举金额，内层枚举硬币：
+
+```cpp
+for (int sum = 0; sum <= amount; sum++) {
+    for (const int coin : coins) {
+        if (sum >= coin) {
+            dp[sum] += dp[sum - coin];
+        }
+    }
+}
+```
+
+这时统计出来的是排列数。因为凑 `sum` 时，每个硬币都可能作为“最后一枚硬币”加入，`1 + 2 + 2`、`2 + 1 + 2`、`2 + 2 + 1` 会被当成不同顺序重复计算。
+
+所以 518 的循环顺序不只是写法习惯，而是题意本身：
+
+- **组合数**：外层硬币，内层金额。
+- **排列数**：外层金额，内层硬币。
+
+### 这题的核心手感
+
+518 的核心，是把“每种硬币无限使用”翻译成完全背包，再把“有多少种凑法”翻译成方案数累加：
+
+$$
+dp[sum] += dp[sum - coin]
+$$
+
+它和 322 的对照非常清楚：
+
+- 322：问最少硬币数，所以用 `min`。
+- 518：问组合方案数，所以用 `+`。
+
+但完全背包的骨架没有变：
+
+- 二维安全垫写法里，选当前硬币时看当前行：`dp[item + 1][sum - coin]`。
+- 一维压缩后，金额正序遍历，允许当前硬币在本轮继续参与转移。
+
+如果你能把 `dp[0] = 1` 理解成“空组合是方案数的起点”，再把外层硬币理解成“固定组合的生成顺序”，这题就不会和 322、排列计数混在一起了。
