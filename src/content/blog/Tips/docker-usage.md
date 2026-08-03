@@ -851,6 +851,132 @@ docker build -f docker/Dockerfile.exec \
   -t inference-exec:cuda12.9 .
 ```
 
+### Compose YAML：先学会写 `compose.yml`
+
+Docker Compose 使用 YAML 描述一个多容器应用。推荐文件名是 `compose.yaml` 或 `compose.yml`；使用 Compose v2 时，不需要再写旧教程常见的顶层 `version: "3"`，当前规范已经合并了旧的 2.x / 3.x 格式。
+
+#### YAML 的四个基础规则
+
+```yaml
+# 1. 映射：键后面有冒号，子项用空格缩进
+services:
+  api:
+    image: example/api:1.0
+
+# 2. 列表：每一项以 - 开头，且缩进必须对齐
+    ports:
+      - "8080:8000"
+      - "127.0.0.1:9000:9000"
+
+# 3. 标量：字符串、数字、布尔值和空值
+    restart: unless-stopped
+    read_only: true
+    replicas: 2
+
+# 4. 注释：# 之后是注释；缩进不能用 Tab，统一使用空格
+```
+
+- 同一缩进层级的键属于同一个映射。`services`、`networks`、`volumes` 是顶层映射；`api`、`redis` 是 `services` 下的服务名。
+- `ports`、`volumes`、`command` 等可以使用列表。短语法便于快速写，长语法更明确、更适合复杂配置。
+- 端口映射、包含 `:` 的挂载路径、可能被 YAML 当成布尔值或数字的值建议加引号，例如 `"8080:80"`、`"false"`、`"0123"`。
+- YAML 缩进错误可能改变数据层级；先运行 `docker compose config`，不要靠肉眼猜最终配置。
+
+#### Compose 文件的顶层结构
+
+| 顶层字段 | 用途 | 常见场景 |
+| --- | --- | --- |
+| `name` | 指定 Compose 项目名，影响容器、网络、卷的前缀。 | `name: inference-servers` |
+| `services` | 定义应用服务，是必需的核心字段。 | `gateway`、`exec`、`redis`、`mysql`。 |
+| `networks` | 声明自定义网络与网络驱动。 | 前后端隔离、接入外部网络。 |
+| `volumes` | 声明命名卷。 | 数据库持久化，如 `mysql-data`。 |
+| `configs` | 声明非敏感配置对象。 | 需要以文件形式交付的静态配置。 |
+| `secrets` | 声明机密对象。 | 密码、访问令牌、私钥；生产环境优于明文 `environment`。 |
+
+#### 一个可运行的服务模板
+
+下面的结构覆盖最常用字段。`api` 可以通过服务名 `db` 访问数据库；不需要写数据库容器 IP，也不应在容器内写 `localhost:5432`。
+
+```yaml
+name: demo-app
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置密码}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    image: demo-api:${APP_VERSION:-dev}
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://app:${POSTGRES_PASSWORD}@db:5432/app
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8080:8000"
+    volumes:
+      - ./Log:/app/Log
+    restart: unless-stopped
+
+volumes:
+  db-data:
+```
+
+`POSTGRES_PASSWORD` 同时出现于变量替换和 `environment` 只是为了讲解连接关系；实际项目中应通过 secrets 或应用读取的配置文件避免把密码展开到容器环境变量和 `docker compose config` 输出中。
+
+#### 服务字段：从意图理解怎么写
+
+| 字段 | 写法 | 用途与约束 |
+| --- | --- | --- |
+| `image` | `image: redis:7` | 使用已有镜像，或为 `build` 的结果命名。应使用明确版本而非裸 `latest`。 |
+| `build` | `build: .` 或 `build: { context: ., dockerfile: Dockerfile }` | 构建镜像。`context` 决定 `COPY` 能看到哪些文件，`dockerfile` 仅选择配方。 |
+| `command` / `entrypoint` | `command: ["redis-server", "--appendonly", "yes"]` | 覆盖镜像的 `CMD` / `ENTRYPOINT`。列表形式避免 shell 转义问题。 |
+| `environment` | 映射或列表：`DEBUG: "1"` / `- DEBUG=1` | 注入容器环境变量。敏感值优先使用 secrets；普通本机变量可放 `env_file`。 |
+| `env_file` | `env_file: [.env]` | 从文件读取环境变量；文件路径相对 Compose 文件。`.env` 不应提交机密。 |
+| `ports` | `- "127.0.0.1:8080:8000"` | 发布宿主机端口。短格式依次为 `[主机 IP:]主机端口:容器端口[/协议]`。 |
+| `expose` | `expose: ["8000"]` | 仅记录/暴露给 Compose 网络内的服务，不发布到宿主机。 |
+| `volumes` | `- data:/var/lib/app`、`- ./Log:/app/Log` | 前者是命名卷，后者是 bind mount；只读写成 `:ro`。 |
+| `networks` | `networks: [backend]` | 服务可加入多个网络；同网络服务可用服务名 DNS 互访。 |
+| `depends_on` | `db: { condition: service_healthy }` | 控制启动顺序；配合健康检查才能等待依赖真正可用。 |
+| `healthcheck` | `test`、`interval`、`timeout`、`retries` | 定义服务就绪探针；`test` 常用 `CMD` 或 `CMD-SHELL` 数组。 |
+| `restart` | `unless-stopped` | 进程退出或 Docker 重启后的重启策略。常用 `no`、`on-failure`、`unless-stopped`、`always`。 |
+| `user` / `read_only` | `user: "10001:10001"` | 约束运行身份与文件系统写权限，降低服务权限。 |
+| `profiles` | `profiles: [debug]` | 将可选服务分组，须配合 `docker compose --profile debug up` 启动。 |
+| `deploy.resources` | GPU 设备与资源预留。 | 适合 Exec 等 GPU 服务；需要本机运行时与 Compose 支持。 |
+
+#### 变量替换、`.env` 与多文件覆盖
+
+Compose 在读取 YAML 时就会替换 `${变量}`；这和容器内的 `environment` 是两个层次。常用写法如下：
+
+| 写法 | 含义 | 示例 |
+| --- | --- | --- |
+| `${VAR}` | 使用环境变量或 `.env` 中的 `VAR`；未定义时通常为空并给出警告。 | `image: app:${TAG}` |
+| `${VAR:-默认值}` | 未定义或为空时使用默认值。 | `image: app:${TAG:-dev}` |
+| `${VAR:?错误信息}` | 未定义或为空时直接报错并中止。 | `${DB_PASSWORD:?请设置 DB_PASSWORD}` |
+| `$$` | 转义为容器内的字面量 `$`，不由 Compose 替换。 | `command: ["sh", "-c", "echo $$HOSTNAME"]` |
+
+可用多个 `-f` 叠加配置：后指定文件覆盖或补充先指定文件，常用于公共生产配置与本地开发覆盖。所有相对路径默认以**第一个** `-f` 指定文件所在目录为基准。
+
+```shell
+docker compose -f compose.yml -f compose.dev.yml config
+```
+
 ### Compose：将四个服务变成一个应用
 
 `docker/compose.yml` 中的 `redis`、`mysql`、`exec` 和 `gateway` 会处在同一个 Compose 网络中。因此服务配置使用 `redis:6379`、`mysql:33060`、`exec:10087`，而不是宿主机的 `localhost`。
@@ -881,7 +1007,7 @@ services:
 
 | Compose 字段 | 此项目中的作用 | 注意点 |
 | --- | --- | --- |
-| `build.context` / `build.dockerfile` | 使用项目根目录作上下文，选择服务专属 Dockerfile。 | `dockerfile` 相对 context 解析；context 过小会让 `COPY` 找不到源码。 |
+| `build.context` / `build.dockerfile` | 使用项目根目录作上下文，选择服务专属 Dockerfile。 | `dockerfile` 相对 context 解析；context 写错会让 `COPY` 找不到源码。 |
 | `image` | 给 Compose 构建结果命名。 | 可在 Compose 外用 `docker run` 调试该镜像。 |
 | `depends_on.condition: service_healthy` | Exec 等 Redis、Gateway 等 MySQL / Redis 的健康检查通过再启动。 | `service_started` 只代表进程启动，不代表服务已经可用。 |
 | `ports` | 发布 HTTP / gRPC 端口给宿主机。 | 容器之间通信只需服务名，不需发布端口。 |
@@ -889,25 +1015,130 @@ services:
 | `environment` | 当前项目为容器设置 `NO_PROXY` / `no_proxy`，避免服务名访问错误走代理。 | 演示密码不要硬编码；应使用 `.env`、`env_file` 或 secrets。 |
 | `deploy.resources.reservations.devices` | 向 Exec 服务申请 NVIDIA GPU。 | 宿主机需要 NVIDIA 驱动与 NVIDIA Container Toolkit，Compose 实现也必须支持该字段。 |
 
-### 启动、检查和关闭完整链路
+### `docker compose` 全局参数：选择项目与配置
+
+所有 Compose 子命令都可以写成 `docker compose [全局选项] <子命令> [子命令选项]`。在 `InferenceServers` 中，为避免默认找不到 `docker/compose.yml`，命令前统一使用 `-f docker/compose.yml`。
+
+| 参数 | 用途 | 示例 |
+| --- | --- | --- |
+| `-f, --file <文件>` | 指定 Compose 文件；可重复传入，后面的文件覆盖或补充前面的文件。 | `-f compose.yml -f compose.dev.yml` |
+| `-p, --project-name <名称>` | 指定项目名，影响容器、网络、命名卷前缀。 | `-p inference-dev` |
+| `--project-directory <目录>` | 指定项目目录与相对路径基准。 | `--project-directory .` |
+| `--env-file <文件>` | 指定变量替换使用的环境文件。 | `--env-file .env.dev` |
+| `--profile <名称>` | 启用一个可选服务 profile，可重复使用。 | `--profile debug` |
+| `--parallel <数量>` | 限制拉取或构建时的最大并发数；网络差时可调小。 | `--parallel 2 pull` |
+| `--progress auto\|tty\|plain\|json\|quiet` | 控制构建和拉取进度输出格式，CI 常用 `plain`。 | `--progress plain build` |
+| `--dry-run` | 预演会执行哪些动作，不实际改变 Compose 项目。 | `--dry-run up --build -d` |
+
+### `docker compose config`：校验、变量替换与渲染 YAML
 
 ```shell
-# 从项目根目录执行
-docker compose -f docker/compose.yml up --build -d
-
-# 先渲染最终 YAML，可尽早发现变量、路径和语法问题
 docker compose -f docker/compose.yml config
-
-docker compose -f docker/compose.yml ps
-docker compose -f docker/compose.yml logs -f gateway
-docker compose -f docker/compose.yml logs -f exec
-
-# 默认保留 Redis / MySQL 命名卷
-docker compose -f docker/compose.yml down
-
-# 谨慎：同时删除 Redis / MySQL 数据卷
-docker compose -f docker/compose.yml down -v
 ```
+
+这是写完 YAML 后应优先执行的命令。它会解析 YAML、读取 `.env` / `--env-file`、合并多个 `-f` 文件并输出最终规范化配置；能尽早发现缩进、变量未定义、路径和服务字段问题。
+
+| 参数 | 用途 | 示例 |
+| --- | --- | --- |
+| `-q, --quiet` | 只校验，不输出渲染后的配置。 | `docker compose config -q` |
+| `--services` | 只列出服务名。 | `docker compose config --services` |
+| `--volumes` | 只列出命名卷。 | `docker compose config --volumes` |
+| `--networks` | 只列出网络。 | `docker compose config --networks` |
+| `--images` | 只列出服务使用的镜像。 | `docker compose config --images` |
+| `--environment` | 输出插值后用于 Compose 的环境变量。 | `docker compose config --environment` |
+| `--no-interpolate` | 不替换 `${VAR}`，便于检查原始变量表达式。 | `docker compose config --no-interpolate` |
+
+### `docker compose build` 与 `pull`：准备服务镜像
+
+```shell
+# 构建有 build 字段的服务镜像；只构建 gateway 也可以
+docker compose -f docker/compose.yml build gateway
+
+# 拉取使用 image 字段的服务镜像
+docker compose -f docker/compose.yml pull redis mysql
+```
+
+| 命令 | 常用参数 | 用途 | 示例 |
+| --- | --- | --- | --- |
+| `docker compose build [服务...]` | `--no-cache`：不使用缓存；`--pull`：拉取更新基础镜像；`--build-arg`：传递构建参数；`--progress`：控制输出。 | 构建或重建带 `build` 的服务镜像。 | `docker compose build --pull exec` |
+| `docker compose pull [服务...]` | `--ignore-buildable`：跳过可构建服务；`--policy always\|missing`：拉取策略；`--quiet`：安静输出。 | 拉取带 `image` 的服务镜像。 | `docker compose pull --policy always redis mysql` |
+
+`build` 不会创建容器，`pull` 不会构建 Dockerfile；`up --build` 会把“构建、创建、启动”串起来。
+
+### `docker compose up`：创建并启动服务
+
+```shell
+# 构建并后台启动完整项目；--wait 等待服务进入 running / healthy
+docker compose -f docker/compose.yml up --build --wait -d
+
+# 只启动 gateway 以及它的依赖
+docker compose -f docker/compose.yml up -d gateway
+```
+
+`up` 会按需构建或拉取镜像、创建网络与容器并启动服务。前台模式会汇集服务日志；按 `Ctrl-C` 时 Compose 会停止容器，后台模式使用 `-d` 后容器继续运行。
+
+| 参数 | 用途 | 示例 |
+| --- | --- | --- |
+| `-d, --detach` | 后台运行。 | `up -d` |
+| `--build` | 启动前构建带 `build` 的服务。 | `up --build -d` |
+| `--pull always\|missing\|never` | 启动前的镜像拉取策略。 | `up --pull always -d` |
+| `--wait` / `--wait-timeout <秒>` | 等待服务达到 running 或 healthy；`--wait` 隐含后台运行。 | `up --wait --wait-timeout 60` |
+| `--no-deps` | 只启动指定服务，不启动它依赖的服务。 | `up -d --no-deps gateway` |
+| `--force-recreate` | 即使镜像和配置没有变化也重建容器。 | `up -d --force-recreate` |
+| `--no-recreate` | 已存在容器时不重建；与 `--force-recreate` 互斥。 | `up -d --no-recreate` |
+| `--remove-orphans` | 删除不在当前 YAML 中定义、但同项目遗留的容器。 | `up -d --remove-orphans` |
+| `--scale <服务>=<数量>` | 临时扩容服务实例；服务不能固定 `container_name`。 | `up -d --scale gateway=3` |
+| `--no-attach <服务>` | 前台模式不跟随某个吵闹服务的日志。 | `up --no-attach mysql` |
+
+### `docker compose ps`、`logs` 与 `top`：观察运行状态
+
+```shell
+docker compose -f docker/compose.yml ps
+docker compose -f docker/compose.yml logs -f --tail 100 gateway
+docker compose -f docker/compose.yml top exec
+```
+
+| 命令 | 常用参数 | 用途 | 示例 |
+| --- | --- | --- | --- |
+| `docker compose ps [服务...]` | `-a, --all`：包含停止容器；`-q`：仅 ID；`--status <状态>`：过滤；`--format`：自定义输出。 | 查看该项目的服务容器状态和端口。 | `docker compose ps -a` |
+| `docker compose logs [服务...]` | `-f`：持续跟随；`-n, --tail`：尾部行数；`--since` / `--until`：时间范围；`-t`：时间戳；`--index`：副本序号。 | 查看服务日志。 | `docker compose logs -f -n 100 gateway` |
+| `docker compose top [服务...]` | 无常用额外参数。 | 查看服务容器内运行的进程。 | `docker compose top exec` |
+| `docker compose stats [服务...]` | `--no-stream`：只采样一次；`--format`：自定义输出。 | 查看 CPU、内存、网络和 I/O 使用。 | `docker compose stats --no-stream` |
+
+### `docker compose exec` 与 `run`：执行临时命令
+
+```shell
+# 在已经运行的 gateway 容器内打开 shell
+docker compose -f docker/compose.yml exec gateway sh
+
+# 创建一次性新容器执行数据库迁移；退出后自动删除
+docker compose -f docker/compose.yml run --rm gateway ./migrate
+```
+
+| 命令 | 常用参数 | 用途 | 示例 |
+| --- | --- | --- | --- |
+| `docker compose exec <服务> <命令>` | `-d`：后台执行；`-e`：临时环境变量；`-T`：关闭默认 TTY；`--index`：选择副本；`-u`：用户；`-w`：工作目录。 | 在**运行中**服务容器执行命令；默认可交互并分配 TTY。 | `exec -T gateway ./health-check` |
+| `docker compose run <服务> <命令>` | `--rm`：退出后删除；`--no-deps`：不启动依赖；`--service-ports`：保留端口发布；`-e`：环境变量；`-v`：额外挂载。 | 创建一个**一次性新容器**执行命令，不影响已运行服务容器。 | `run --rm --no-deps gateway sh` |
+
+不要用 `exec` 手工修改程序文件作为发布手段；修复应进入源码、Dockerfile 或配置，再重建容器。
+
+### `docker compose start`、`stop`、`restart` 与 `down`：控制生命周期
+
+```shell
+docker compose -f docker/compose.yml stop -t 30 gateway
+docker compose -f docker/compose.yml start gateway
+docker compose -f docker/compose.yml restart -t 30 exec
+docker compose -f docker/compose.yml down
+```
+
+| 命令 | 常用参数 | 用途 | 示例 |
+| --- | --- | --- | --- |
+| `docker compose start [服务...]` | 无常用选项。 | 启动已存在但停止的服务容器，不重新创建。 | `docker compose start gateway` |
+| `docker compose stop [服务...]` | `-t, --timeout <秒>`：优雅停止等待时间。 | 停止服务但保留容器、网络和命名卷。 | `docker compose stop -t 30 gateway` |
+| `docker compose restart [服务...]` | `-t, --timeout <秒>`：停止阶段等待时间。 | 停止后重启服务容器，不重建镜像或容器。 | `docker compose restart -t 30 exec` |
+| `docker compose down` | `-v, --volumes`：删除命名卷与匿名卷；`--rmi local\|all`：删除镜像；`--remove-orphans`：删除遗留服务；`-t`：停止超时。 | 停止并删除服务容器和项目网络，默认保留命名卷。 | `docker compose down --remove-orphans` |
+
+`down -v` 会删除 `volumes:` 声明的命名卷以及匿名卷；对于本项目意味着 Redis / MySQL 数据可能永久丢失，执行前要确认备份。
 
 这个案例的核心原则是：**按服务拆镜像、按构建和运行拆阶段、把模型/日志/数据库数据放到运行时卷、用 Compose 服务名连接依赖，并让 CMake Preset、Dockerfile 与 Compose 的路径保持一致。**
 
@@ -1000,3 +1231,5 @@ flowchart LR
 - [Dockerfile 指令参考](https://docs.docker.com/reference/dockerfile/)
 - [构建上下文与 `.dockerignore`](https://docs.docker.com/build/concepts/context/) / [构建缓存失效规则](https://docs.docker.com/build/cache/invalidation/)
 - [多阶段构建](https://docs.docker.com/build/building/multi-stage/) / [Compose 服务字段参考](https://docs.docker.com/reference/compose-file/services/)
+- [Compose 文件规范](https://docs.docker.com/reference/compose-file/) / [Compose CLI 与全局参数](https://docs.docker.com/reference/cli/docker/compose/)
+- [`docker compose up`](https://docs.docker.com/reference/cli/docker/compose/up/) / [`down`](https://docs.docker.com/reference/cli/docker/compose/down/) / [`exec`](https://docs.docker.com/reference/cli/docker/compose/exec/) / [`logs`](https://docs.docker.com/reference/cli/docker/compose/logs/)

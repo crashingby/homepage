@@ -62,6 +62,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: '训练系统',
         description: '有关深度学习训练的理论，系统实现',
     },
+    'gpu-communication': {
+        label: 'GPU通信系统',
+        description: '有关GPU通信的理论和实践知识',
+    },
 }
 
 const fallbackTopic: BlogTopic = {
