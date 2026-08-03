@@ -949,6 +949,104 @@ loss.backward()
 返回与 apply 输入逐一对应的 dq、dk、dv 或 None
 ```
 
+先把源码中的 `FlashAttnFunc` 完整放出来。它就是一个典型的 `torch.autograd.Function` 自定义算子写法：`forward` 负责调用 CUDA 前向并保存反向需要的状态，`backward` 负责接收上游梯度 `dout`，再调用 CUDA backward 写出 `dq/dk/dv`。
+
+源码位置：`flash_attn/flash_attn_interface.py`
+
+```python
+class FlashAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_softmax,
+        is_grad_enabled,
+    ):
+        is_grad = is_grad_enabled and any(
+            x.requires_grad for x in [q, k, v]
+        )
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
+            k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
+            v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal=causal,
+            window_size_left=window_size[0],
+            window_size_right=window_size[1],
+            softcap=softcap,
+            alibi_slopes=alibi_slopes,
+            return_softmax=return_softmax and dropout_p > 0,
+        )
+        if is_grad:
+            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
+            ctx.dropout_p = dropout_p
+            ctx.softmax_scale = softmax_scale
+            ctx.causal = causal
+            ctx.window_size = window_size
+            ctx.softcap = softcap
+            ctx.alibi_slopes = alibi_slopes
+            ctx.deterministic = deterministic
+        out = out_padded[..., :head_size_og]
+        return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        head_size_og = dout.size(3)
+        dout_padded = dout
+        if head_size_og % 8 != 0:
+            dout_padded = torch.nn.functional.pad(dout, [0, 8 - head_size_og % 8])
+        _wrapped_flash_attn_backward(
+            dout_padded,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            ctx.dropout_p,
+            ctx.softmax_scale,
+            ctx.causal,
+            ctx.window_size[0],
+            ctx.window_size[1],
+            ctx.softcap,
+            ctx.alibi_slopes,
+            ctx.deterministic,
+            rng_state=rng_state,
+        )
+        dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
+        dk = dk[..., : dout.shape[-1]]
+        dv = dv[..., : dout.shape[-1]]
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+```
+
+从这个类可以直接看出写自定义 autograd 类时最核心的接口约定：
+
+- **必须通过 `Class.apply(...)` 调用**，而不是手动实例化 `FlashAttnFunc()`。
+- **`forward(ctx, ...)` 是静态方法**，第一个参数 `ctx` 用来保存 backward 需要的 tensor 和配置。
+- **`backward(ctx, dout, *args)` 也是静态方法**，其中 `dout` 是输出 `out` 对应的上游梯度；`*args` 对应 `forward` 可能返回的额外输出梯度。
+- **`backward` 的返回值数量必须和 `forward` 的输入参数数量对齐**，不需要梯度的配置参数返回 `None`。
+
 `ctx` 是本次 `.apply()` 调用专属的上下文对象，不是类的实例状态。FA2 用它保存两类数据：
 
 | 保存方式 | `FlashAttnFunc` 中的内容 | 为什么要保存 |
@@ -1035,6 +1133,48 @@ def _flash_attn_forward(...) -> tuple[torch.Tensor, ...]:
 
 文件开头根据后端选择导入的模块：NVIDIA CUDA 主路径是 `import flash_attn_2_cuda as flash_attn_gpu`；ROCm/HIP 环境在不能导入该模块或显式开启开关时，可改走 Triton AMD 实现。后文沿用 `flash_attn_gpu` 这个统一别名讨论 NVIDIA 主路径。
 
+这里要分清两个名字：
+
+- `flash_attn_2_cuda` 是编译出来的 Python extension 模块名。
+- `flash_attn_gpu` 是 `flash_attn_interface.py` 里给这个模块起的 Python 别名。
+
+也就是说，Python 侧的：
+
+```python
+import flash_attn_2_cuda as flash_attn_gpu
+```
+
+只是把已编译模块改名为统一后端别名。真正决定模块名的是 `setup.py` 里的 `CUDAExtension`：
+
+```python
+CUDAExtension(
+    name="flash_attn_2_cuda",
+    sources=[
+        "csrc/flash_attn/flash_api.cpp",
+        "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
+        "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
+        ...
+    ],
+)
+```
+
+`name="flash_attn_2_cuda"` 会影响编译宏 `TORCH_EXTENSION_NAME`。因此 `flash_api.cpp` 末尾的：
+
+```cpp
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.doc() = "FlashAttention";
+    m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
+    m.def("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd, "Forward pass (variable length)");
+    m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
+    m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
+    m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
+}
+```
+
+等价于导出一个名为 `flash_attn_2_cuda` 的 Python 模块，并在模块上挂五个函数。
+
+### PyBind11 导出表
+
 `flash_attn_2_cuda` 的 PyBind11 模块在 `csrc/flash_attn/flash_api.cpp` 导出下列 Python 名称：
 
 | Python extension 名称 | C++ 实现 | 用途 |
@@ -1045,7 +1185,328 @@ def _flash_attn_forward(...) -> tuple[torch.Tensor, ...]:
 | `varlen_bwd` | `mha_varlen_bwd` | 变长 backward。 |
 | `fwd_kvcache` | `mha_fwd_kvcache` | KV cache 推理 forward。 |
 
-以 `mha_fwd` 为例，它先检查 CUDA 设备、Ampere 及以上计算能力、`fp16` / `bf16` dtype、最后一维连续、`head_size <= 256`、`head_size % 8 == 0` 和 MQA/GQA 的整除关系；然后分配 `out`、`softmax_lse`、可选 `S_dmask`、`rng_state`，将地址和 stride 填入 `Flash_fwd_params`。最后 `run_mha_fwd` 通过 `FP16_SWITCH`、`HEADDIM_SWITCH` 和 `BOOL_SWITCH` 选择 element type、编译期 head dimension 与 causal 模板参数；根据 split-KV 条件再选择普通 kernel 或 `run_mha_fwd_splitkv_dispatch`。这正是 Python 的通用参数最终收敛为有限个 CUDA 模板实例的位置。
+所以 Python 调用关系可以写成：
+
+```text
+flash_attn_gpu.fwd(...)
+-> flash_attn_2_cuda.fwd(...)
+-> csrc/flash_attn/flash_api.cpp::mha_fwd(...)
+-> run_mha_fwd(params, stream)
+-> run_mha_fwd_<elem_type, kHeadDim, Is_causal>(...)
+   或 run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(...)
+```
+
+这里的 `m.def("fwd", &FLASH_NAMESPACE::mha_fwd, ...)` 是关键连接点：Python 看到的是 `fwd`，C++ 里真正执行的是 `mha_fwd`。
+
+### C++ 接口长什么样？
+
+这些导出函数不是普通 C ABI，而是 PyTorch C++ extension 风格的接口：参数大量使用 `at::Tensor`、`std::optional<at::Tensor>`，返回值使用 `std::vector<at::Tensor>`。PyBind11 和 PyTorch extension 会负责把 Python 侧的 `torch.Tensor` / `None` 映射到这些 C++ 类型。
+
+以定长 forward 为例，源码签名的核心部分是：
+
+```cpp
+std::vector<at::Tensor>
+mha_fwd(at::Tensor &q,
+        const at::Tensor &k,
+        const at::Tensor &v,
+        std::optional<at::Tensor> &out_,
+        std::optional<at::Tensor> &alibi_slopes_,
+        const float p_dropout,
+        const float softmax_scale,
+        bool is_causal,
+        int window_size_left,
+        int window_size_right,
+        const float softcap,
+        const bool return_softmax,
+        std::optional<at::Tensor> unused_generator_compat)
+```
+
+这个签名直接对应 Python 后端边界 `_flash_attn_forward` 中调用的：
+
+```python
+flash_attn_gpu.fwd(
+    q,
+    k,
+    v,
+    out,
+    alibi_slopes,
+    dropout_p,
+    softmax_scale,
+    causal,
+    window_size_left,
+    window_size_right,
+    softcap,
+    return_softmax,
+    None,
+)
+```
+
+注意最后的 `None` 会落到 C++ 的 `unused_generator_compat`。源码里立刻检查它必须为空：
+
+```cpp
+TORCH_CHECK(!unused_generator_compat.has_value(),
+            "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+            "dropout (when enabled) uses the default CUDA generator.");
+```
+
+这说明这个参数已经只是为了兼容旧版参数位置保留下来的，不再是真正的 generator 输入。
+
+### `mha_fwd` 做了什么？
+
+`mha_fwd` 是从 Python extension 进入 C++ / CUDA 的第一层。它主要做四件事。
+
+第一步是**保护设备上下文**，避免 kernel 被错误发射到 `cuda:0`：
+
+```cpp
+at::cuda::CUDAGuard device_guard{q.device()};
+```
+
+第二步是**检查输入约束**。典型检查包括：
+
+- Q/K/V 必须在 CUDA 设备上。
+- GPU 必须是 Ampere 或更新架构。
+- dtype 只能是 `fp16` 或 `bf16`，并且 Q/K/V dtype 一致。
+- 最后一维必须连续，也就是 `stride(-1) == 1`。
+- `head_size <= 256`。
+- `head_size % 8 == 0`。
+- `num_heads % num_heads_k == 0`，这是 MQA/GQA 的基本约束。
+
+源码里能看到这些检查集中在 `mha_fwd` 开头：
+
+```cpp
+auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+bool is_sm8x_min = cc_major >= 8;
+TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+
+auto q_dtype = q.dtype();
+TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+            "FlashAttention only support fp16 and bf16 data type");
+TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+
+TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+```
+
+第三步是**分配输出和中间 tensor**。定长 forward 返回四个 tensor：
+
+- `out`：attention 输出，形状和 `q` 对齐。
+- `softmax_lse`：每个 query 行的 log-sum-exp，反向需要它。
+- `p`：可选的 attention/dropout mask 相关输出，只在 `return_softmax` 时分配真实大小。
+- `rng_state`：dropout 反向复现随机掩码所需的 seed / offset。
+
+源码最后返回：
+
+```cpp
+return {out, softmax_lse, p, rng_state};
+```
+
+这也正好对应 Python `_flash_attn_forward` 里的解包：
+
+```python
+out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(...)
+```
+
+第四步是**填充 `Flash_fwd_params` 并发射 kernel**：
+
+```cpp
+Flash_fwd_params params;
+set_params_fprop(
+    params,
+    batch_size,
+    seqlen_q, seqlen_k,
+    seqlen_q_rounded, seqlen_k_rounded,
+    num_heads, num_heads_k,
+    head_size, head_size_rounded,
+    q, k, v, out,
+    /*cu_seqlens_q_d=*/nullptr,
+    /*cu_seqlens_k_d=*/nullptr,
+    /*seqused_k=*/nullptr,
+    return_softmax ? p.data_ptr() : nullptr,
+    softmax_lse.data_ptr(),
+    p_dropout,
+    softmax_scale,
+    window_size_left,
+    window_size_right,
+    softcap);
+
+auto stream = at::cuda::getCurrentCUDAStream().stream();
+run_mha_fwd(params, stream);
+```
+
+`set_params_fprop` 是非常重要的一层：它把高层 tensor 拆成 kernel 需要的裸指针、stride、shape、scale、dropout、window、causal 等字段。
+
+例如它会设置：
+
+```cpp
+params.q_ptr = q.data_ptr();
+params.k_ptr = k.data_ptr();
+params.v_ptr = v.data_ptr();
+params.q_row_stride = q.stride(-3);
+params.q_head_stride = q.stride(-2);
+params.o_ptr = out.data_ptr();
+params.softmax_lse_ptr = softmax_lse_d;
+params.b = b;
+params.h = h;
+params.h_k = h_k;
+params.h_h_k_ratio = h / h_k;
+params.seqlen_q = seqlen_q;
+params.seqlen_k = seqlen_k;
+params.d = d;
+params.d_rounded = d_rounded;
+```
+
+也就是说，Python 里的 `torch.Tensor` 到这里已经被整理成 CUDA kernel 能直接使用的参数包。
+
+### `run_mha_fwd` 如何转发到 CUDA 模板？
+
+`run_mha_fwd` 是 C++ host 侧的 dispatch 层：
+
+```cpp
+void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                if (params.num_splits <= 1 && !force_split_kernel) {
+                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+                } else {
+                    run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+                }
+            });
+        });
+    });
+}
+```
+
+这段代码完成的是**运行期参数到编译期模板参数的收敛**：
+
+- `FP16_SWITCH(!params.is_bf16, ...)`：根据 dtype 选择 `fp16` 或 `bf16` 的模板实例。
+- `HEADDIM_SWITCH(params.d, ...)`：根据 `head_dim` 选择有限的编译期 `kHeadDim`。
+- `BOOL_SWITCH(params.is_causal, Is_causal, ...)`：根据 causal 开关选择编译期布尔模板参数。
+- `params.num_splits` 和 `force_split_kernel`：决定走普通 forward kernel，还是 split-KV 路径。
+
+所以 `mha_fwd` 负责“把 PyTorch tensor 变成参数包”，`run_mha_fwd` 负责“把参数包转到具体 CUDA 模板实例”。
+
+### 其它导出函数的差异
+
+`mha_varlen_fwd` 和 `mha_fwd` 的主体流程一样，但多了变长序列元数据：
+
+```cpp
+mha_varlen_fwd(
+    at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &v,
+    std::optional<at::Tensor> &out_,
+    const at::Tensor &cu_seqlens_q,
+    const at::Tensor &cu_seqlens_k,
+    std::optional<at::Tensor> &seqused_k,
+    std::optional<const at::Tensor> &leftpad_k_,
+    std::optional<at::Tensor> &block_table_,
+    ...
+)
+```
+
+核心差异是：
+
+- 输入形状从 `(batch, seqlen, heads, dim)` 变成压平后的 `(total, heads, dim)`。
+- `cu_seqlens_q` / `cu_seqlens_k` 告诉 kernel 每条序列在压平 token 数组里的边界。
+- `block_table_` 存在时启用 paged KV 路径。
+- `softmax_lse` 形状从定长的 `(batch, heads, seqlen_q)` 变成 `(heads, total_q)`。
+
+`mha_bwd` 是定长 backward。它的 Python 侧已经传入预分配的 `dq/dk/dv`，C++ 侧会校验或创建这些 buffer，然后把它们交给 CUDA backward 原地写入：
+
+```cpp
+std::vector<at::Tensor>
+mha_bwd(const at::Tensor &dout,
+        const at::Tensor &q,
+        const at::Tensor &k,
+        const at::Tensor &v,
+        const at::Tensor &out,
+        const at::Tensor &softmax_lse,
+        std::optional<at::Tensor> &dq_,
+        std::optional<at::Tensor> &dk_,
+        std::optional<at::Tensor> &dv_,
+        ...
+        std::optional<at::Tensor> &rng_state)
+```
+
+它最终填的是 `Flash_bwd_params`：
+
+```cpp
+set_params_dgrad(
+    params,
+    batch_size,
+    seqlen_q, seqlen_k,
+    seqlen_q_rounded, seqlen_k_rounded,
+    num_heads, num_heads_k,
+    head_size, head_size_rounded,
+    q, k, v, out,
+    dout, dq, dk_expanded, dv_expanded,
+    nullptr,
+    nullptr,
+    loop ? dq_accum.data_ptr() : nullptr,
+    nullptr,
+    nullptr,
+    softmax_lse.data_ptr(),
+    softmax_d.data_ptr(),
+    p_dropout,
+    softmax_scale,
+    window_size_left,
+    window_size_right,
+    softcap,
+    deterministic,
+    /*unpadded_lse=*/false);
+```
+
+然后通过 `run_mha_bwd` 选择 backward 模板：
+
+```cpp
+void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    FP16_SWITCH(!params.is_bf16, [&] {
+        HEADDIM_SWITCH(params.d, [&] {
+            BOOL_SWITCH(params.is_causal, Is_causal, [&] {
+                run_mha_bwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+            });
+        });
+    });
+}
+```
+
+`mha_varlen_bwd` 和 `mha_bwd` 的关系，就类似 `mha_varlen_fwd` 和 `mha_fwd` 的关系：多传 `cu_seqlens_*`、`max_seqlen_*`，并让 `softmax_lse` 使用变长布局。
+
+`mha_fwd_kvcache` 是推理路径。它只做 forward，并且可以把新来的 `k/v` 写入已有 cache：
+
+```cpp
+mha_fwd_kvcache(
+    at::Tensor &q,
+    const at::Tensor &kcache,
+    const at::Tensor &vcache,
+    std::optional<const at::Tensor> &k_,
+    std::optional<const at::Tensor> &v_,
+    std::optional<const at::Tensor> &seqlens_k_,
+    ...
+)
+```
+
+这个接口的特殊点是：
+
+- `kcache/vcache` 是已有 KV cache。
+- `k_/v_` 存在时，函数会设置 `params.knew_ptr` / `params.vnew_ptr`，让 kernel 看到新 token 的 K/V。
+- `seqlens_k_` 描述每条序列当前 cache 中已经有效的长度。
+- `rotary_cos_` / `rotary_sin_` 存在时，函数会把 rotary 参数写进 `params`。
+- 如果有新 K/V、`cache_batch_idx_` 或 paged KV，源码会强制走 split-KV kernel。
+
+这里的转发语句很直接：
+
+```cpp
+run_mha_fwd(
+    params,
+    stream,
+    /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+```
 
 注意 `qkvpacked` 和 `kvpacked` 的“打包”主要影响 Python 层如何从输入 tensor 中切出 `q/k/v`，以及 backward 如何组织梯度返回；进入底层 CUDA forward 时，仍然会把 Q、K、V 作为独立 tensor 传入。
 
