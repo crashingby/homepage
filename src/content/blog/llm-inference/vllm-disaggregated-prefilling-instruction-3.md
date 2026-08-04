@@ -2842,28 +2842,227 @@ if params is not None and params.get("do_remote_prefill"):
 
 ### allocate_slots：D 侧只占 blocks，不跑本轮计算
 
-源码位置：vllm/v1/core/sched/scheduler.py；接口位置：`Scheduler.schedule()`。
+下面专门展开 `Scheduler.schedule()` 中所有直接由 `load_kv_async` 控制的分支。这里讨论的是 NIXL pull connector 的远端 prefill 路径；变量并不等价于“当前实例是 D 侧”，而是 connector 针对**当前请求、本次调度**给出的结果：是否要在两个 scheduler step 之间异步接收远端 KV。
+
+源码位置：
+
+- 调度器：`vllm/v1/core/sched/scheduler.py`，`Scheduler.schedule()`。
+- `allocate_slots` 的实际内存处理：`vllm/v1/core/kv_cache_manager.py`。
+- NIXL pull connector 的判定来源：`vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py`。
+
+#### 信号从哪里来
+
+`schedule()` 并不自己根据 `kv_role` 设置 `load_kv_async`，而是询问 connector：
 
 ```python
+# scheduler.py: 首次调度该请求时
+ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+    request, num_new_local_computed_tokens
+)
+num_external_computed_tokens = ext_tokens
+```
+
+NIXL 的远端 prefill 分支如下：
+
+```python
+# nixl/pull_scheduler.py
+if params is not None and params.get("do_remote_prefill"):
+    # actual 是 prompt 中可由远端 P 侧提供的 token 数。
+    actual = self._mamba_prefill_token_count(len(request.prompt_token_ids or []))
+    count = actual - num_computed_tokens  # 扣掉 D 侧已有的本地 prefix cache 命中。
+    if count > 0:
+        return count, True
+
+return 0, False
+```
+
+因此两个返回值必须连起来看：
+
+| 值 | 含义 |
+| --- | --- |
+| `num_external_computed_tokens` | 远端已经计算、但 D 侧尚未拥有本地 KV 的 token 数。它决定 D 侧需要给这些 token 准备多少 paged-KV slots。 |
+| `load_kv_async=True` | 这些 slots 不是本轮 forward 写入，而是未来由 connector 的异步传输写入；请求必须先进入等待状态。 |
+
+`count == 0` 时不会走异步加载。例如 D 侧 prefix cache 已完整命中，或请求没有携带 `do_remote_prefill`。而 `do_remote_prefill` 在 `update_state_after_alloc()` 后会被清为 `False`，所以同一个请求不会重复发起接收。
+
+#### `schedule()` 内的全部相关分支
+
+可以把首次调度远端 prefill 的控制流压缩成下面这段。代码中的注释对应源码语义：
+
+```python
+# 1. 不给模型安排任何新 token：本轮没有 forward 工作。
 if load_kv_async:
-    # KVTransfer: 正在加载远端 KV，本轮不做新的模型计算。
     assert num_external_computed_tokens > 0
     num_new_tokens = 0
 else:
-    # 普通调度路径才会计算本轮要跑多少 token。
     num_new_tokens = request.num_tokens - num_computed_tokens
+    # 正常计算 token budget、chunked prefill、encoder 输入等。
 
-# 给即将加载的外部 KV 分配本地 paged KV blocks。
+# 2. 异步接收不做 Mamba 的本地计算对齐。
+if self.need_mamba_block_aligned_split and not load_kv_async:
+    num_new_tokens = self._mamba_block_aligned_split(...)
+
+# 3. 异步远端 prefill + EAGLE 时，不额外分配 speculative lookahead slots。
+limit_lookahead_tokens = load_kv_async and self.use_eagle
+effective_lookahead_tokens = (
+    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+)
+
+# 4. 给等待中的远端传输留出当前在飞 prefill 的完工容量。
+reserved_blocks = 0
+if load_kv_async:
+    reserved_blocks = self._inflight_prefill_reserved_blocks()
+
+# 5. 本轮仍调用 allocate_slots，但分配的是接收目的地，而不是计算输出位置。
 new_blocks = self.kv_cache_manager.allocate_slots(
     request,
-    num_new_tokens,
+    num_new_tokens,  # 异步路径中为 0
+    num_new_computed_tokens=num_new_local_computed_tokens,
+    new_computed_blocks=new_computed_blocks,
+    num_lookahead_tokens=effective_lookahead_tokens,
     num_external_computed_tokens=num_external_computed_tokens,
     delay_cache_blocks=load_kv_async,
-    ...
+    reserved_blocks=reserved_blocks,
+    ...,
+)
+
+# 6. 不进入 running；等 worker 回报 KV 已收完。
+if load_kv_async:
+    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+    request.num_computed_tokens = num_computed_tokens
+    self._inflight_prefills.add(request)
+    continue
+```
+
+因此“**只占 blocks，不跑本轮计算**”并非 `allocate_slots` 的特殊短路：它是 `num_new_tokens = 0` 与 `num_external_computed_tokens > 0` 这组参数共同表达的。scheduler 也没有把该请求放入 `running`、没有写入 `num_scheduled_tokens`，所以它不会出现在本轮 `SchedulerOutput` 的模型执行 token 集合中。
+
+```mermaid
+flowchart TD
+    A["D 侧请求带 do_remote_prefill"] --> B["connector 返回 ext_tokens > 0, load_kv_async = True"]
+    B --> C["num_new_tokens = 0<br>不消耗 token budget、不安排 forward"]
+    C --> D["allocate_slots 为 ext_tokens 分配本地 KV slots<br>delay_cache_blocks = True"]
+    D --> E["update_state_after_alloc 生成接收 metadata"]
+    E --> F["状态：WAITING_FOR_REMOTE_KVS<br>不进入 running"]
+    F --> G["worker 异步从 P 侧接收 KV"]
+    G --> H["finished_recving"]
+    H --> I["cache_blocks 后回到 WAITING"]
+    I --> J["下一 scheduler step 正常安排 decode forward"]
+```
+
+这里的关键是：**block table 必须在传输开始前稳定下来**。connector 要把 D 侧新分配的物理 block IDs 放进 metadata，worker 才知道远端 KV 应写到哪里；但这些 block 中的数据还没有可供 attention 使用，所以不能让请求进入 `RUNNING`。
+
+#### `allocate_slots` 为什么接受 `num_new_tokens=0`
+
+`KVCacheManager.allocate_slots()` 专门支持这种情况：
+
+```python
+# kv_cache_manager.py
+if num_new_tokens == 0 and num_external_computed_tokens == 0:
+    raise ValueError(...)
+
+total_computed_tokens = min(
+    request.num_computed_tokens
+    + num_new_computed_tokens
+    + num_external_computed_tokens,
+    self.max_model_len,
+)
+
+num_tokens_main_model = total_computed_tokens + num_new_tokens
+num_tokens_need_slot = min(
+    num_tokens_main_model + num_lookahead_tokens, self.max_model_len
 )
 ```
 
-这里 `delay_cache_blocks=True` 很重要：D 侧 blocks 已经分配出来，但 KV 内容还没到，不能立刻把它们当作 prefix cache 命中写入缓存状态。要等 worker 真的拉完 KV 之后再 cache。
+异步 D 侧首次调度时，令 `L` 为本地 prefix 命中 token 数，`R` 为需从 P 侧接收的 token 数，则：
+
+$$
+\text{num\_new\_tokens}=0,\qquad
+\text{total\_computed}=L+R,\qquad
+\text{num\_tokens\_need\_slot}=L+R+\text{lookahead}.
+$$
+
+所以要分配的是承载远端 `R` 的本地 KV blocks（以及必要时的 lookahead blocks），而不是为 GPU forward 新增的 token 分配空间。随后 `allocate_new_computed_blocks(..., num_external_computed_tokens=R)` 会把这段外部 token 对应的 blocks 接到该请求的 block table；`delay_cache_blocks=True` 又阻止本轮调用 `cache_blocks()`。等 `finished_recving` 后，`_update_waiting_for_remote_kv()` 才调用：
+
+```python
+self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+```
+
+这解释了“已分配”与“已 cache / 可计算”是两个不同状态。前者是传输目的地址就绪，后者表示内容已经接收完成并提交给 KV cache manager。
+
+#### 为什么 EAGLE 时要清零 `lookahead_tokens`
+
+```python
+limit_lookahead_tokens = load_kv_async and self.use_eagle
+effective_lookahead_tokens = (
+    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+)
+```
+
+`self.use_eagle` 表示启用了 EAGLE speculative decoding。正常 speculative decoding 会用 `self.num_lookahead_tokens` 提前给 draft token 预留 KV slots；它们是**本地未来可能执行**的额外空间，不属于 P 侧实际传来的 prompt KV。
+
+在异步接收的这一轮，D 侧没有执行这些 draft token。若仍分配 lookahead，D 侧 block table 会比 P 侧实际可传输的 remote blocks 多出一个或多个 block，造成 P/D block 数和位置对不上。这里将有效值改为 `0`，只按真实的 `L + R` 建立接收目的地；等 KV 接收完成、请求恢复为普通调度后，EAGLE 的常规 lookahead 分配才会恢复。
+
+#### `reserved_blocks = _inflight_prefill_reserved_blocks()` 防的是什么
+
+这个 reservation 只在新异步接收请求准入时计算：
+
+```python
+def _request_remaining_blocks(self, request: Request) -> int:
+    full_num_tokens = min(request.num_tokens, self.max_model_len)
+    return self.kv_cache_manager.coordinator.get_num_blocks_to_allocate(
+        request_id=request.request_id,
+        num_tokens=full_num_tokens,
+        total_computed_tokens=request.num_computed_tokens,
+        num_tokens_main_model=full_num_tokens,
+        apply_admission_cap=True,
+        ...,
+    )
+
+def _inflight_prefill_reserved_blocks(self) -> int:
+    return sum(
+        self._request_remaining_blocks(req) for req in self._inflight_prefills
+    )
+```
+
+`_inflight_prefills` 包含仍未结束 prefill 的普通请求，也包含已经处于 `WAITING_FOR_REMOTE_KVS` 的异步接收请求。对集合中每个请求，它估算“若该请求要走到完整序列，之后还需要多少 blocks”，并把总和作为新异步接收的不可动用容量。
+
+`allocate_slots()` 的实际准入判断是：
+
+```python
+available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+required_blocks = num_blocks_to_allocate + watermark_blocks
+if required_blocks > available_blocks:
+    return None
+```
+
+也就是新 D 侧传输只有在下式成立时才开始：
+
+$$
+\text{新请求所需 blocks}+\text{watermark}
+\le
+\text{当前空闲 blocks}-\sum\text{在飞 prefill 的剩余 blocks}.
+$$
+
+原因是异步接收请求一旦拿到目标 blocks，就会在传输期间停在 `WAITING_FOR_REMOTE_KVS`：它没有 forward 进展，当前路径也不应为了它去抢占其他在飞 prefill。若无限制地让它们先占满空闲 blocks，已经开始的 chunked prefill 可能再也拿不到完成所需空间；大家又都需要对方释放 blocks，便会导致可预测的抢占甚至资源死锁。`reserved_blocks` 是 admission control，不是额外分配：它只把一部分**尚未分配的空闲 blocks**从新异步接收的可用容量中扣除。
+
+#### 接收完成后如何重新进入正常调度
+
+`WAITING_FOR_REMOTE_KVS` 被视作 blocked waiting 状态。worker 通过 `KVConnectorOutput.finished_recving` 回报完成，scheduler 在下一轮将其提升：
+
+```python
+if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+    if request.request_id not in self.finished_recving_kv_req_ids:
+        return False  # 继续等待，仍不执行模型
+
+    self._update_waiting_for_remote_kv(request)  # cache_blocks
+    request.status = (
+        RequestStatus.PREEMPTED if request.num_preemptions
+        else RequestStatus.WAITING
+    )
+    return True
+```
+
+此时 `load_kv_async` 已不会再次为同一个 `do_remote_prefill` 请求返回 `True`：connector 已清除该标记；请求带着已到位的本地 KV 回到普通 `WAITING` 调度路径。若远端 KV 覆盖了完整 prompt，scheduler 还会把 `num_computed_tokens` 减一，让最后一个 prompt token 再执行一次，以产生用于采样下一个 token 的 logits。
 
 ### update_state_after_alloc：记录要从 P 侧接收哪些 KV
 
