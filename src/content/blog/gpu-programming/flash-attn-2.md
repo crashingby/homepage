@@ -36,6 +36,24 @@ flowchart LR
 | `mha_varlen_fwd` | `q: (total_q, H, D)`，`k/v: (total_k, Hk, D)`；也可令 K/V 为 paged KV。 | `cu_seqlens_q/k`、`seqused_k`、`leftpad_k`、`block_table`。 | 同上，但 LSE 为无 padding 布局。 | unpadding 后的变长 batch、varlen paged KV。 |
 | `mha_fwd_kvcache` | `q: (B, Lq, H, D)`，cache 为定长或分页布局。 | 可追加 `k/v`、`seqlens_k`、RoPE、cache 重映射、paged KV。 | `out`、`softmax_lse`。 | decode / chunked decode。 |
 
+### LSE（log-sum-exp）是什么
+
+本文的 **LSE** 是 `log-sum-exp`，即每个 attention query row 的 softmax 分母取对数；它**不是** softmax 概率，也不是输出向量。对固定的 `(b, h, i)`，设 $X[i,j]$ 为已缩放、mask 后的 attention score，`J_i` 为没有被 mask 的 key 下标集合，则：
+
+$$
+\operatorname{LSE}[b,h,i]
+= \log\sum_{j\in J_i}e^{X[i,j]}.
+$$
+
+kernel 以稳定形式计算它：先取 $m_i=\max_{j\in J_i}X[i,j]$，再计算
+
+$$
+\operatorname{LSE}[b,h,i]
+=m_i+\log\sum_{j\in J_i}e^{X[i,j]-m_i}.
+$$
+
+`softmax_lse` 使用 fp32 保存这个标量：定长路径逻辑形状为 `(B, H, Lq)`，varlen 路径为 `(H, total_q)`。它让反向传播能够重建 softmax 的归一化信息，而无需保存完整 `(Lq, Lk)` 概率矩阵；在 split-KV 中，`softmax_lse_accum` 先保存每个分片的局部 LSE，combine kernel 再合并成最终 LSE。
+
 三个函数都由 `flash-attention/csrc/flash_attn/flash_api.cpp` 末尾的 `PYBIND11_MODULE` 注册为 Python 侧的 `fwd`、`varlen_fwd`、`fwd_kvcache`。参数中的 `at::Tensor&`、`const at::Tensor&`、`std::optional<at::Tensor>&` 是 C++ 接口边界；进入 kernel 前，所有必要信息都会被摊平成指针、stride、尺寸和标志位。
 
 ## 先认识路径上的 Libtorch 接口
@@ -898,34 +916,7 @@ flowchart LR
     C --> O["最终 O、LSE"]
 ```
 
-设分片 `s` 的最大 score 为 $m_s$、归一化和为 $l_s$、分片内已归一化输出为 $O_s$。combine kernel 使用稳定 softmax 公式：
 
-$$
-m = \max_s m_s, \qquad
-l = \sum_s e^{m_s-m} l_s, \qquad
-O = \frac{\sum_s e^{m_s-m} l_s O_s}{l}.
-$$
-
-因此分片之间不需要保存完整 attention matrix，只需保存 fp32 的 partial output 与 LSE。`set_params_splitkv` 在 `params.num_splits > 1` 时分配：
-
-```cpp
-/**
- * @brief 为 split-KV 的多个 K/V 分片分配 fp32 归并缓冲区。
- *
- * @param params [in/out] 写入最终使用的 `num_splits` 与中间 buffer 指针。
- * @param num_splits `0` 表示启发式选择，`1` 表示不做并行切分，`>1` 表示切分数。
- * @return 保存 LSE 与 O 累积 tensor 的二元组；调用者必须在 kernel 完成前保持其生命周期。
- */
-std::tuple<at::Tensor, at::Tensor> set_params_splitkv(/* ... */) {
-    softmax_lse_accum = torch::empty(
-        {params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    out_accum = torch::empty(
-        {params.num_splits, batch_size, num_heads, max_seqlen_q, head_size_rounded},
-        opts.dtype(at::kFloat));
-    params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
-    params.oaccum_ptr = out_accum.data_ptr();
-}
-```
 
 分片数的选择也有明确约束：
 
@@ -935,6 +926,394 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(/* ... */) {
 - 最大支持 128 个分片。分片越多并不总更快：并行度增加，但中间 fp32 buffer 与 combine 的带宽成本也增加。
 
 局部变量 `softmax_lse_accum`、`out_accum` 看似在函数末尾不再使用，却必须保留到 launch 之后，因为 `params` 仅保存裸指针；Libtorch tensor 变量负责维持这两块 device storage 的生命周期。
+
+### 完整源码：`num_splits_heuristic`
+
+```cpp
+/**
+ * @brief 为 split-KV 选择能较好填充 GPU 的 K/V 分片数。
+ *
+ * @param batch_nheads_mblocks 不切分时的 CTA 数，即 `B * H * ceil(Lq / kBlockM)`。
+ * @param num_SMs 调度估计使用的有效 SM 数；调用方传入 `num_sm * 2`，以匹配
+ *        当前 split-KV kernel 每个 block 使用 128 threads 的经验模型。
+ * @param num_n_blocks K/V 方向 N tile 的总数；分片数不能超过它。
+ * @param max_splits 调用方允许的分片数上限；此处调用时为 128。
+ * @return 达到最佳 wave efficiency 至少 85% 的最小可用分片数；最少为 1。
+ */
+inline int num_splits_heuristic(
+    int batch_nheads_mblocks,
+    int num_SMs,
+    int num_n_blocks,
+    int max_splits) {
+    // 原始 CTA 已几乎填满 SM 时，避免额外 HBM 中间结果读写。
+    if (batch_nheads_mblocks >= 0.8f * num_SMs) {
+        return 1;
+    }
+    max_splits = std::min({max_splits, num_SMs, num_n_blocks});
+    float max_efficiency = 0.f;
+    std::vector<float> efficiency;
+    efficiency.reserve(max_splits);
+    auto ceildiv = [](int a, int b) { return (a + b - 1) / b; };
+
+    // ceil(N / S) 不变时，增加 S 不会改变各 split 的 N block 数，故跳过该候选。
+    auto is_split_eligible = [&ceildiv, &num_n_blocks](int num_splits) {
+        return num_splits == 1 ||
+               ceildiv(num_n_blocks, num_splits) !=
+                   ceildiv(num_n_blocks, num_splits - 1);
+    };
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            efficiency.push_back(0.f);
+        } else {
+            // 总 CTA 数为基础 CTA 数乘 S；最后一个不完整 wave 降低调度效率。
+            float n_waves = float(batch_nheads_mblocks * num_splits) / num_SMs;
+            float eff = n_waves / ceil(n_waves);
+            if (eff > max_efficiency) {
+                max_efficiency = eff;
+            }
+            efficiency.push_back(eff);
+        }
+    }
+    // 达到最优效率 85% 即接受，并优先返回较小 S 以减少中间 buffer 的读写。
+    for (int num_splits = 1; num_splits <= max_splits; num_splits++) {
+        if (!is_split_eligible(num_splits)) {
+            continue;
+        }
+        if (efficiency[num_splits - 1] >= 0.85 * max_efficiency) {
+            return num_splits;
+        }
+    }
+    return 1;
+}
+```
+
+其中 $n_{\text{waves}} = (B \cdot H \cdot M_{\text{blocks}} \cdot S) / N_{\text{SM}}$，`eff = n_waves / ceil(n_waves)` 是末尾不完整调度 wave 造成的理想化利用率。该启发式不总选最大的 $S$，因为每多一个分片也会多写、读一份 fp32 中间结果。
+
+### 完整源码：`set_params_splitkv`
+
+```cpp
+/**
+ * @brief 为 split-KV 前向路径选择分片数，并按需分配 fp32 归并缓冲区。
+ *
+ * @param params [in/out] 写入 `num_splits`；当 `S > 1` 时还写入两个借用的 device 指针。
+ * @param batch_size 定长 batch 大小 B。
+ * @param num_heads Q head 数 H。
+ * @param head_size 实际 D，用于选择与 split-KV dispatch 一致的 K/V tile 宽度。
+ * @param max_seqlen_k K/V 的最大长度。
+ * @param max_seqlen_q Q 的最大长度。
+ * @param head_size_rounded 向上取整的 D；中间 O buffer 以该宽度分配。
+ * @param p_dropout dropout 丢弃概率；非零时当前实现不启用 split-KV。
+ * @param num_splits 小于 1 表示自动选择，1 表示无需归并，大于 1 表示固定 S。
+ * @param num_sm 当前 CUDA device 的物理 SM 数。
+ * @param opts 临时 tensor 的分配选项；函数只覆写 dtype 为 fp32。
+ * @return `{softmax_lse_accum, out_accum}`；调用方须持有它们直到 CUDA kernel 入队完成。
+ */
+std::tuple<at::Tensor, at::Tensor> set_params_splitkv(
+    Flash_fwd_params& params,
+    const int batch_size,
+    const int num_heads,
+    const int head_size,
+    const int max_seqlen_k,
+    const int max_seqlen_q,
+    const int head_size_rounded,
+    const float p_dropout,
+    const int num_splits,
+    const int num_sm,
+    struct c10::TensorOptions opts) {
+    // 必须与 run_mha_fwd_splitkv_dispatch 选用的 kBlockN 保持一致。
+    const int block_n = head_size <= 64 ? 256 :
+                        (head_size <= 128 ? 128 : 64);
+    const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
+    // split-KV kernel 的 kBlockM 固定为 64。
+    const int num_m_blocks = (max_seqlen_q + 64 - 1) / 64;
+    params.num_splits = num_splits;
+    at::Tensor softmax_lse_accum;
+    at::Tensor out_accum;
+
+    // Split-KV 目前不实现 dropout。
+    if (p_dropout == 0.0f) {
+        if (num_splits < 1) {
+            // 128-thread block 的经验 occupancy 模型：将有效 SM 数乘 2。
+            params.num_splits = num_splits_heuristic(
+                batch_size * num_heads * num_m_blocks,
+                num_sm * 2,
+                num_n_blocks,
+                128);
+        }
+        if (params.num_splits > 1) {
+            // 以 split 为首维，每个 CTA 独占一段 fp32 局部结果，因而无需 atomic。
+            softmax_lse_accum = torch::empty(
+                {params.num_splits, batch_size, num_heads, max_seqlen_q},
+                opts.dtype(at::kFloat));
+            out_accum = torch::empty(
+                {params.num_splits, batch_size, num_heads, max_seqlen_q,
+                 head_size_rounded},
+                opts.dtype(at::kFloat));
+            params.softmax_lseaccum_ptr = softmax_lse_accum.data_ptr();
+            params.oaccum_ptr = out_accum.data_ptr();
+        }
+        TORCH_CHECK(params.num_splits <= 128, "num_splits > 128 not supported");
+    }
+    return std::make_tuple(softmax_lse_accum, out_accum);
+}
+```
+
+`softmax_lse_accum` 的逻辑形状是 `(S, B, H, Lq)`，而 `out_accum` 是 `(S, B, H, Lq, D_rounded)`。`Flash_fwd_params` 只保存它们的裸 device 指针，故调用方必须保持返回的 `at::Tensor` 存活；两个局部变量并非无用。
+
+### 数学原理：如何稳定合并 `softmax_lse_accum` 与 `out_accum`
+
+下面先忽略 tiling，把一个 `(b, h)` 的 attention 当作一个完整矩阵计算；随后再回到源码中真正的 CTA 粒度。设：
+
+$$
+Q \in \mathbb{R}^{L_q \times D},\qquad
+K,V \in \mathbb{R}^{L_k \times D}.
+$$
+
+### 不使用 split-KV：一个 `(b,h)` 上的完整计算
+
+固定 batch `b` 和 query head `h`，常规 attention 的数据流为：
+
+$$
+X = \operatorname{mask}\!\left(\frac{QK^T}{\sqrt D}\right)
+  \in \mathbb{R}^{L_q \times L_k},
+\qquad
+P = \operatorname{softmax}_{\text{row}}(X)
+  \in \mathbb{R}^{L_q \times L_k},
+$$
+
+$$
+O = PV \in \mathbb{R}^{L_q \times D}.
+$$
+
+其中 $X[i,j]$ 是第 `i` 个 query token 对第 `j` 个 key token 的 score。数学上，softmax 的原始分母是：
+
+$$
+Z_i = \sum_{j=0}^{L_k-1} e^{X[i,j]}.
+$$
+
+但 kernel **不会直接**计算它：当 score 较大时 `exp(X[i,j])` 会溢出。实际先取这一行的最大 score（被 mask 的位置视作 $-\infty$）：
+
+$$
+m_i = \max_{0\le j<L_k} X[i,j],
+\qquad
+\ell_i = \sum_{j=0}^{L_k-1}e^{X[i,j]-m_i}.
+$$
+
+此时 $X[i,j]-m_i\le0$，每个指数项都不大于 1。由于原始分子、分母同时除以 $e^{m_i}$，概率完全不变：
+
+$$
+P[i,j]
+= \frac{e^{X[i,j]-m_i}}{\ell_i}
+= \frac{e^{X[i,j]}}{Z_i},
+\qquad
+O[i,:] = \sum_{j=0}^{L_k-1} P[i,j]V[j,:].
+$$
+
+二者的关系为 $Z_i=e^{m_i}\ell_i$，所以写入训练所需 LSE 的值是
+$\operatorname{LSE}_i=\log Z_i=m_i+\log\ell_i$。后面的 split-KV 正是让每个 CTA 各自维护一套局部 $(m_{s,i},\ell_{s,i})$，再将它们稳定地合并为这个全局 $(m_i,\ell_i)$。
+
+FlashAttention 不会真的把完整的 $X$ 或 $P$ 写到 HBM；它按 K/V tile 流式读取，在线维护每行的最大值、softmax 分母和输出累积。但从数学上看，最终仍是上面的 `(Lq, Lk) → (Lq, D)`。
+
+**源码中的真实 CTA 更小。** 普通 forward 的一个 CTA 实际固定 `(m_block, b, h)`，只处理 $M \le kBlockM$ 个 query row，而不是全部 `Lq`；本节中的 `(Lq, ·)` 只需替换成这个 Q tile 的 `(M, ·)`。这个差别不影响 split-KV 的合并原理。
+
+### 使用 split-KV：`S` 个 CTA 分摊同一个 Q tile 的 K/V 维
+
+对同一个 `(m_block, b, h)`，将 K/V 的 `Lk` 个 token 切成 $S$ 个互不重叠的连续片段：
+
+$$
+\{0,\ldots,L_k-1\}=J_0\mathbin{\dot\cup}J_1\mathbin{\dot\cup}\cdots
+\mathbin{\dot\cup}J_{S-1}.
+$$
+
+于是第 `s` 个 split worker CTA 的局部计算形状如下。最后一个分片可能稍短；源码按 N tile 切分，因此不必恰好等长。
+
+| 对象 | 不切分时 | split `s` 的 CTA | 是否写入 HBM |
+| --- | --- | --- | --- |
+| Q tile | `(M, D)` | 同一份 `(M, D)`，每个 worker CTA 自行读取。 | 否。 |
+| K/V | `(Lk, D)` | `(Lk_s, D)`，其中 ` Lk_s = J_s `。 | 否。 |
+| 局部 score | `(M, Lk)` | `(M, Lk_s)`。 | 否，仍在寄存器 / shared memory 流式处理。 |
+| 局部 LSE | 每个 Q row 一个标量 | `(M,)`。 | 是，写入 `softmax_lse_accum[s,b,h,m:m+M]`。 |
+| 局部输出 | `(M, D)` | `(M, D)`。 | 是，写入 `out_accum[s,b,h,m:m+M,:]`。 |
+
+例如 `Lq=64`、`Lk=4096`、`D=128`、`S=4` 时，概念上四个 CTA 都拿到同一份 `Q: (64,128)`，但分别只处理 `K_s,V_s: (1024,128)` 和局部 score `(64,1024)`。它们不会各自得到“最终 O”，而会各自得到一份只在本分片 K/V 上归一化的局部 O。
+
+对一个 Q row `i`，第 `s` 个 CTA 计算：
+
+$$
+m_{s,i}=\max_{j\in J_s}X[i,j],
+\qquad
+\ell_{s,i}=\sum_{j\in J_s} e^{X[i,j]-m_{s,i}},
+$$
+
+$$
+\operatorname{LSE}_{s,i}=m_{s,i}+\log \ell_{s,i},
+\qquad
+O_{s}[i,:]=
+\sum_{j\in J_s}
+\frac{e^{X[i,j]-m_{s,i}}}{\ell_{s,i}}V[j,:].
+$$
+
+$\ell_{s,i}$ 就是“**局部归一化和**”：它只把当前分片 $J_s$ 内、减去局部最大值后的指数加起来。$O_s[i,:]$ 因而是“若 K/V 只有分片 $s$，这个 row 会得到什么输出”。它不是最终答案，但它和 `LSE_s` 恰好足以恢复最终答案。
+
+第一个 split kernel 写入的真实 buffer 形状为：
+
+```text
+softmax_lse_accum: [S, B, H, Lq]             // fp32，每个 split、每个 Q row 一个 LSE
+out_accum:         [S, B, H, Lq, D_rounded] // fp32，每个 split、每个 Q row 一个局部 O 向量
+```
+
+所以固定一个 `(b,h,i)`，combine kernel 读取的是 `S` 个标量
+`softmax_lse_accum[0:S,b,h,i]`，以及 `S` 个向量
+`out_accum[0:S,b,h,i,:]`；它不再读取 Q、K、V，更不会重新计算 `(M,Lk)` score 矩阵。
+
+### combine CTA：先合并分母，再合并局部输出
+
+先把第 `s` 个分片对应的**原始 softmax 分母份额**记为：
+
+$$
+Z_{s,i}=\sum_{j\in J_s}e^{X[i,j]}
+=e^{m_{s,i}}\ell_{s,i}
+=e^{\operatorname{LSE}_{s,i}}.
+$$
+
+所有分片不重叠且覆盖全部 K，因此全局分母就是各分片分母的和：
+
+$$
+Z_i=\sum_{s=0}^{S-1}Z_{s,i}.
+$$
+
+同理，第 `s` 个局部输出满足 $O_s[i,:]=N_{s,i}/Z_{s,i}$。这里的
+$N_{s,i}$ 定义为**原始**未归一化分子，所以第一种写法中没有减
+$m_{s,i}$：
+
+$$
+\begin{aligned}
+N_{s,i}
+&= \sum_{j\in J_s} e^{X[i,j]}V[j,:] \\
+&= e^{m_{s,i}}\sum_{j\in J_s}e^{X[i,j]-m_{s,i}}V[j,:].
+\end{aligned}
+$$
+
+第二行才是 kernel 实际安全计算的形式；$e^{m_{s,i}}$ 被提到求和号外。与此同时
+$Z_{s,i}=e^{m_{s,i}}\ell_{s,i}$，所以计算局部输出时这个公共因子严格抵消：
+
+$$
+O_s[i,:]
+= \frac{e^{m_{s,i}}\sum_{j\in J_s}e^{X[i,j]-m_{s,i}}V[j,:]}
+       {e^{m_{s,i}}\ell_{s,i}}
+= \frac{\sum_{j\in J_s}e^{X[i,j]-m_{s,i}}V[j,:]}
+       {\ell_{s,i}}.
+$$
+
+因此 $m_{s,i}$ 没有漏掉：它在原始 $N_{s,i}$ 定义中隐含于指数 $e^{X[i,j]}$，在稳定实现中显式出现后又与分母抵消。于是：
+
+$$
+O[i,:]
+=\frac{\sum_s N_{s,i}}{Z_i}
+=\sum_s\underbrace{\frac{Z_{s,i}}{Z_i}}_{w_{s,i}}O_s[i,:].
+$$
+
+也就是说，combine 只需把每个局部输出乘以它对全局 softmax 分母的贡献比例 $w_{s,i}$ 后相加。下面展开说明这个 LSE 与权重公式从何而来。
+
+首先，局部 LSE 的定义就是局部分母的对数：
+
+$$
+\operatorname{LSE}_{s,i}=\log Z_{s,i}
+\qquad\Longleftrightarrow\qquad
+Z_{s,i}=e^{\operatorname{LSE}_{s,i}}.
+$$
+
+所有 $J_s$ 不重叠并覆盖所有 K，因此全局分母是局部分母之和。对它取对数，就得到全局 LSE：
+
+$$
+\begin{aligned}
+\operatorname{LSE}_i
+&=\log Z_i \\
+&=\log\sum_s Z_{s,i} \\
+&=\log\sum_s e^{\operatorname{LSE}_{s,i}}.
+\end{aligned}
+$$
+
+最后一行直接计算可能溢出，所以令 $c_i=\max_s\operatorname{LSE}_{s,i}$，并把每一项的 $e^{c_i}$ 提出来：
+
+$$
+\begin{aligned}
+\operatorname{LSE}_i
+&=\log\left(e^{c_i}\sum_s e^{\operatorname{LSE}_{s,i}-c_i}\right) \\
+&=c_i+\log\sum_s e^{\operatorname{LSE}_{s,i}-c_i}.
+\end{aligned}
+$$
+
+这不是近似：只是 $\log(ab)=\log a+\log b$。又因为 $c_i$ 是最大局部 LSE，所以所有指数输入都不大于 0。
+
+权重是“分片 $s$ 占全局 softmax 分母的比例”，将上面的关系逐行代入可得：
+
+$$
+\begin{aligned}
+w_{s,i}
+&=\frac{Z_{s,i}}{Z_i} \\
+&=\frac{e^{\operatorname{LSE}_{s,i}}}
+        {\sum_t e^{\operatorname{LSE}_{t,i}}} \\
+&=\frac{e^{\operatorname{LSE}_{s,i}}}
+        {e^{\operatorname{LSE}_i}} \\
+&=e^{\operatorname{LSE}_{s,i}-\operatorname{LSE}_i} \\
+&=\frac{e^{\operatorname{LSE}_{s,i}-c_i}}
+        {\sum_t e^{\operatorname{LSE}_{t,i}-c_i}}.
+\end{aligned}
+$$
+
+第四行正是源码使用的 `expf(lse_accum - lse_logsum)`；最后一行说明它本身也是对 `S` 个局部 LSE 做的一次稳定 softmax，故 $\sum_s w_{s,i}=1$。得到权重后才合并输出：
+
+$$
+O[i,:]=\sum_s w_{s,i}O_s[i,:].
+$$
+
+不能直接计算 $\sum_s O_s[i,:]$，原因在于 `out_accum` 中的 $O_s$ 已经是**各分片内部除过自己的分母**后的局部平均：
+
+$$
+O_s[i,:]=\frac{N_{s,i}}{Z_{s,i}}.
+$$
+
+直接相加会给每个 split 相同的系数 1，而正确结果应让它按自身 softmax 概率质量 $Z_{s,i}/Z_i$ 加权：
+
+$$
+\underbrace{\sum_s O_s[i,:]}_{\text{错误：每个 split 等权}}
+\quad\ne\quad
+\underbrace{\sum_s \frac{Z_{s,i}}{Z_i}O_s[i,:]}_{\text{正确：按分片分母质量加权}}.
+$$
+
+一个最小反例是 $S=2$，每个分片各有一个 key，且两个 score 相同。此时
+$O_0=V_0$、$O_1=V_1$、$Z_0=Z_1$。直接相加得到 $V_0+V_1$，而真正的 softmax 输出必须是
+$(V_0+V_1)/2$；权重自然应为 $w_0=w_1=1/2$。若第 0 个分片的 score 明显更大，则 $Z_0\gg Z_1$，正确输出也必须更接近 $O_0$，而不是仍将两个局部输出等权相加。
+
+反过来，若第一个 kernel 保存的是未归一化分子 $N_{s,i}$，那么确实可以直接做 $\sum_sN_{s,i}$；但源码保存的是更适合在线 softmax 的局部归一化结果 $O_s$，所以 combine 必须先从 LSE 恢复权重 $Z_{s,i}/Z_i$。$w_{s,i}$ 正是这个比例，因为：
+
+$$
+w_{s,i}
+= \frac{Z_{s,i}}{Z_i}
+= \frac{e^{\operatorname{LSE}_{s,i}}}
+        {\sum_t e^{\operatorname{LSE}_{t,i}}}.
+$$
+
+`c_i` 使所有指数的输入不大于 0，避免溢出。这里是严格的代数变形：分子、分母都乘了同一个 $e^{-c_i}$，所以无 split 与 split 的结果仅可能因浮点舍入顺序略有不同。
+
+源码的 combine CTA 会一次处理 `kBlockM` 个扁平化的 `(b,h,i)` row：
+
+1. 从 `softmax_lse_accum` 读取该 Q tile 的 `S × M` 个局部 LSE 到 shared memory，并沿 `S` 做 max、sum-exp、log，得到最终 `softmax_lse`。
+2. 将每个 `exp(LSE_s - LSE)` 留在 shared memory，作为该 split、该 row 的权重。
+3. 依次读取 `out_accum[s,...]` 的 `(M,D)` 局部输出，乘对应权重并在寄存器累加。
+4. 把最终 `(M,D)` 写到 `o_ptr`。这一步只读中间 buffer，不访问 Q/K/V。
+
+对应源码最核心的两行是：
+
+```cpp
+// 每行每个 split 的全局权重 w_s。
+sLSE[split][row] = expf(lse_accum(split) - lse_logsum);
+// 将局部 O_s 的每个 D 元素按 w_s 加权后累加为最终 O。
+tOrO += sLSE[split][row] * tOrOaccum;
+```
+
+所有分片对某行都无有效 K 时，首 kernel 写 `-INFINITY`。combine kernel 对“所有局部 LSE 都为 `-INFINITY`”写入 `INFINITY` 哨兵，避免计算 `(-∞)-(-∞)` 产生 NaN；这也与 host 在 `seqlen_k == 0` 时将最终 LSE 填为正无穷一致。
 
 ## `run_mha_fwd`：运行时值如何选择已编译模板
 
