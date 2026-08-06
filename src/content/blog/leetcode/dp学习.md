@@ -10032,3 +10032,422 @@ $$
 - 一维压缩后，金额正序遍历，允许当前硬币在本轮继续参与转移。
 
 如果你能把 `dp[0] = 1` 理解成“空组合是方案数的起点”，再把外层硬币理解成“固定组合的生成顺序”，这题就不会和 322、排列计数混在一起了。
+
+## 线性 DP：最长公共子序列（LCS）
+
+背包题的状态通常围绕“选到第几个物品、当前容量是多少”。接下来换一个大题型：**线性 DP**。
+
+线性 DP 的典型感觉是：
+
+> 用一个或多个位置下标表示“前缀范围”，答案从更短的前缀推出来。
+
+最长公共子序列（Longest Common Subsequence, LCS）就是二维线性 DP 的经典地基题。它不再关心容量，而是关心两个字符串的前缀：
+
+- `text1` 的前 `i` 个字符。
+- `text2` 的前 `j` 个字符。
+
+两个前缀之间的 LCS，可以由更短的前缀推出。
+
+## [1143. 最长公共子序列 - 力扣（LeetCode）](https://leetcode.cn/problems/longest-common-subsequence/description/)
+
+给定两个字符串 `text1` 和 `text2`，返回这两个字符串的最长**公共子序列**的长度。如果不存在公共子序列，返回 `0`。
+
+一个字符串的子序列，是指从原字符串中删除某些字符，且不改变剩余字符相对顺序后得到的新字符串。
+
+示例 1：
+
+```text
+输入：text1 = "abcde", text2 = "ace"
+输出：3
+解释：最长公共子序列是 "ace"，长度为 3。
+```
+
+示例 2：
+
+```text
+输入：text1 = "abc", text2 = "abc"
+输出：3
+解释：最长公共子序列是 "abc"，长度为 3。
+```
+
+示例 3：
+
+```text
+输入：text1 = "abc", text2 = "def"
+输出：0
+解释：两个字符串没有公共子序列，返回 0。
+```
+
+提示：
+
+- `1 <= text1.length, text2.length <= 1000`
+- `text1` 和 `text2` 仅由小写英文字符组成
+
+### 题目如何识别成线性 DP？
+
+这题有两个很强的信号：
+
+- **子序列**：可以删除字符，但不能改变相对顺序。
+- **两个字符串共同拥有**：需要同时在 `text1` 和 `text2` 中做选择。
+
+所以我们很自然会想：
+
+> 如果只看 `text1` 的前一部分，只看 `text2` 的前一部分，它们的最长公共子序列长度是多少？
+
+这就是 LCS 的状态来源。
+
+这里不是背包问题，因为没有“容量”这个维度；它是典型的**双序列前缀 DP**：
+
+- 一个下标走 `text1`。
+- 一个下标走 `text2`。
+- 每个状态表示两个前缀之间的最优答案。
+
+### 递归切入（探索逻辑）
+
+先从递归想。定义 `dfs(i, j)` 表示：
+
+> `text1[0..i]` 和 `text2[0..j]` 的最长公共子序列长度。
+
+也就是两个字符串分别只看到下标 `i` 和下标 `j`。
+
+站在 `text1[i]` 和 `text2[j]` 这两个字符面前，有两种情况。
+
+如果两个字符相等：
+
+```text
+text1[i] == text2[j]
+```
+
+那它们可以作为公共子序列的最后一个字符。此时答案来自更短的两个前缀：
+
+$$
+dfs(i, j) = dfs(i - 1, j - 1) + 1
+$$
+
+如果两个字符不相等：
+
+```text
+text1[i] != text2[j]
+```
+
+这两个字符不能同时作为同一个公共子序列的最后一个字符。那就必须丢掉其中一个尾字符继续尝试：
+
+- 丢掉 `text1[i]`，看 `dfs(i - 1, j)`。
+- 丢掉 `text2[j]`，看 `dfs(i, j - 1)`。
+
+取更长的那个：
+
+$$
+dfs(i, j) = \max(dfs(i - 1, j),\ dfs(i, j - 1))
+$$
+
+递归边界：
+
+- 如果 `i < 0` 或 `j < 0`，说明至少一个前缀已经空了，公共子序列长度为 0。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求两个字符串的最长公共子序列长度。
+     *
+     * @param text1 第一个字符串。
+     * @param text2 第二个字符串。
+     * @return 两个字符串的最长公共子序列长度。
+     */
+    int longestCommonSubsequence(string text1, string text2) {
+        const int rows = static_cast<int>(text1.size());
+        const int cols = static_cast<int>(text2.size());
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        return dfs(text1, text2, memo, rows - 1, cols - 1);
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(
+        const string& text1,
+        const string& text2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0 || col < 0) {
+            return 0;
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (text1[row] == text2[col]) {
+            // 两个尾字符相等，可以一起接到前一个公共子序列后面。
+            cached = dfs(text1, text2, memo, row - 1, col - 1) + 1;
+        } else {
+            // 两个尾字符不相等，只能分别尝试丢掉一个尾字符。
+            cached = max(
+                dfs(text1, text2, memo, row - 1, col),
+                dfs(text1, text2, memo, row, col - 1));
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归的重点，是始终盯住两个尾字符：
+
+- 相等：两个尾字符一起加入答案。
+- 不相等：丢掉一个尾字符，保留另一个方向继续找。
+
+### 状态定义
+
+把递归翻译成 DP。为了避免处理 `i - 1`、`j - 1` 越界，继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> `text1` 的前 `row + 1` 个字符，和 `text2` 的前 `col + 1` 个字符的最长公共子序列长度。
+
+更常见地写成：
+
+`dp[i][j]` 表示：
+
+> `text1` 的前 `i` 个字符，和 `text2` 的前 `j` 个字符的最长公共子序列长度。
+
+这里的 `i` 和 `j` 是长度，不是原字符串下标。真实字符下标是：
+
+- `text1[i - 1]`
+- `text2[j - 1]`
+
+最终答案是：
+
+$$
+dp[text1.size()][text2.size()]
+$$
+
+### 状态转移
+
+处理真实字符 `text1[row]` 和 `text2[col]`，对应安全垫状态 `dp[row + 1][col + 1]`。
+
+如果两个字符相等：
+
+$$
+dp[row + 1][col + 1] = dp[row][col] + 1
+$$
+
+这里的 `dp[row][col]` 表示两个字符串都退回一个字符之前的 LCS 长度。
+
+如果两个字符不相等：
+
+$$
+dp[row + 1][col + 1] =
+\max(dp[row][col + 1],\ dp[row + 1][col])
+$$
+
+含义分别是：
+
+- `dp[row][col + 1]`：丢掉 `text1[row]`。
+- `dp[row + 1][col]`：丢掉 `text2[col]`。
+
+合起来就是：
+
+```text
+if text1[row] == text2[col]:
+    dp[row + 1][col + 1] = dp[row][col] + 1
+else:
+    dp[row + 1][col + 1] = max(dp[row][col + 1], dp[row + 1][col])
+```
+
+### 初始化
+
+安全垫写法中：
+
+- `dp[0][j] = 0`：`text1` 为空时，和任何 `text2` 前缀的 LCS 都是 0。
+- `dp[i][0] = 0`：`text2` 为空时，和任何 `text1` 前缀的 LCS 都是 0。
+
+所以整个 `dp` 初始化为 0 即可。
+
+这里的第 0 行和第 0 列就是“空字符串安全垫”。它让转移中的 `dp[row][col]`、`dp[row][col + 1]`、`dp[row + 1][col]` 都自然合法。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `row = 0` 到 `text1.size() - 1`，逐个加入 `text1` 的字符。
+- 内层从 `col = 0` 到 `text2.size() - 1`，逐个加入 `text2` 的字符。
+
+每个状态 `dp[row + 1][col + 1]` 依赖：
+
+- 左上：`dp[row][col]`
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+
+所以从左到右、从上到下遍历即可。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维线性 DP 求两个字符串的最长公共子序列长度。
+     *
+     * @param text1 第一个字符串。
+     * @param text2 第二个字符串。
+     * @return 两个字符串的最长公共子序列长度。
+     */
+    int longestCommonSubsequence(string text1, string text2) {
+        const int rows = static_cast<int>(text1.size());
+        const int cols = static_cast<int>(text2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (text1[row] == text2[col]) {
+                    // 两个尾字符相等：一起接到两个更短前缀的 LCS 后面。
+                    dp[row + 1][col + 1] = dp[row][col] + 1;
+                } else {
+                    // 两个尾字符不相等：分别丢掉一个尾字符，取更长结果。
+                    dp[row + 1][col + 1] = max(
+                        dp[row][col + 1],
+                        dp[row + 1][col]);
+                }
+            }
+        }
+
+        return dp[rows][cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(text1.size() \times text2.size())$。
+- 空间复杂度：$O(text1.size() \times text2.size())$。
+
+### 空间优化
+
+二维转移依赖三格：
+
+- 左上：`dp[row][col]`
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+
+压成一维后，`dp[col + 1]` 表示当前处理到 `text1` 某个前缀时，和 `text2` 前 `col + 1` 个字符的 LCS 长度。
+
+但是一维会覆盖上一行，所以需要一个额外变量 `prev_diagonal` 保存“左上角”的旧值：
+
+```text
+prev_diagonal = 旧 dp[col]
+dp[col + 1]   = 旧上方
+dp[col]       = 当前行左方
+```
+
+遍历时要先保存旧的 `dp[col + 1]`，因为它下一轮会变成新的 `prev_diagonal`。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维线性 DP 求两个字符串的最长公共子序列长度。
+     *
+     * @param text1 第一个字符串。
+     * @param text2 第二个字符串。
+     * @return 两个字符串的最长公共子序列长度。
+     */
+    int longestCommonSubsequence(string text1, string text2) {
+        const int rows = static_cast<int>(text1.size());
+        const int cols = static_cast<int>(text2.size());
+        vector<int> dp(cols + 1, 0);
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = 0;
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方值；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+
+                if (text1[row] == text2[col]) {
+                    dp[col + 1] = prev_diagonal + 1;
+                } else {
+                    dp[col + 1] = max(dp[col + 1], dp[col]);
+                }
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return dp[cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(text1.size() \times text2.size())$。
+- 空间复杂度：$O(text2.size())$。
+
+### 为什么不能只看相等字符？
+
+LCS 的难点不是“字符相等就加一”，而是**字符不相等时怎么继承历史最优答案**。
+
+比如：
+
+```text
+text1 = "abcde"
+text2 = "ace"
+```
+
+当看到 `text1[1] = 'b'` 和 `text2[1] = 'c'` 时，它们不相等。但这不代表当前答案变成 0，因为前面已经匹配到了 `'a'`。
+
+所以不相等时必须保留两种可能：
+
+- 丢掉 `text1` 当前字符，继承上方状态。
+- 丢掉 `text2` 当前字符，继承左方状态。
+
+这就是：
+
+$$
+dp[row + 1][col + 1] =
+\max(dp[row][col + 1],\ dp[row + 1][col])
+$$
+
+LCS 的本质不是贪心地找相等字符，而是在两个前缀之间不断维护“到目前为止能形成的最长公共子序列”。
+
+### 这题的核心手感
+
+1143 是双序列线性 DP 的地基题。它的核心手感是：
+
+> `dp[i][j]` 永远表示两个前缀之间的答案。
+
+然后只盯住两个前缀的最后一个字符：
+
+- **相等**：两个字符一起用，答案来自左上角 `dp[i - 1][j - 1] + 1`。
+- **不相等**：两个字符不能一起用，答案来自上方和左方的最大值。
+
+安全垫写法里，对应到真实下标就是：
+
+```text
+if text1[row] == text2[col]:
+    dp[row + 1][col + 1] = dp[row][col] + 1
+else:
+    dp[row + 1][col + 1] = max(dp[row][col + 1], dp[row + 1][col])
+```
+
+如果你能把 `dp[row + 1][col + 1]` 理解成“两个前缀的答案”，而不是“两个字符的答案”，LCS 这一类题就打开了。后面很多编辑距离、不同子序列、字符串匹配类 DP，都是在这个前缀状态上继续变形。

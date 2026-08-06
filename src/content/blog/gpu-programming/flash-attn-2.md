@@ -1345,18 +1345,625 @@ void run_mha_fwd(Flash_fwd_params& params, cudaStream_t stream,
 
 `flash-attention/csrc/flash_attn/src/static_switch.h` 中的宏不是普通 `switch`：它们在运行时 `if` 的两个分支中，各创建一个 `constexpr` 常量或 type alias，再立刻调用 lambda。于是被调用函数可以将 `kHeadDim`、`Is_causal` 等作为**编译期模板参数**，让编译器删掉无关分支、确定 tile shape 与内存布局。
 
+先看这几个宏的源码。这里的宏之所以看起来“魔法味”很重，是因为它把 C 预处理器、C++ lambda 和模板实例化三件事叠在了一起：
+
+```cpp
+// flash-attention/csrc/flash_attn/src/static_switch.h
+
+/**
+ * @brief 把运行时 bool 条件转成局部作用域内的 constexpr bool 名字。
+ *
+ * @param COND 运行时 bool 表达式，例如 params.is_causal。
+ * @param CONST_NAME 由调用点指定的常量名；宏展开后会真的声明这个名字。
+ * @param ... 通常传入一个 lambda，例如 [&] { use<CONST_NAME>(); }。
+ *
+ * @note __VA_ARGS__ 是 C/C++ 变参宏的占位符，表示第三个及之后的所有实参。
+ *       本宏要求 __VA_ARGS__ 是一个可调用对象，所以源码里写成 __VA_ARGS__()。
+ */
+#define BOOL_SWITCH(COND, CONST_NAME, ...)      \
+  [&] {                                         \
+    if (COND) {                                 \
+      constexpr static bool CONST_NAME = true;  \
+      return __VA_ARGS__();                     \
+    } else {                                    \
+      constexpr static bool CONST_NAME = false; \
+      return __VA_ARGS__();                     \
+    }                                           \
+  }()
+
+/**
+ * @brief 根据编译选项决定 dropout 路径是否还需要运行时分发。
+ *
+ * 如果编译时定义 FLASHATTENTION_DISABLE_DROPOUT，则不再生成 dropout=true
+ * 的模板路径，直接把 Is_dropout 固定为 false。
+ */
+#ifdef FLASHATTENTION_DISABLE_DROPOUT
+  #define DROPOUT_SWITCH(COND, CONST_NAME, ...) \
+  [&] {                                         \
+    constexpr static bool CONST_NAME = false;   \
+    return __VA_ARGS__();                       \
+  }()
+#else
+  #define DROPOUT_SWITCH BOOL_SWITCH
+#endif
+
+/**
+ * @brief 把运行时 dtype 选择转成编译期 elem_type 类型别名。
+ *
+ * @param COND 运行时 bool；在 run_mha_fwd 中是 !params.is_bf16。
+ * @param ... 在 elem_type 作用域内执行的 lambda。
+ *
+ * @note COND 为 true 时选择 fp16，否则选择 bf16。这里生成的是 using elem_type，
+ *       所以后续才能写 run_mha_fwd_<elem_type, ...>。
+ */
+#define FP16_SWITCH(COND, ...)               \
+  [&] {                                      \
+    if (COND) {                              \
+      using elem_type = cutlass::half_t;     \
+      return __VA_ARGS__();                  \
+    } else {                                 \
+      using elem_type = cutlass::bfloat16_t; \
+      return __VA_ARGS__();                  \
+    }                                        \
+  }()
+
+/**
+ * @brief 根据实际 head dimension 选择向上取整后的编译期 kHeadDim。
+ *
+ * @param HEADDIM 运行时 head dimension，例如 params.d。
+ * @param ... 在选中的 kHeadDim 作用域内执行的 lambda。
+ *
+ * @note 实际 D=80 会进入 kHeadDim=96 特化；kernel 内再用 IsEvenKConst
+ *       判断是否需要对 D 方向多出来的列做 mask。
+ */
+#define HEADDIM_SWITCH(HEADDIM, ...)   \
+  [&] {                                \
+    if (HEADDIM <= 32) {               \
+      constexpr static int kHeadDim = 32;  \
+      return __VA_ARGS__();            \
+    } else if (HEADDIM <= 64) {        \
+      constexpr static int kHeadDim = 64;  \
+      return __VA_ARGS__();            \
+    } else if (HEADDIM <= 96) {        \
+      constexpr static int kHeadDim = 96;  \
+      return __VA_ARGS__();            \
+    } else if (HEADDIM <= 128) {       \
+      constexpr static int kHeadDim = 128; \
+      return __VA_ARGS__();            \
+    } else if (HEADDIM <= 192) {       \
+      constexpr static int kHeadDim = 192; \
+      return __VA_ARGS__();            \
+    } else if (HEADDIM <= 256) {       \
+      constexpr static int kHeadDim = 256; \
+      return __VA_ARGS__();            \
+    }                                  \
+  }()
+```
+
+`__VA_ARGS__` 不是 FlashAttention 自己发明的名字，而是**变参宏**语法。比如：
+
+```cpp
+#define CALL_TWICE(...) \
+  __VA_ARGS__();        \
+  __VA_ARGS__()
+
+CALL_TWICE([&] { work(); });
+```
+
+预处理器会把 `__VA_ARGS__` 替换成调用点传入的那段文本，也就是 `[&] { work(); }`。所以展开后近似是：
+
+```cpp
+[&] { work(); }();
+[&] { work(); }();
+```
+
+FlashAttention 的 `BOOL_SWITCH(COND, CONST_NAME, [&] { ... })` 也是这个套路：第三个参数是一整个 lambda 表达式，宏内部的 `__VA_ARGS__()` 就是“把这个 lambda 立即调用”。
+
+为什么要传 lambda？核心原因是：宏需要先在某个分支里声明一个 `constexpr` 名字，然后让后续代码在这个名字的作用域内执行。以 `BOOL_SWITCH(params.is_causal, Is_causal, [&] { ... })` 为例，它大致展开成：
+
+```cpp
+[&] {
+    if (params.is_causal) {
+        constexpr static bool Is_causal = true;
+        return [&] {
+            run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+        }();
+    } else {
+        constexpr static bool Is_causal = false;
+        return [&] {
+            run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
+        }();
+    }
+}();
+```
+
+所以 `Is_causal` 不是凭空出现的变量，它就是 `BOOL_SWITCH` 的第二个参数 `CONST_NAME`。调用点把 `Is_causal` 这个标识符传给宏，宏展开后在 `if/else` 两个分支里分别生成：
+
+```cpp
+constexpr static bool Is_causal = true;
+constexpr static bool Is_causal = false;
+```
+
+然后第三个参数 lambda 在同一个分支作用域里被调用，模板参数 `<..., Is_causal>` 就能看到这个名字。`constexpr` 很关键：模板参数必须是编译期常量，普通 `bool is_causal = params.is_causal` 不能写成 `run_mha_fwd_<..., is_causal>`。
+
+`[&]` 表示 lambda 用**引用捕获**外层变量，所以 lambda 里可以直接访问 `params`、`stream`、`elem_type`、`kHeadDim`。这里捕获的是 host 侧 C++ 变量，不是 CUDA device lambda；它只发生在发射 kernel 之前。
+
 | 宏 | 运行时条件 | 向模板提供的编译期实体 |
 | --- | --- | --- |
 | `FP16_SWITCH(!params.is_bf16, ...)` | Q 是 fp16 还是 bf16。 | `elem_type = cutlass::half_t` 或 `cutlass::bfloat16_t`。 |
 | `HEADDIM_SWITCH(params.d, ...)` | 实际 D 落在哪个上界桶。 | `kHeadDim ∈ {32, 64, 96, 128, 192, 256}`。 |
 | `BOOL_SWITCH(params.is_causal, ...)` | 是否 causal。 | `constexpr bool Is_causal`。 |
-| `DROPOUT_SWITCH`、`ALIBI_SWITCH` 等 | 更深层 kernel 的特性开关。 | 对应的 `constexpr bool`，若编译时禁用特性则固定为 `false`。 |
+| `DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, ...)` | 是否启用 dropout 路径。 | `constexpr bool Is_dropout`；若编译时禁用 dropout，则固定为 `false`。 |
+| `EVENK_SWITCH(is_even_K, IsEvenKConst, ...)` | 实际 D 是否刚好等于 `kHeadDim`。 | `constexpr bool IsEvenKConst`；若不相等，kernel 需要 mask 掉补齐列。 |
+| `LOCAL_SWITCH(..., Is_local, ...)` | 是否启用 sliding-window local attention。 | `constexpr bool Is_local`；causal 时源码会把 local 路径关掉。 |
+| `ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, ...)` | 是否传入 ALiBi slopes。 | `constexpr bool Has_alibi`；若编译时禁用 ALiBi，则固定为 `false`。 |
+| `SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, ...)` | 是否启用 softcap logits 限幅。 | `constexpr bool Is_softcap`；若编译时禁用 softcap，则固定为 `false`。 |
 
 这里的 `HEADDIM_SWITCH` 是“向上分桶”，例如实际 `D=80` 进入 `kHeadDim=96` 特化；内层 `is_even_K = params.d == Kernel_traits::kHeadDim` 决定是否需要 K 维 mask。入口限制 `D <= 256` 正是宏能覆盖的上限。
 
+这套宏的控制流可以按“运行时选择，编译期落点”理解：
+
+```mermaid
+flowchart TD
+    A["params.is_bf16 / params.d / params.is_causal 等运行时值"] --> B["宏内部 if/else 判断"]
+    B --> C["在命中的分支里声明 constexpr 或 using"]
+    C --> D["立即调用用户传入的 lambda"]
+    D --> E["lambda 中调用模板函数"]
+    E --> F["编译器选择已经实例化好的 kernel 版本"]
+```
+
+也就是说，宏没有在运行时“生成模板”。所有模板实例早就在编译扩展时生成好了；运行时只是沿着一棵 `if/else` 分发树，走到某个已编译实例。
+
 ### 从 `run_mha_fwd_` 到实际 kernel
 
-`flash.h` 只声明 `run_mha_fwd_<T, Headdim, Is_causal>`；其定义分散在类似 `flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_fp16_sm80.cu` 的显式特化文件中。一个特化通常只是把调用转给 `run_mha_fwd_hdim128<T, Is_causal>`，后者根据 dropout、GPU 架构和性能测量结果选择 `Flash_fwd_kernel_traits<...>`。
+`flash.h` 只声明 `run_mha_fwd_<T, Headdim, Is_causal>`：
+
+```cpp
+// flash-attention/csrc/flash_attn/src/flash.h
+
+/**
+ * @brief 普通 forward 路径的模板入口声明。
+ *
+ * @tparam T Q/K/V 的计算元素类型，通常是 cutlass::half_t 或 cutlass::bfloat16_t。
+ * @tparam Headdim 编译期 head dimension 桶，例如 32、64、96、128、192、256。
+ * @tparam Is_causal 是否编译 causal mask 路径。
+ * @param params [in,out] host 侧参数包；内部字段指向 device tensor、尺寸和 stride。
+ * @param stream [in] 当前 PyTorch CUDA stream。
+ *
+ * @note 这里只是声明。具体 `<T, Headdim, Is_causal>` 组合在多个 `.cu`
+ *       文件中显式特化，避免所有组合堆在同一个翻译单元里导致编译时间爆炸。
+ */
+template <typename T, int Headdim, bool Is_causal>
+void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream);
+```
+
+以 `run_mha_fwd` 中选出的 `<elem_type=cutlass::half_t, kHeadDim=128, Is_causal=true>` 为例，它会落到 `flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu` 里的显式特化：
+
+```cpp
+// flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_fp16_causal_sm80.cu
+
+/**
+ * @brief fp16、head dim 128、causal forward 的显式特化入口。
+ *
+ * @param params [in,out] 已由 C++/PyTorch wrapper 填好的 Flash_fwd_params。
+ * @param stream [in] CUDA launch stream。
+ *
+ * @note 这一层不做新的运行时判断，也不直接 launch kernel。
+ *       它只是把已经确定的模板组合转发给通用 hdim128 选择器。
+ */
+template <>
+void run_mha_fwd_<cutlass::half_t, 128, true>(
+    Flash_fwd_params& params,
+    cudaStream_t stream) {
+    run_mha_fwd_hdim128<cutlass::half_t, true>(params, stream);
+}
+```
+
+这一步的作用很工程化：`run_mha_fwd` 通过宏得到一个模板组合，但链接器需要在某个 `.cu` 文件里真的找到这个组合的定义。FlashAttention 用脚本生成一批 `flash_fwd_hdim{D}_{dtype}_{causal}_sm80.cu` 文件，每个文件只负责少数组合；这样可以控制 nvcc / ptxas 的单文件模板实例数量。
+
+然后才进入 `flash-attention/csrc/flash_attn/src/flash_fwd_launch_template.h` 中的 `run_mha_fwd_hdim128`。这一层开始根据 dropout、GPU 架构和经验调参结果选择具体 `Flash_fwd_kernel_traits<...>`：
+
+```cpp
+// flash-attention/csrc/flash_attn/src/flash_fwd_launch_template.h
+
+/**
+ * @brief head dim 128 的普通 forward host 侧选择器。
+ *
+ * @tparam T Q/K/V 的元素类型，由上一层显式特化固定。
+ * @tparam Is_causal 是否 causal，由上一层显式特化固定。
+ * @param params [in,out] 前向参数包；读取 dropout、尺寸和指针等运行时状态。
+ * @param stream [in] CUDA launch stream。
+ *
+ * @note 本函数还没有直接 launch CUDA kernel。它先把 dropout 转成编译期
+ *       Is_dropout，再根据 GPU 架构和 causal 状态选择 tile shape。
+ */
+template <typename T, bool Is_causal>
+void run_mha_fwd_hdim128(Flash_fwd_params& params, cudaStream_t stream) {
+    /// 编译期 head dimension 桶已经固定为 128。
+    constexpr static int Headdim = 128;
+
+    /// 读取当前 GPU compute capability；sm86/sm89 有单独的经验最优 tile。
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+
+    /// 把运行时 dropout 状态冻结为编译期 Is_dropout。
+    DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        if constexpr (!Is_dropout) {
+            // 无 dropout 时，针对不同架构和 causal 状态选择不同 Q/K tile。
+            if (is_sm8x) {
+                if constexpr (!Is_causal) {
+                    // sm86/sm89 + non-causal：128 x 32 使用约 48 KiB smem，
+                    // 更容易在一个 SM 上放下更多 CTA。
+                    run_flash_fwd<
+                        Flash_fwd_kernel_traits<Headdim, 128, 32, 4,
+                                                false, false, T>,
+                        Is_dropout,
+                        Is_causal>(params, stream);
+                } else {
+                    // sm86/sm89 + causal：64 x 64 更接近方形 tile，
+                    // 对 causal 三角区域的利用率更好。
+                    run_flash_fwd<
+                        Flash_fwd_kernel_traits<Headdim, 64, 64, 4,
+                                                false, false, T>,
+                        Is_dropout,
+                        Is_causal>(params, stream);
+                }
+            } else {
+                // 其他架构走 128 x 64 的通用选择。
+                run_flash_fwd<
+                    Flash_fwd_kernel_traits<Headdim, 128, 64, 4,
+                                            false, false, T>,
+                    Is_dropout,
+                    Is_causal>(params, stream);
+            }
+        } else {
+            // 有 dropout 时固定使用 128 x 32；dropout 会改变访存和寄存器压力，
+            // 源码保留了其他候选，但当前选择这个实例。
+            run_flash_fwd<
+                Flash_fwd_kernel_traits<Headdim, 128, 32, 4,
+                                        false, false, T>,
+                Is_dropout,
+                Is_causal>(params, stream);
+        }
+    });
+}
+```
+
+`Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, kNWarps, Is_Q_in_regs, Share_Q_K_smem, T>` 是真正把 kernel 形状固定下来的 traits。对上面的 causal fp16 hdim128 例子，如果运行在 sm86/sm89 且无 dropout，最终会走：
+
+```cpp
+run_flash_fwd<
+    Flash_fwd_kernel_traits<128, 64, 64, 4, false, false, cutlass::half_t>,
+    false,
+    true>(params, stream);
+```
+
+这句话已经把几个关键编译期参数固定了：
+
+- `Headdim=128`：每个 head 的 D 桶为 128。
+- `kBlockM=64`：一个 CTA 处理 64 行 Q。
+- `kBlockN=64`：一个 CTA 每轮处理 64 列 K/V。
+- `kNWarps=4`：一个 CTA 使用 4 个 warp。
+- `Is_dropout=false`：kernel 内不编译 dropout 路径。
+- `Is_causal=true`：kernel 内编译 causal mask 路径。
+
+若同样是 hdim128 causal，但不是 sm8x，源码会选 `kBlockM=128, kBlockN=64`；若启用了 dropout，则无论 causal 与否都会走 `128 x 32` 这个当前保留的 dropout 实例。这里的选择不是数学正确性要求，而是基于 shared memory、寄存器压力、occupancy（占用率）和不同 GPU 架构测出来的性能取舍。
+
+### `Flash_fwd_kernel_traits`：把 kernel 形状固定成编译期常量
+
+先看 `flash-attention/csrc/flash_attn/src/kernel_traits.h`。这里有两层 traits：
+
+- `Flash_kernel_traits`：公共底座，主要决定元素类型、累加类型、MMA 指令、shared memory copy 指令。
+- `Flash_fwd_kernel_traits`：forward 专用 traits，主要决定 CTA tile、线程数、shared memory layout、global memory copy layout。
+
+公共底座源码可以压缩成下面这样读：
+
+```cpp
+// flash-attention/csrc/flash_attn/src/kernel_traits.h
+
+/**
+ * @brief FlashAttention kernel 的公共编译期 traits。
+ *
+ * @tparam kHeadDim_ 编译期 head dimension 桶。
+ * @tparam kBlockM_ 一个 CTA 覆盖的 Q 行数。
+ * @tparam kBlockN_ 一个 CTA 每轮覆盖的 K/V 列数。
+ * @tparam kNWarps_ 一个 CTA 使用的 warp 数。
+ * @tparam elem_type Q/K/V 的元素类型。
+ *
+ * @note 这一层不区分 forward/backward，主要抽象架构相关能力：
+ *       是否支持 cp.async、使用哪种 MMA atom、从 shared memory 读矩阵时用哪种 copy atom。
+ */
+template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+          typename elem_type = cutlass::half_t>
+struct Flash_kernel_traits {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    /// sm80+ 上保留调用点传入的 half/bf16 类型，并启用 cp.async。
+    using Element = elem_type;
+    static constexpr bool Has_cp_async = true;
+#else
+    /// sm75 路径退回 half，且不使用 cp.async。
+    using Element = cutlass::half_t;
+    static constexpr bool Has_cp_async = false;
+#endif
+
+    /// attention score、softmax 和输出累加使用 fp32。
+    using ElementAccum = float;
+
+    /// tensor offset / stride 相关索引类型。
+    using index_t = int64_t;
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    /// sm80+ 根据 Element 选择 fp16 或 bf16 的 Tensor Core MMA 指令。
+    using MMA_Atom_Arch = std::conditional_t<
+        std::is_same_v<elem_type, cutlass::half_t>,
+        MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>,
+        MMA_Atom<SM80_16x8x16_F32BF16BF16F32_TN>>;
+#else
+    /// sm75 使用 16x8x8 的 fp16 Tensor Core MMA。
+    using MMA_Atom_Arch = MMA_Atom<SM75_16x8x8_F32F16F16F32_TN>;
+#endif
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    /// 从 shared memory 用 ldmatrix 风格加载 Q/K/V tile。
+    using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, elem_type>;
+    using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, elem_type>;
+#else
+    using SmemCopyAtom = Copy_Atom<DefaultCopy, elem_type>;
+    using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;
+#endif
+};
+```
+
+然后 forward 专用 traits 继承它。下面是 `Flash_fwd_kernel_traits` 的完整源码摘录，加上中文注释：
+
+```cpp
+/**
+ * @brief forward kernel 的编译期 traits，固定 CTA 形状、访存向量化和 shared memory 布局。
+ *
+ * @tparam kHeadDim_ 编译期 head dimension 桶。
+ * @tparam kBlockM_ 一个 CTA 处理的 Q 行数。
+ * @tparam kBlockN_ 一个 CTA 每轮处理的 K/V 列数。
+ * @tparam kNWarps_ 一个 CTA 使用的 warp 数。
+ * @tparam Is_Q_in_regs_ 是否把 Q 保存在寄存器中。
+ * @tparam Share_Q_K_smem_ 是否让 Q 和 K 复用同一段 shared memory。
+ * @tparam elem_type Q/K/V 的元素类型。
+ * @tparam Base 公共 traits，默认是 Flash_kernel_traits。
+ */
+template <int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_,
+          bool Is_Q_in_regs_ = false,
+          bool Share_Q_K_smem_ = false,
+          typename elem_type = cutlass::half_t,
+          typename Base = Flash_kernel_traits<kHeadDim_, kBlockM_, kBlockN_,
+                                              kNWarps_, elem_type>>
+struct Flash_fwd_kernel_traits : public Base {
+    /// Q/K/V/O 的元素类型，继承自公共 traits。
+    using Element = typename Base::Element;
+
+    /// score、softmax、输出累加的元素类型，固定为 fp32。
+    using ElementAccum = typename Base::ElementAccum;
+
+    /// tensor offset / stride 的索引类型。
+    using index_t = typename Base::index_t;
+
+    /// 是否使用 cp.async 从 global memory 异步搬运到 shared memory。
+    static constexpr bool Has_cp_async = Base::Has_cp_async;
+
+    /// shared memory -> register 的 copy atom。
+    using SmemCopyAtom = typename Base::SmemCopyAtom;
+
+    /// shared memory 中转置视角读取时使用的 copy atom。
+    using SmemCopyAtomTransposed = typename Base::SmemCopyAtomTransposed;
+
+    /// 是否复用 Q/K 的 shared memory；若复用，就必须先把 Q 放到寄存器。
+    static constexpr bool Share_Q_K_smem = Share_Q_K_smem_;
+    static constexpr bool Is_Q_in_regs = Is_Q_in_regs_ || Share_Q_K_smem;
+
+    /// CTA 线程组织：一个 warp 32 线程。
+    static constexpr int kNWarps = kNWarps_;
+    static constexpr int kNThreads = kNWarps * 32;
+
+    /// CTA 覆盖的逻辑 tile：M 是 Q 行，N 是 K/V 列，K 是 head dimension。
+    static constexpr int kBlockM = kBlockM_;
+    static constexpr int kBlockN = kBlockN_;
+    static constexpr int kHeadDim = kHeadDim_;
+    static_assert(kHeadDim % 32 == 0);
+
+    /// shared memory layout 在 D 维上的分块宽度；只取 32 或 64。
+    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
+
+    /// global memory 向量化搬运时在 D 维上的对齐宽度；可取 32、64、128。
+    static constexpr int kBlockKGmem = kHeadDim % 128 == 0 ? 128
+        : (kHeadDim % 64 == 0 ? 64 : 32);
+
+    /// shared memory swizzle 强度；D 维分块为 32 用 2，为 64 用 3。
+    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+
+    /// Tensor Core MMA 的线程/warp 组织；4 warp 时逻辑 MMA tile 是 64 x 16 x 16。
+    using TiledMma = TiledMMA<
+        typename Base::MMA_Atom_Arch,
+        Layout<Shape<Int<kNWarps>, _1, _1>>,  // 4x1x1 or 8x1x1 thread group
+        Tile<Int<16 * kNWarps>, _16, _16>>;
+
+    /// Q 的 shared memory layout atom。先描述 8 x kBlockKSmem 小块，再叠加 swizzle。
+    using SmemLayoutAtomQ = decltype(
+        composition(Swizzle<kSwizzle, 3, 3>{},
+                    // 这里必须用 kBlockKSmem；源码注释指出 d=128 时用 kHeadDim 会算错。
+                    Layout<Shape<_8, Int<kBlockKSmem>>,
+                           Stride<Int<kBlockKSmem>, _1>>{}));
+
+    /// Q tile 的完整 shared memory layout，逻辑形状为 (kBlockM, kHeadDim)。
+    using SmemLayoutQ = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+
+    /// K/V tile 的 shared memory layout，逻辑形状为 (kBlockN, kHeadDim)。
+    using SmemLayoutKV = decltype(tile_to_shape(
+        SmemLayoutAtomQ{},
+        Shape<Int<kBlockN>, Int<kHeadDim>>{}));
+
+    /// V 的转置 shared memory 视角，用于把 V 当成 (kHeadDim, kBlockN) 来喂给 MMA。
+    using SmemLayoutVtransposed = decltype(
+        composition(SmemLayoutKV{},
+                    make_layout(Shape<Int<kHeadDim>, Int<kBlockN>>{},
+                                GenRowMajor{})));
+
+    /// 去掉 swizzle 后的 V 转置 layout 片段，供 ldmatrix / copy atom 识别可直接搬运部分。
+    using SmemLayoutVtransposedNoSwizzle = decltype(
+        get_nonswizzle_portion(SmemLayoutVtransposed{}));
+
+    /// O 的 shared memory layout atom。
+    using SmemLayoutAtomO = decltype(
+        composition(Swizzle<kSwizzle, 3, 3>{},
+                    Layout<Shape<Int<8>, Int<kBlockKSmem>>,
+                           Stride<Int<kBlockKSmem>, _1>>{}));
+
+    /// O tile 的完整 shared memory layout，逻辑形状为 (kBlockM, kHeadDim)。
+    using SmemLayoutO = decltype(tile_to_shape(
+        SmemLayoutAtomO{},
+        Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+
+    /// O 写 shared/global 时的向量化 copy atom。
+    using SmemCopyAtomO =
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>;
+
+    /// split-KV 的 fp32 out_accum 写 shared/global 时使用的 copy atom。
+    using SmemCopyAtomOaccum =
+        Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
+
+    /// shared memory 大小：Q tile + K/V 双 tile；若 Share_Q_K_smem 则取二者最大值。
+    static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
+    static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
+    static constexpr int kSmemSize = Share_Q_K_smem
+        ? std::max(kSmemQSize, kSmemKVSize)
+        : kSmemQSize + kSmemKVSize;
+
+    /// global memory 读写使用 128-bit 向量化，一次搬 sizeof(uint128_t)/sizeof(Element) 个元素。
+    static constexpr int kGmemElemsPerLoad =
+        sizeof(cute::uint128_t) / sizeof(Element);
+    static_assert(kHeadDim % kGmemElemsPerLoad == 0,
+                  "kHeadDim must be a multiple of kGmemElemsPerLoad");
+
+    /// 每行多少线程共同搬运 D 维；这里故意用 kBlockKSmem 而不是 kBlockKGmem。
+    ///
+    /// 源码注释指出：d=128 时若按 128 宽搬运，每行会有 16 个线程；
+    /// 写入 shared memory 时 thread 0-7 写第一页，thread 8-15 写第二页，
+    /// 容易落到相同 bank。改用 kBlockKSmem=64 后，每行 8 个线程，可减少 bank conflict。
+    static constexpr int kGmemThreadsPerRow =
+        kBlockKSmem / kGmemElemsPerLoad;
+    static_assert(kNThreads % kGmemThreadsPerRow == 0,
+                  "kNThreads must be a multiple of kGmemThreadsPerRow");
+
+    /// global memory copy 的线程布局：线程被组织成若干行，每行 kGmemThreadsPerRow 个搬运线程。
+    using GmemLayoutAtom =
+        Layout<Shape<Int<kNThreads / kGmemThreadsPerRow>,
+                     Int<kGmemThreadsPerRow>>,
+               Stride<Int<kGmemThreadsPerRow>, _1>>;
+
+    /// Q/K/V 的 global->shared copy atom。
+    ///
+    /// sm80+ 使用 cp.async cache global；源码注释说不用 CACHEALWAYS，
+    /// 因为同一个 threadblock 不会反复读同一个地址，CACHEGLOBAL 略快。
+    using Gmem_copy_struct = std::conditional_t<
+        Has_cp_async,
+        SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
+        AutoVectorizingCopyWithAssumedAlignment<128>>;
+
+    /// Q/K/V 的 tiled copy；每次 copy 的 value layout 是 8 个元素。
+    using GmemTiledCopyQKV = decltype(
+        make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
+                        GmemLayoutAtom{},
+                        Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+
+    /// O 的 tiled copy；写回也按 128-bit 对齐向量化。
+    using GmemTiledCopyO = decltype(
+        make_tiled_copy(
+            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+            GmemLayoutAtom{},
+            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+
+    /// split-KV 的 fp32 out_accum 写回布局。
+    using GmemLayoutAtomOaccum = std::conditional_t<
+        kBlockKSmem == 32,
+        Layout<Shape<_16, _8>,  // Thread layout, 8 threads per row
+               Stride<_8, _1>>,
+        Layout<Shape<_8, _16>,  // Thread layout, 16 threads per row
+               Stride<_16, _1>>>;
+
+    /// split-KV 的 fp32 out_accum tiled copy；value layout 每次 4 个 fp32。
+    using GmemTiledCopyOaccum = decltype(
+        make_tiled_copy(
+            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
+            GmemLayoutAtomOaccum{},
+            Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per store
+
+    /// RoPE cos/sin 的 global memory copy 线程布局，复用 Q/K/V 的布局。
+    using GmemLayoutAtomRotcossin = GmemLayoutAtom;
+
+    /// RoPE cos/sin 的非连续读取 copy；每次读取 4 个值。
+    using GmemTiledCopyRotcossin = decltype(
+        make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per load
+
+    /// RoPE cos/sin 的连续读取 copy；每次读取 8 个值。
+    using GmemTiledCopyRotcossinCont = decltype(
+        make_tiled_copy(
+            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+            GmemLayoutAtomRotcossin{},
+            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per load
+};
+```
+
+这段 traits 可以按三组来理解：
+
+- **计算组织**：`TiledMma` 决定 Tensor Core MMA 的 warp 组织；对 4 warp forward，它的逻辑 tile 是 `64 x 16 x 16`。
+- **shared memory 组织**：`SmemLayoutQ/KV/O` 决定 Q、K/V、O tile 在 shared memory 中怎么排，并通过 `Swizzle<kSwizzle, 3, 3>` 减少 bank conflict。
+- **global memory 搬运组织**：`GmemTiledCopyQKV/O/Oaccum/Rotcossin` 决定线程如何做 128-bit 向量化读写。
+
+几个容易卡住的字段单独解释一下：
+
+- `kBlockKGmem` 是 **global memory 搬运视角下的 D 维对齐宽度**。它允许 d=128 时按 128 宽判断全局内存向量化边界；但源码后面计算 `kGmemThreadsPerRow` 时没有用它，而是用 `kBlockKSmem`，因为 d=128 时按 128 宽会让每行 16 个线程同时写 shared memory 的两个“页”，更容易撞同一组 bank。
+- `kBlockKSmem` 是 **shared memory layout 视角下的 D 维分块宽度**，只取 32 或 64。它直接影响 swizzle、每行搬运线程数和 shared memory 页面切分。
+- `kSwizzle = kBlockKSmem == 32 ? 2 : 3` 表示：当 D 维 shared-memory atom 较窄时用 `Swizzle<2, 3, 3>`，较宽时用 `Swizzle<3, 3, 3>`。这里的 2/3 不是运行时参数，而是 CUTE swizzle 的编译期模式选择；直观上，`kBlockKSmem=64` 需要更强的交错映射来打散 ldmatrix / Tensor Core 访问集中落到同一 bank 的风险。
+- `SmemLayoutVtransposed` 是 **V 的转置视角**。注意力最后一步是 $P \times V$，其中 $P$ 的 tile 逻辑形状接近 `(kBlockM, kBlockN)`，V 需要以 `(kBlockN, kHeadDim)` 存在 shared memory 中，但 MMA 往往要按 `(kHeadDim, kBlockN)` 的视角读取 V。这个 layout 没有复制一份 V，只是用 CUTE 给同一段 shared memory 建了一个转置坐标解释。
+- `SmemLayoutVtransposedNoSwizzle` 是从转置 layout 中取出 **去掉 swizzle 后可被 copy atom 直接识别的部分**。shared memory 真实地址带 swizzle，但 `ldmatrix`/copy atom 关心的是局部连续、可向量化、可矩阵加载的那部分布局；`get_nonswizzle_portion` 就是把这部分抽出来，方便后续构造 shared-memory tiled copy。
+
+把我们选定的特化完整代进去：
+
+```cpp
+using Kernel_traits =
+    Flash_fwd_kernel_traits<128, 64, 64, 4,
+                            false, false, cutlass::half_t>;
+```
+
+在 sm80+ 编译目标下，它的关键编译期常量是：
+
+| 名字 | 具体值 | 含义 |
+| --- | --- | --- |
+| `Element` | `cutlass::half_t` | Q/K/V/O 的元素类型是 fp16。 |
+| `ElementAccum` | `float` | score、softmax、输出累加用 fp32。 |
+| `Has_cp_async` | `true` | sm80+ 使用 `cp.async` 搬运 global memory 到 shared memory。 |
+| `MMA_Atom_Arch` | `SM80_16x8x16_F32F16F16F32_TN` | Tensor Core 做 fp16 x fp16 -> fp32 MMA。 |
+| `kHeadDim` | `128` | D 维编译期桶为 128。 |
+| `kBlockM` | `64` | 一个 CTA 处理 64 行 Q。 |
+| `kBlockN` | `64` | 一个 CTA 每轮处理 64 列 K/V。 |
+| `kNWarps` | `4` | 一个 CTA 使用 4 个 warp。 |
+| `kNThreads` | `128` | 一个 CTA 共 128 个线程。 |
+| `Share_Q_K_smem` | `false` | Q 与 K 不复用同一段 shared memory。 |
+| `Is_Q_in_regs` | `false` | Q 不强制提前常驻寄存器。 |
+| `kBlockKSmem` | `64` | shared memory layout 在 D 维按 64 宽分块。 |
+| `kBlockKGmem` | `128` | global memory 搬运在 D 维按 128 宽对齐。 |
+| `kSwizzle` | `3` | 使用 `Swizzle<3, 3, 3>`。 |
+| `TiledMma` tile | `64 x 16 x 16` | 4 个 warp 组成的 MMA tile；M 方向是 `16 * kNWarps = 64`。 |
+| `kSmemQSize` | `64 * 128 * 2 = 16384 B` | Q tile 占 16 KiB shared memory。 |
+| `kSmemKVSize` | `64 * 128 * 2 * 2 = 32768 B` | K 和 V 两个 tile 共占 32 KiB shared memory。 |
+| `kSmemSize` | `49152 B` | 不复用 Q/K shared memory，所以总共 48 KiB。 |
+| `kGmemElemsPerLoad` | `8` | fp16 下 128-bit 向量化一次搬 8 个元素。 |
+| `kGmemThreadsPerRow` | `8` | 每行 D 维由 8 个线程共同搬运到 shared memory。 |
+| `GmemLayoutAtom` | `Shape<16, 8>` | 128 个线程被组织成 16 行、每行 8 个搬运线程。 |
+| `GmemLayoutAtomOaccum` | `Shape<8, 16>` | split-KV fp32 `out_accum` 写回时，每行使用 16 个线程布局。 |
+
+因此，到 `run_flash_fwd<Kernel_traits, false, true>` 时，host 侧已经不再需要猜 kernel 的资源形状了：一个 CTA 的 Q tile、K/V tile、线程数、MMA tile、shared memory 字节数都成了 `Kernel_traits::...` 这样的编译期常量。`run_flash_fwd` 后面构造 grid 和 launch kernel，本质上就是使用这套 traits。
 
 `run_flash_fwd` 再构造普通 kernel 的 grid：
 
@@ -1382,6 +1989,54 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
 ```
 
 普通 kernel 的 grid 是 `(ceil(Lq / kBlockM), B, H)`。launch 前若动态 shared memory 不小于 48 KiB，代码用 `cudaFuncSetAttribute` 申请更高的每 block shared-memory 上限；launch 后立刻检查错误。再下一层的 `flash_fwd_kernel` 将 `Flash_fwd_params` **按值**传给 device，并调用 `compute_attn`。
+
+这段“继续转成模板布尔值”的真实结构大致是：
+
+```cpp
+const bool is_even_MN = params.cu_seqlens_q == nullptr
+    && params.cu_seqlens_k == nullptr
+    && params.seqlen_k % Kernel_traits::kBlockN == 0
+    && params.seqlen_q % Kernel_traits::kBlockM == 0;
+const bool is_even_K = params.d == Kernel_traits::kHeadDim;
+const bool return_softmax = params.p_ptr != nullptr;
+
+BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
+    EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
+        LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0)
+                         && !Is_causal,
+                     Is_local, [&] {
+            BOOL_SWITCH(return_softmax, ReturnSoftmaxConst, [&] {
+                ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
+                    SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
+                        auto kernel = &flash_fwd_kernel<
+                            Kernel_traits,
+                            Is_dropout && !Is_softcap,
+                            Is_causal,
+                            Is_local && !Is_causal,
+                            Has_alibi,
+                            IsEvenMNConst && IsEvenKConst && !Is_local
+                                && !Has_alibi && !ReturnSoftmaxConst
+                                && Kernel_traits::kHeadDim <= 128,
+                            IsEvenKConst && !ReturnSoftmaxConst && !Has_alibi,
+                            Is_softcap,
+                            ReturnSoftmaxConst && Is_dropout && !Is_softcap>;
+                        kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
+                    });
+                });
+            });
+        });
+    });
+});
+```
+
+这里的每一层 lambda 都会把一个运行时判断“冻结”为一个编译期名字。读这段时可以按作用域一层层压栈：
+
+- 外层 `run_mha_fwd_<T, Headdim, Is_causal>` 已经把 `T`、`Headdim`、`Is_causal` 固定了。
+- `run_mha_fwd_hdim128<T, Is_causal>` 这类函数再用 `DROPOUT_SWITCH` 固定 `Is_dropout`。
+- `run_flash_fwd<Kernel_traits, Is_dropout, Is_causal>` 里继续固定 `IsEvenMNConst`、`IsEvenKConst`、`Is_local`、`ReturnSoftmaxConst`、`Has_alibi`、`Is_softcap`。
+- 最后 `auto kernel = &flash_fwd_kernel<...>` 拿到的是一个**完全特化后的函数指针**，CUDA launch 只是在发射这个具体版本。
+
+这也是 FlashAttention 用宏而不是普通 `if` 的关键原因：普通 `if (params.is_causal)` 可以选择控制流，但不能把 `params.is_causal` 变成模板参数；这些宏做的正是“在每个运行时分支里，声明一个同名的编译期常量，再调用后续模板代码”。
 
 ### split-KV dispatch 的两个 kernel
 
