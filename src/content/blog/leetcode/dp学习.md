@@ -10451,3 +10451,418 @@ else:
 ```
 
 如果你能把 `dp[row + 1][col + 1]` 理解成“两个前缀的答案”，而不是“两个字符的答案”，LCS 这一类题就打开了。后面很多编辑距离、不同子序列、字符串匹配类 DP，都是在这个前缀状态上继续变形。
+
+## [583. 两个字符串的删除操作 - 力扣（LeetCode）](https://leetcode.cn/problems/delete-operation-for-two-strings/description/)
+
+给定两个单词 `word1` 和 `word2`，返回使得 `word1` 和 `word2` 相同所需的最小步数。
+
+每一步可以删除任意一个字符串中的一个字符。
+
+示例 1：
+
+```text
+输入：word1 = "sea", word2 = "eat"
+输出：2
+解释：第一步将 "sea" 变为 "ea"，第二步将 "eat" 变为 "ea"。
+```
+
+示例 2：
+
+```text
+输入：word1 = "leetcode", word2 = "etco"
+输出：4
+```
+
+提示：
+
+- `1 <= word1.length, word2.length <= 500`
+- `word1` 和 `word2` 只包含小写英文字母
+
+### 题目如何和 LCS 联系起来？
+
+这题只能删除字符，不能替换，也不能插入。最后两个字符串要变得相同，等价于：
+
+> 从 `word1` 和 `word2` 中各自删掉一些字符，留下一个相同的公共子序列。
+
+为了删除次数最少，留下来的公共子序列当然要尽量长。
+
+所以这题可以直接转成 LCS：
+
+- 设 `lcs` 是 `word1` 和 `word2` 的最长公共子序列长度。
+- `word1` 中不属于 LCS 的字符都要删掉，数量是 `word1.size() - lcs`。
+- `word2` 中不属于 LCS 的字符都要删掉，数量是 `word2.size() - lcs`。
+
+因此答案是：
+
+$$
+word1.size() + word2.size() - 2 \times lcs
+$$
+
+比如 `word1 = "sea"`，`word2 = "eat"`：
+
+- LCS 是 `"ea"`，长度为 2。
+- `word1` 删除 `'s'`。
+- `word2` 删除 `'t'`。
+- 总删除次数是 $3 + 3 - 2 \times 2 = 2$。
+
+这就是 583 和 1143 的关系：**583 是 LCS 的删除代价版本**。
+
+### 递归切入（直接删除逻辑）
+
+也可以不先套公式，直接从删除动作想。定义 `dfs(i, j)` 表示：
+
+> 让 `word1[0..i]` 和 `word2[0..j]` 变成相同字符串，最少需要删除多少次。
+
+站在两个尾字符 `word1[i]` 和 `word2[j]` 面前：
+
+如果两个字符相等：
+
+```text
+word1[i] == word2[j]
+```
+
+它们可以一起保留下来，不需要删除，答案来自更短的两个前缀：
+
+$$
+dfs(i, j) = dfs(i - 1, j - 1)
+$$
+
+如果两个字符不相等：
+
+```text
+word1[i] != word2[j]
+```
+
+最后这两个字符不能同时保留。要么删掉 `word1[i]`，要么删掉 `word2[j]`：
+
+$$
+dfs(i, j) =
+\min(dfs(i - 1, j),\ dfs(i, j - 1)) + 1
+$$
+
+递归边界：
+
+- 如果 `i < 0`，说明 `word1` 已经空了，只能把 `word2[0..j]` 全删掉，返回 `j + 1`。
+- 如果 `j < 0`，说明 `word2` 已经空了，只能把 `word1[0..i]` 全删掉，返回 `i + 1`。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求两个字符串变相同所需的最少删除次数。
+     *
+     * @param word1 第一个字符串。
+     * @param word2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最少步数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        return dfs(word1, word2, memo, rows - 1, cols - 1);
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(
+        const string& word1,
+        const string& word2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0) {
+            return col + 1;
+        }
+        if (col < 0) {
+            return row + 1;
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (word1[row] == word2[col]) {
+            // 两个尾字符相等，可以一起保留。
+            cached = dfs(word1, word2, memo, row - 1, col - 1);
+        } else {
+            // 两个尾字符不相等，必须删除其中一个。
+            cached = min(
+                dfs(word1, word2, memo, row - 1, col),
+                dfs(word1, word2, memo, row, col - 1)) + 1;
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归和 LCS 很像，只是“不相等”的时候，LCS 是取最大保留长度，这题是取最小删除次数。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> 让 `word1` 的前 `row + 1` 个字符，和 `word2` 的前 `col + 1` 个字符变得相同，最少需要删除多少次。
+
+也可以写成：
+
+`dp[i][j]` 表示：
+
+> 让 `word1` 的前 `i` 个字符，和 `word2` 的前 `j` 个字符变得相同，最少需要删除多少次。
+
+真实字符下标仍然是：
+
+- `word1[i - 1]`
+- `word2[j - 1]`
+
+最终答案是：
+
+$$
+dp[word1.size()][word2.size()]
+$$
+
+### 状态转移
+
+处理真实字符 `word1[row]` 和 `word2[col]`。
+
+如果两个尾字符相等，可以一起保留：
+
+$$
+dp[row + 1][col + 1] = dp[row][col]
+$$
+
+如果两个尾字符不相等，必须删除其中一个：
+
+$$
+dp[row + 1][col + 1] =
+\min(dp[row][col + 1],\ dp[row + 1][col]) + 1
+$$
+
+含义分别是：
+
+- `dp[row][col + 1] + 1`：删除 `word1[row]`。
+- `dp[row + 1][col] + 1`：删除 `word2[col]`。
+
+合起来就是：
+
+```text
+if word1[row] == word2[col]:
+    dp[row + 1][col + 1] = dp[row][col]
+else:
+    dp[row + 1][col + 1] = min(dp[row][col + 1], dp[row + 1][col]) + 1
+```
+
+### 初始化
+
+安全垫的第 0 行和第 0 列表示有一个字符串为空：
+
+- `dp[0][col + 1] = col + 1`：`word1` 为空时，只能删除 `word2` 的前 `col + 1` 个字符。
+- `dp[row + 1][0] = row + 1`：`word2` 为空时，只能删除 `word1` 的前 `row + 1` 个字符。
+
+这和 LCS 的初始化不一样。LCS 中空字符串对应长度 0；这里空字符串对应“把另一个字符串全删掉”的删除次数。
+
+### 遍历顺序
+
+每个状态依赖：
+
+- 左上：`dp[row][col]`
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+
+所以仍然从左到右、从上到下遍历。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求两个字符串变相同所需的最少删除次数。
+     *
+     * @param word1 第一个字符串。
+     * @param word2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最少步数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            dp[row + 1][0] = row + 1;
+        }
+        for (int col = 0; col < cols; col++) {
+            dp[0][col + 1] = col + 1;
+        }
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (word1[row] == word2[col]) {
+                    // 两个尾字符相等，可以一起保留，不增加删除次数。
+                    dp[row + 1][col + 1] = dp[row][col];
+                } else {
+                    // 两个尾字符不相等，只能删除其中一个尾字符。
+                    dp[row + 1][col + 1] = min(
+                        dp[row][col + 1],
+                        dp[row + 1][col]) + 1;
+                }
+            }
+        }
+
+        return dp[rows][cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(word1.size() \times word2.size())$。
+- 空间复杂度：$O(word1.size() \times word2.size())$。
+
+### 用 LCS 公式写法
+
+因为最终保留下来的相同字符串一定是两个字符串的公共子序列，所以也可以先求 LCS，再用总长度减去保留长度。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 先求 LCS，再换算成最少删除次数。
+     *
+     * @param word1 第一个字符串。
+     * @param word2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最少步数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (word1[row] == word2[col]) {
+                    dp[row + 1][col + 1] = dp[row][col] + 1;
+                } else {
+                    dp[row + 1][col + 1] = max(
+                        dp[row][col + 1],
+                        dp[row + 1][col]);
+                }
+            }
+        }
+
+        const int lcs_length = dp[rows][cols];
+        return rows + cols - 2 * lcs_length;
+    }
+};
+```
+
+这个写法更能体现它和 1143 的关系；直接删除 DP 写法更能体现“每一步删除一个字符”的题意。两种写法本质上是同一件事。
+
+### 空间优化
+
+直接删除 DP 也可以压成一维。
+
+压缩后：
+
+- `dp[col + 1]` 在更新前表示上方状态。
+- `dp[col]` 表示当前行左方状态。
+- `prev_diagonal` 表示左上角旧状态。
+
+和 LCS 一维优化一样，必须先保存旧的 `dp[col + 1]`。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求两个字符串变相同所需的最少删除次数。
+     *
+     * @param word1 第一个字符串。
+     * @param word2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最少步数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<int> dp(cols + 1, 0);
+
+        for (int col = 0; col < cols; col++) {
+            dp[col + 1] = col + 1;
+        }
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = dp[0];
+            dp[0] = row + 1;
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方值；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+
+                if (word1[row] == word2[col]) {
+                    dp[col + 1] = prev_diagonal;
+                } else {
+                    dp[col + 1] = min(dp[col + 1], dp[col]) + 1;
+                }
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return dp[cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(word1.size() \times word2.size())$。
+- 空间复杂度：$O(word2.size())$。
+
+### 这题的核心手感
+
+583 的核心，是把“删除到相同”翻译成“保留公共子序列”：
+
+> 删除次数最少，等价于保留的公共子序列最长。
+
+所以它可以直接借用 LCS：
+
+$$
+answer = word1.size() + word2.size() - 2 \times LCS(word1, word2)
+$$
+
+如果用直接 DP，则状态仍然是两个前缀：
+
+- **尾字符相等**：两个字符都保留，不增加删除次数。
+- **尾字符不相等**：删除其中一个尾字符，取更小删除次数。
+
+对照 1143 看，会发现两题只是在“不相等”时的目标不同：
+
+- 1143：为了保留最多字符，所以取 `max`。
+- 583：为了删除最少字符，所以取 `min + 1`。
+
+这题是 LCS 的第一层变形：状态还是两个前缀，转移还是看两个尾字符，只是 DP 值从“最长长度”变成了“最少删除次数”。
