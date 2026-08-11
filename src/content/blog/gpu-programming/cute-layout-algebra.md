@@ -956,7 +956,73 @@ auto zipped  = zipped_divide(layout_a, tiler);
 // layout<0>(zipped_divide(layout_a, tiler)) == composition(layout_a, tiler)
 ```
 
-对 `zipped`，第 `k` 个 tile 的首地址可写成 `zipped(0, k)`；二维 tile 网格中 `(i, j)` 的首地址则是 `zipped(0, make_coord(i, j))`。
+这个例子的真实输出可以写成：
+
+$$
+\begin{aligned}
+\mathrm{logical}
+&=((3,3),((2,4),(2,2))) \\
+&\quad :((177,59),((13,2),(26,1))), \\
+\mathrm{zipped}
+&=((3,(2,4)),(3,(2,2))) \\
+&\quad :((177,(13,2)),(59,(26,1))).
+\end{aligned}
+$$
+
+`logical_divide` 保留原始 mode 语义，所以结果还是“原 mode 0 被拆成 `(TileM, RestM)`，原 mode 1 被拆成 `(TileN, RestN)`”：
+
+$$
+((TileM,RestM),(TileN,RestN)).
+$$
+
+`zipped_divide` 则把所有 tile 内 mode 收到第 0 个 mode，把所有 rest mode 收到第 1 个 mode：
+
+$$
+((TileM,TileN),(RestM,RestN)).
+$$
+
+在这个例子里：
+
+| 部分 | Layout | 语义 |
+| --- | --- | --- |
+| `layout<0>(zipped)` | `(3,(2,4)):(177,(13,2))` | 一个 tile 内部的 24 个元素，也就是 `composition(layout_a, tiler)`。 |
+| `layout<1>(zipped)` | `(3,(2,2)):(59,(26,1))` | tile 网格，一共有 $3\times2\times2=12$ 个 tile。 |
+
+因此，`zipped` 的完整坐标可以写成：
+
+$$
+\mathrm{zipped}\big((t_m,(t_{n0},t_{n1})),(r_m,(r_{n0},r_{n1}))\big)
+=177t_m+13t_{n0}+2t_{n1}+59r_m+26r_{n0}+r_{n1}.
+$$
+
+这里第一组坐标 `(t_m,(t_{n0},t_{n1}))` 表示**tile 内第几个元素**，第二组坐标 `(r_m,(r_{n0},r_{n1}))` 表示**第几个 tile**。
+
+所以第 `k` 个 tile 的首地址写成：
+
+$$
+\mathrm{zipped}(0,k).
+$$
+
+这里的第一个 `0` 不是“第 0 个 tile”，而是 **tile 内坐标取 0**，也就是取这个 tile 的第一个元素作为基址。第二个参数 `k` 才是在选择第几个 tile。
+
+反过来，`zipped(k,0)` 的含义完全不同：它固定在第 0 个 tile 上，然后取这个 tile 内的第 `k` 个元素。用前几项对比最直观：
+
+| 表达式 | 含义 | 前几项 |
+| --- | --- | --- |
+| `zipped(0, k)` | 第 `k` 个 tile 的首地址 | `0, 59, 118, 26, 85, 144, ...` |
+| `zipped(k, 0)` | 第 0 个 tile 内第 `k` 个元素地址 | `0, 177, 354, 13, 190, 367, ...` |
+
+如果要取第 `k` 个完整 tile，应保留第 0 个 mode，固定第 1 个 mode：
+
+```cpp
+auto tile_k = zipped(_, k);
+```
+
+如果要看所有 tile 中相同的第 `i` 个元素，应固定第 0 个 mode，保留第 1 个 mode：
+
+```cpp
+auto elem_i_across_tiles = zipped(i, _);
+```
 
 ![zipped divide：纵向遍历 tile，横向遍历 tile 内元素](/blog-assets/gpu-programming/cute-layout-algebra/zipped-divide.png)
 
