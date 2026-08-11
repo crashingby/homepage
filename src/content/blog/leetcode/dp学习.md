@@ -10866,3 +10866,870 @@ $$
 - 583：为了删除最少字符，所以取 `min + 1`。
 
 这题是 LCS 的第一层变形：状态还是两个前缀，转移还是看两个尾字符，只是 DP 值从“最长长度”变成了“最少删除次数”。
+
+## [712. 两个字符串的最小 ASCII 删除和 - 力扣（LeetCode）](https://leetcode.cn/problems/minimum-ascii-delete-sum-for-two-strings/description/)
+
+给定两个字符串 `s1` 和 `s2`，返回使两个字符串相等所需删除字符的 **ASCII 值的最小和**。
+
+示例 1：
+
+```text
+输入：s1 = "sea", s2 = "eat"
+输出：231
+解释：
+在 "sea" 中删除 "s"，ASCII 值为 115。
+在 "eat" 中删除 "t"，ASCII 值为 116。
+最终两个字符串都变成 "ea"，总代价是 115 + 116 = 231。
+```
+
+示例 2：
+
+```text
+输入：s1 = "delete", s2 = "leet"
+输出：403
+解释：
+删除后两个字符串都变成 "let"。
+总代价是 100[d] + 101[e] + 101[e] + 101[e] = 403。
+```
+
+提示：
+
+- `1 <= s1.length, s2.length <= 1000`
+- `s1` 和 `s2` 由小写英文字母组成
+
+### 题目如何和 583 联系起来？
+
+583 问的是：
+
+> 删除多少个字符，才能让两个字符串相同？
+
+712 问的是：
+
+> 删除字符的 ASCII 值总和最小是多少，才能让两个字符串相同？
+
+所以 712 是 583 的带权版本：
+
+- 583：删除一个字符的代价恒为 `1`。
+- 712：删除一个字符的代价是 `ASCII(character)`。
+
+状态形状完全不变，还是两个字符串的前缀；只是转移里的删除代价从 `+1` 变成了 `+ s[row]` 或 `+ s[col]`。
+
+### 递归切入（带权删除逻辑）
+
+定义 `dfs(i, j)` 表示：
+
+> 让 `s1[0..i]` 和 `s2[0..j]` 变成相同字符串，所需删除字符 ASCII 值的最小和。
+
+站在两个尾字符 `s1[i]` 和 `s2[j]` 面前：
+
+如果两个字符相等：
+
+```text
+s1[i] == s2[j]
+```
+
+它们可以一起保留，不产生删除代价：
+
+$$
+dfs(i, j) = dfs(i - 1, j - 1)
+$$
+
+如果两个字符不相等：
+
+```text
+s1[i] != s2[j]
+```
+
+必须删除其中一个尾字符：
+
+- 删除 `s1[i]`，代价是 `ASCII(s1[i]) + dfs(i - 1, j)`。
+- 删除 `s2[j]`，代价是 `ASCII(s2[j]) + dfs(i, j - 1)`。
+
+取更小值：
+
+$$
+dfs(i, j) =
+\min(
+dfs(i - 1, j) + ASCII(s1[i]),\
+dfs(i, j - 1) + ASCII(s2[j])
+)
+$$
+
+递归边界：
+
+- 如果 `i < 0`，说明 `s1` 已经空了，只能删除 `s2[0..j]` 的所有字符。
+- 如果 `j < 0`，说明 `s2` 已经空了，只能删除 `s1[0..i]` 的所有字符。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求两个字符串相等所需的最小 ASCII 删除和。
+     *
+     * @param s1 第一个字符串。
+     * @param s2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最小 ASCII 代价。
+     */
+    int minimumDeleteSum(string s1, string s2) {
+        const int rows = static_cast<int>(s1.size());
+        const int cols = static_cast<int>(s2.size());
+        vector<int> prefix_s1(rows + 1, 0);
+        vector<int> prefix_s2(cols + 1, 0);
+        for (int row = 0; row < rows; row++) {
+            prefix_s1[row + 1] = prefix_s1[row] + static_cast<int>(s1[row]);
+        }
+        for (int col = 0; col < cols; col++) {
+            prefix_s2[col + 1] = prefix_s2[col] + static_cast<int>(s2[col]);
+        }
+
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        return dfs(s1, s2, prefix_s1, prefix_s2, memo, rows - 1, cols - 1);
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(
+        const string& s1,
+        const string& s2,
+        const vector<int>& prefix_s1,
+        const vector<int>& prefix_s2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0) {
+            return prefix_s2[col + 1];
+        }
+        if (col < 0) {
+            return prefix_s1[row + 1];
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (s1[row] == s2[col]) {
+            // 两个尾字符相等，可以一起保留，不产生删除代价。
+            cached = dfs(s1, s2, prefix_s1, prefix_s2, memo, row - 1, col - 1);
+        } else {
+            // 两个尾字符不相等，删除其中一个，并累加它的 ASCII 代价。
+            cached = min(
+                dfs(s1, s2, prefix_s1, prefix_s2, memo, row - 1, col) +
+                    static_cast<int>(s1[row]),
+                dfs(s1, s2, prefix_s1, prefix_s2, memo, row, col - 1) +
+                    static_cast<int>(s2[col]));
+        }
+
+        return cached;
+    }
+};
+```
+
+这段递归能清楚看出 712 和 583 的差异：
+
+- 583 不相等时：`min(...) + 1`。
+- 712 不相等时：删除哪个字符，就加哪个字符的 ASCII 值。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> 让 `s1` 的前 `row + 1` 个字符，和 `s2` 的前 `col + 1` 个字符变得相同，所需删除字符 ASCII 值的最小和。
+
+也可以写成：
+
+`dp[i][j]` 表示：
+
+> 让 `s1` 的前 `i` 个字符，和 `s2` 的前 `j` 个字符变得相同，所需删除字符 ASCII 值的最小和。
+
+最终答案是：
+
+$$
+dp[s1.size()][s2.size()]
+$$
+
+### 状态转移
+
+处理真实字符 `s1[row]` 和 `s2[col]`。
+
+如果两个尾字符相等，可以一起保留：
+
+$$
+dp[row + 1][col + 1] = dp[row][col]
+$$
+
+如果两个尾字符不相等，必须删除其中一个：
+
+$$
+dp[row + 1][col + 1] =
+\min(
+dp[row][col + 1] + ASCII(s1[row]),\
+dp[row + 1][col] + ASCII(s2[col])
+)
+$$
+
+含义分别是：
+
+- `dp[row][col + 1] + ASCII(s1[row])`：删除 `s1[row]`。
+- `dp[row + 1][col] + ASCII(s2[col])`：删除 `s2[col]`。
+
+### 初始化
+
+安全垫的第 0 行和第 0 列仍然表示有一个字符串为空：
+
+- `dp[0][col + 1] = dp[0][col] + ASCII(s2[col])`：`s1` 为空，只能删除 `s2` 的前缀。
+- `dp[row + 1][0] = dp[row][0] + ASCII(s1[row])`：`s2` 为空，只能删除 `s1` 的前缀。
+
+这和 583 的初始化很像，只是从“字符个数前缀和”变成了“ASCII 值前缀和”。
+
+### 遍历顺序
+
+每个状态仍然依赖：
+
+- 左上：`dp[row][col]`
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+
+所以继续从左到右、从上到下遍历。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求两个字符串相等所需的最小 ASCII 删除和。
+     *
+     * @param s1 第一个字符串。
+     * @param s2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最小 ASCII 代价。
+     */
+    int minimumDeleteSum(string s1, string s2) {
+        const int rows = static_cast<int>(s1.size());
+        const int cols = static_cast<int>(s2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            dp[row + 1][0] = dp[row][0] + static_cast<int>(s1[row]);
+        }
+        for (int col = 0; col < cols; col++) {
+            dp[0][col + 1] = dp[0][col] + static_cast<int>(s2[col]);
+        }
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (s1[row] == s2[col]) {
+                    // 两个尾字符相等，可以一起保留，不产生删除代价。
+                    dp[row + 1][col + 1] = dp[row][col];
+                } else {
+                    // 两个尾字符不相等，删除其中一个，并累加对应 ASCII 值。
+                    dp[row + 1][col + 1] = min(
+                        dp[row][col + 1] + static_cast<int>(s1[row]),
+                        dp[row + 1][col] + static_cast<int>(s2[col]));
+                }
+            }
+        }
+
+        return dp[rows][cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(s1.size() \times s2.size())$。
+- 空间复杂度：$O(s1.size() \times s2.size())$。
+
+### 用“最大保留 ASCII 和”理解
+
+583 可以通过 LCS 长度换算：
+
+$$
+answer = word1.size() + word2.size() - 2 \times LCS
+$$
+
+712 也有类似思路，只是最长公共子序列的“长度”变成了公共子序列的 **ASCII 值总和**。
+
+设 `keep_sum` 是两个字符串可以共同保留下来的公共子序列的最大 ASCII 和，那么：
+
+$$
+answer = sum(s1) + sum(s2) - 2 \times keep\_sum
+$$
+
+对应的 DP 是：
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 先求最大公共保留 ASCII 和，再换算成最小删除和。
+     *
+     * @param s1 第一个字符串。
+     * @param s2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最小 ASCII 代价。
+     */
+    int minimumDeleteSum(string s1, string s2) {
+        const int rows = static_cast<int>(s1.size());
+        const int cols = static_cast<int>(s2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (s1[row] == s2[col]) {
+                    dp[row + 1][col + 1] = dp[row][col] + static_cast<int>(s1[row]);
+                } else {
+                    dp[row + 1][col + 1] = max(
+                        dp[row][col + 1],
+                        dp[row + 1][col]);
+                }
+            }
+        }
+
+        const int keep_sum = dp[rows][cols];
+        return asciiSum(s1) + asciiSum(s2) - 2 * keep_sum;
+    }
+
+private:
+    int asciiSum(const string& text) {
+        int sum = 0;
+        for (const char ch : text) {
+            sum += static_cast<int>(ch);
+        }
+        return sum;
+    }
+};
+```
+
+这个写法和 1143 的 LCS 结构几乎一致：
+
+- 字符相等时，不是 `+1`，而是 `+ ASCII(character)`。
+- 字符不相等时，仍然取上方和左方的最大值。
+
+### 空间优化
+
+直接删除 DP 可以压成一维。
+
+压缩后：
+
+- `dp[col + 1]` 更新前表示上方状态。
+- `dp[col]` 表示当前行左方状态。
+- `prev_diagonal` 表示左上角旧状态。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求两个字符串相等所需的最小 ASCII 删除和。
+     *
+     * @param s1 第一个字符串。
+     * @param s2 第二个字符串。
+     * @return 只通过删除字符让两个字符串相同的最小 ASCII 代价。
+     */
+    int minimumDeleteSum(string s1, string s2) {
+        const int rows = static_cast<int>(s1.size());
+        const int cols = static_cast<int>(s2.size());
+        vector<int> dp(cols + 1, 0);
+
+        for (int col = 0; col < cols; col++) {
+            dp[col + 1] = dp[col] + static_cast<int>(s2[col]);
+        }
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = dp[0];
+            dp[0] += static_cast<int>(s1[row]);
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方值；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+
+                if (s1[row] == s2[col]) {
+                    dp[col + 1] = prev_diagonal;
+                } else {
+                    dp[col + 1] = min(
+                        dp[col + 1] + static_cast<int>(s1[row]),
+                        dp[col] + static_cast<int>(s2[col]));
+                }
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return dp[cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(s1.size() \times s2.size())$。
+- 空间复杂度：$O(s2.size())$。
+
+### 这题的核心手感
+
+712 是 583 的带权版本，也是 LCS 的保留价值版本。
+
+从删除视角看：
+
+- **尾字符相等**：两个字符都保留，代价不变。
+- **尾字符不相等**：删除其中一个，代价加上对应字符的 ASCII 值。
+
+从保留视角看：
+
+- 583 保留的是“最长公共子序列长度”。
+- 712 保留的是“公共子序列的最大 ASCII 值总和”。
+
+所以它有两个等价公式：
+
+$$
+dp[row + 1][col + 1] =
+\min(
+dp[row][col + 1] + ASCII(s1[row]),\
+dp[row + 1][col] + ASCII(s2[col])
+)
+$$
+
+以及：
+
+$$
+answer = sum(s1) + sum(s2) - 2 \times keep\_sum
+$$
+
+如果 583 你已经理解成“保留 LCS、删除其它字符”，那 712 就是把“保留长度最大”升级成“保留 ASCII 总价值最大”。
+
+## [72. 编辑距离 - 力扣（LeetCode）](https://leetcode.cn/problems/edit-distance/description/)
+
+给你两个单词 `word1` 和 `word2`，返回将 `word1` 转换成 `word2` 所使用的最少操作数。
+
+你可以对一个单词进行如下三种操作：
+
+- 插入一个字符
+- 删除一个字符
+- 替换一个字符
+
+示例 1：
+
+```text
+输入：word1 = "horse", word2 = "ros"
+输出：3
+解释：
+horse -> rorse  替换 'h' 为 'r'
+rorse -> rose   删除 'r'
+rose -> ros     删除 'e'
+```
+
+示例 2：
+
+```text
+输入：word1 = "intention", word2 = "execution"
+输出：5
+解释：
+intention -> inention   删除 't'
+inention -> enention    替换 'i' 为 'e'
+enention -> exention    替换 'n' 为 'x'
+exention -> exection    替换 'n' 为 'c'
+exection -> execution   插入 'u'
+```
+
+提示：
+
+- `0 <= word1.length, word2.length <= 500`
+- `word1` 和 `word2` 由小写英文字母组成
+
+### 题目如何和前面的删除 DP 联系起来？
+
+583 和 712 只能删除字符，所以它们最后一定是在两个字符串里**共同保留一个公共子序列**。
+
+72 不一样，它允许三种操作：
+
+- **删除**：从 `word1` 里删掉一个多余字符。
+- **插入**：往 `word1` 里插入一个 `word2` 需要的字符。
+- **替换**：把 `word1` 的一个字符改成 `word2` 的一个字符。
+
+因为多了插入和替换，72 不能简单转成 LCS 长度公式。它要直接在两个前缀之间做最短操作数 DP。
+
+但状态形状仍然没有变：
+
+> `word1` 的一个前缀，变成 `word2` 的一个前缀，最少需要多少步？
+
+这就是编辑距离（Edit Distance / Levenshtein Distance）的经典状态。
+
+### 递归切入（编辑动作逻辑）
+
+定义 `dfs(i, j)` 表示：
+
+> 将 `word1[0..i]` 转换成 `word2[0..j]`，最少需要多少步。
+
+站在两个尾字符 `word1[i]` 和 `word2[j]` 面前。
+
+如果两个字符相等：
+
+```text
+word1[i] == word2[j]
+```
+
+尾字符已经相同，不需要操作，答案来自更短前缀：
+
+$$
+dfs(i, j) = dfs(i - 1, j - 1)
+$$
+
+如果两个字符不相等，就有三种选择：
+
+- **删除 `word1[i]`**：先把 `word1[0..i - 1]` 变成 `word2[0..j]`，再删除 `word1[i]`。
+- **插入 `word2[j]`**：先把 `word1[0..i]` 变成 `word2[0..j - 1]`，再插入 `word2[j]`。
+- **替换 `word1[i]` 为 `word2[j]`**：先把 `word1[0..i - 1]` 变成 `word2[0..j - 1]`，再替换尾字符。
+
+所以：
+
+$$
+dfs(i, j) =
+\min(
+dfs(i - 1, j),\
+dfs(i, j - 1),\
+dfs(i - 1, j - 1)
+) + 1
+$$
+
+递归边界：
+
+- 如果 `i < 0`，说明 `word1` 已经空了，只能插入 `word2[0..j]` 的所有字符，返回 `j + 1`。
+- 如果 `j < 0`，说明 `word2` 已经空了，只能删除 `word1[0..i]` 的所有字符，返回 `i + 1`。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求 word1 转换成 word2 的最少编辑次数。
+     *
+     * @param word1 源字符串。
+     * @param word2 目标字符串。
+     * @return 通过插入、删除、替换将 word1 转成 word2 的最少操作数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        return dfs(word1, word2, memo, rows - 1, cols - 1);
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(
+        const string& word1,
+        const string& word2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0) {
+            return col + 1;
+        }
+        if (col < 0) {
+            return row + 1;
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (word1[row] == word2[col]) {
+            // 两个尾字符相同，不需要编辑当前字符。
+            cached = dfs(word1, word2, memo, row - 1, col - 1);
+        } else {
+            // 删除、插入、替换三种动作里选择总代价最小的一种。
+            cached = min({
+                dfs(word1, word2, memo, row - 1, col),
+                dfs(word1, word2, memo, row, col - 1),
+                dfs(word1, word2, memo, row - 1, col - 1),
+            }) + 1;
+        }
+
+        return cached;
+    }
+};
+```
+
+这里最容易混的是“插入”的递归来源。
+
+如果选择插入 `word2[j]`，意思是：
+
+> 先把 `word1[0..i]` 变成 `word2[0..j - 1]`，再补上最后这个 `word2[j]`。
+
+所以它对应的是 `dfs(i, j - 1) + 1`。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> 将 `word1` 的前 `row + 1` 个字符，转换成 `word2` 的前 `col + 1` 个字符，最少需要多少步。
+
+也可以写成：
+
+`dp[i][j]` 表示：
+
+> 将 `word1` 的前 `i` 个字符，转换成 `word2` 的前 `j` 个字符，最少需要多少步。
+
+真实字符下标仍然是：
+
+- `word1[i - 1]`
+- `word2[j - 1]`
+
+最终答案是：
+
+$$
+dp[word1.size()][word2.size()]
+$$
+
+### 状态转移
+
+处理真实字符 `word1[row]` 和 `word2[col]`。
+
+如果两个尾字符相等：
+
+$$
+dp[row + 1][col + 1] = dp[row][col]
+$$
+
+如果两个尾字符不相等：
+
+$$
+dp[row + 1][col + 1] =
+\min(
+dp[row][col + 1],\
+dp[row + 1][col],\
+dp[row][col]
+) + 1
+$$
+
+三个来源分别表示：
+
+- `dp[row][col + 1] + 1`：删除 `word1[row]`。
+- `dp[row + 1][col] + 1`：往 `word1` 当前前缀后插入 `word2[col]`。
+- `dp[row][col] + 1`：把 `word1[row]` 替换成 `word2[col]`。
+
+### 初始化
+
+安全垫的第 0 行和第 0 列含义非常直观：
+
+- `dp[0][col + 1] = col + 1`：空字符串变成 `word2` 的前 `col + 1` 个字符，只能连续插入。
+- `dp[row + 1][0] = row + 1`：`word1` 的前 `row + 1` 个字符变成空字符串，只能连续删除。
+
+这和 583 的初始化形式一样，但含义多了一侧“插入”：
+
+- 第一列：删除 `word1`。
+- 第一行：插入 `word2`。
+
+### 遍历顺序
+
+每个状态依赖：
+
+- 左上：`dp[row][col]`
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+
+所以继续从左到右、从上到下遍历。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求 word1 转换成 word2 的最少编辑次数。
+     *
+     * @param word1 源字符串。
+     * @param word2 目标字符串。
+     * @return 通过插入、删除、替换将 word1 转成 word2 的最少操作数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+
+        for (int row = 0; row < rows; row++) {
+            dp[row + 1][0] = row + 1;
+        }
+        for (int col = 0; col < cols; col++) {
+            dp[0][col + 1] = col + 1;
+        }
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (word1[row] == word2[col]) {
+                    // 两个尾字符相等，不需要编辑当前字符。
+                    dp[row + 1][col + 1] = dp[row][col];
+                } else {
+                    // 三个来源分别对应删除、插入、替换。
+                    dp[row + 1][col + 1] = min({
+                        dp[row][col + 1],
+                        dp[row + 1][col],
+                        dp[row][col],
+                    }) + 1;
+                }
+            }
+        }
+
+        return dp[rows][cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(word1.size() \times word2.size())$。
+- 空间复杂度：$O(word1.size() \times word2.size())$。
+
+### 空间优化
+
+编辑距离也可以压成一维。
+
+压缩后：
+
+- `dp[col + 1]` 更新前表示上方状态，也就是删除 `word1[row]` 后的来源。
+- `dp[col]` 表示当前行左方状态，也就是插入 `word2[col]` 后的来源。
+- `prev_diagonal` 表示左上角旧状态，也就是替换或相等继承的来源。
+
+```cpp
+#include <algorithm>
+#include <string>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求 word1 转换成 word2 的最少编辑次数。
+     *
+     * @param word1 源字符串。
+     * @param word2 目标字符串。
+     * @return 通过插入、删除、替换将 word1 转成 word2 的最少操作数。
+     */
+    int minDistance(string word1, string word2) {
+        const int rows = static_cast<int>(word1.size());
+        const int cols = static_cast<int>(word2.size());
+        vector<int> dp(cols + 1, 0);
+
+        for (int col = 0; col < cols; col++) {
+            dp[col + 1] = col + 1;
+        }
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = dp[0];
+            dp[0] = row + 1;
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方状态；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+
+                if (word1[row] == word2[col]) {
+                    dp[col + 1] = prev_diagonal;
+                } else {
+                    dp[col + 1] = min({
+                        old_up,
+                        dp[col],
+                        prev_diagonal,
+                    }) + 1;
+                }
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return dp[cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(word1.size() \times word2.size())$。
+- 空间复杂度：$O(word2.size())$。
+
+### 和 583、712 的对照
+
+583、712、72 都是双序列前缀 DP，但允许的动作不同。
+
+| 题目 | 允许动作 | 不相等时的转移目标 |
+| --- | --- | --- |
+| 583. 两个字符串的删除操作 | 只能删除 | 删除其中一个尾字符，代价 `+1` |
+| 712. 两个字符串的最小 ASCII 删除和 | 只能删除 | 删除其中一个尾字符，代价 `+ASCII` |
+| 72. 编辑距离 | 插入、删除、替换 | 从删除、插入、替换三种动作中取最小 |
+
+所以 72 的状态不是新东西，仍然是：
+
+> 一个前缀变成另一个前缀，最少需要多少代价？
+
+只是它在尾字符不相等时，多了一个“替换”的左上角来源：
+
+$$
+\min(
+dp[row][col + 1],\
+dp[row + 1][col],\
+dp[row][col]
+) + 1
+$$
+
+### 这题的核心手感
+
+72 是编辑类 DP 的地基题。它的核心手感是：
+
+> `dp[i][j]` 表示把 `word1` 的前 `i` 个字符，变成 `word2` 的前 `j` 个字符的最小代价。
+
+然后只看两个尾字符：
+
+- **相等**：尾字符已经对齐，直接看左上角。
+- **不相等**：最后一步一定是删除、插入、替换三者之一。
+
+安全垫写法里就是：
+
+```text
+if word1[row] == word2[col]:
+    dp[row + 1][col + 1] = dp[row][col]
+else:
+    dp[row + 1][col + 1] = min(
+        dp[row][col + 1],
+        dp[row + 1][col],
+        dp[row][col]
+    ) + 1
+```
+
+如果 583 和 712 是“只能删，所以要保留共同部分”，那 72 就是“能改能补，所以要直接模拟两个前缀之间的最短编辑过程”。

@@ -861,44 +861,1260 @@ mha_fwd(
 
 ### `mha_varlen_fwd`：用 token 边界代替 batch stride
 
-**用途**
+变长入口的核心变化是：**batch 维没有了，所有 token 被压平成一维**。`q` 的形状从定长的 `(B, Lq, H, D)` 变成 `(total_q, H, D)`，`k/v` 从 `(B, Lk, Hk, D)` 变成 `(total_k, Hk, D)`。每条样本的起点和终点不再由 batch stride 推出来，而是由 `cu_seqlens_q/k` 给出：
 
-将压平布局 `(total_q, H, D)`、`(total_k, Hk, D)` 与 `cu_seqlens_q/k: (B + 1,)` 封装成同一套参数 ABI，避免 padding token 的计算。
+```cpp
+// 第 b 条 Q 序列的 token 范围：
+[cu_seqlens_q[b], cu_seqlens_q[b + 1])
 
-**与定长路径的关键差异**
+// 第 b 条 K/V 序列的 token 范围：
+[cu_seqlens_k[b], cu_seqlens_k[b + 1])
+```
 
-| 项目 | 定长 `mha_fwd` | 变长 `mha_varlen_fwd` |
-| --- | --- | --- |
-| batch 定位 | `*_batch_stride` | `cu_seqlens_q/k[b]` 给出第 `b` 条序列的 token 起点。 |
-| Q/K/V 形状 | `(B, L, H, D)` | `(total, H, D)`；paged K/V 时为 `(num_blocks, page_block_size, Hk, D)`。 |
-| LSE 布局 | `(B, H, Lq)` | `(H, total_q)`，并设置 `params.unpadded_lse = true`。 |
-| 可选长度控制 | 无 | `seqused_k` 可逐样本缩短实际 K 长度；`leftpad_k` 表示左 padding。 |
-| paged KV | 不在此接口 | `block_table` 存在时，K/V 通过逻辑 block 映射寻址，page size 必须是 256 的倍数。 |
+所以 `mha_varlen_fwd` 最终仍然调用 `set_params_fprop`，但它传进去的 `cu_seqlens_q_d/cu_seqlens_k_d` 不再是 `nullptr`。`set_params_fprop` 看到非空 `cu_seqlens` 后，就不会把 `q_batch_stride/k_batch_stride/v_batch_stride/o_batch_stride` 当作“定长 batch 的寻址规则”，kernel 会改用前缀和数组定位每个样本。
 
-这里 `set_params_fprop` 收到非空 `cu_seqlens`，因此不会写普通 Q/K/V 的 batch stride。paged KV 额外在调用后覆盖 `params.k_batch_stride/v_batch_stride` 为物理 page 的 stride，并写入 `block_table`、其 batch stride 与 `page_block_size`。
+这里有三个 K 侧参数很容易混在一起：`seqused_k`、`leftpad_k_`、`block_table_`。先给一个总览：
 
-常规 varlen 不会自动调用 `set_params_splitkv`；只有 `seqlenq_ngroups_swapped` 快路径需要它。若为 paged KV，则代码限制 `num_splits <= 1`，写入该值后用 `run_mha_fwd(params, stream, paged_KV)` 强制选择 split-KV kernel，因为普通 kernel 不具备 block table 寻址能力。
+| 参数 | 形状 | 解决的问题 | 是否改变 K/V 存储布局 |
+| --- | --- | --- | --- |
+| `seqused_k` | `(B)`，int32 CUDA | **实际参与 attention 的 K 长度**可能比 `cu_seqlens_k[b + 1] - cu_seqlens_k[b]` 更短。 | 不改变。它只改变 mask / 循环边界。 |
+| `leftpad_k_` | `(B)`，int32 CUDA | K/V 序列左侧有 padding，真实 token 从左 padding 之后开始。 | 不改变。它只把 K 的逻辑起点右移。 |
+| `block_table_` | `(B, max_num_blocks_per_seq)`，int32 CUDA | paged KV：逻辑 K/V 序列被切成 page，通过表映射到物理 block。 | 改变。K/V 形状从 `(total_k, Hkv, D)` 变成 `(num_blocks, page_block_size, Hkv, D)`。 |
+
+最重要的一点是：`cu_seqlens_k` 仍然描述 **K/V 在逻辑序列维度上的大边界**，而这三个参数是在这个边界上继续修正“实际从哪里读、读多少、怎么映射到物理地址”。
+
+源码里真正把这几个概念合起来的是 `flash-attention/csrc/flash_attn/src/block_info.h`：
+
+```cpp
+/**
+ * @brief 在 device 侧为某个 batch 样本计算 Q/K 的起点和有效长度。
+ *
+ * @tparam Varlen 是否为 varlen 路径。
+ * @param params kernel 参数包，里面保存 cu_seqlens、leftpad、seqused 等裸指针。
+ * @param bidb 当前 CTA 负责的 batch id。
+ */
+template<bool Varlen=true>
+struct BlockInfo {
+    template<typename Params>
+    __device__ BlockInfo(const Params& params, const int bidb)
+        // Q 的逻辑起点。普通定长路径或 swapped decode 中没有 cu_seqlens_q，
+        // 用 -1 表示后续按 batch_stride 寻址。
+        : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr
+                      ? -1
+                      : params.cu_seqlens_q[bidb])
+
+        // K 的逻辑起点。只有 varlen 且 cu_seqlens_k 表示 cumulative offsets 时才有效。
+        // KV cache 路径会复用 cu_seqlens_k 存“每条样本长度”，此时 sum_s_k 设为 -1。
+        , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr ||
+                          !params.is_seqlens_k_cumulative
+                      ? -1
+                      : params.cu_seqlens_k[bidb])
+
+        // 当前样本的 Q 长度。varlen 用前缀和差值；定长用 params.seqlen_q。
+        , actual_seqlen_q(!Varlen || params.cu_seqlens_q == nullptr
+                              ? params.seqlen_q
+                              : params.cu_seqlens_q[bidb + 1] - sum_s_q)
+
+        // leftpad_k 是“这条 K 序列左边有多少 padding token”。
+        // 没传 leftpad_k 时就是 0。
+        , leftpad_k(params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb])
+
+        // cache 中可用的 K 长度，先由 cu_seqlens_k 或 params.seqlen_k 得到，
+        // 再减掉左 padding。注意这里还没有看 seqused_k。
+        , seqlen_k_cache(
+              (!Varlen || params.cu_seqlens_k == nullptr
+                   ? params.seqlen_k
+                   : (params.is_seqlens_k_cumulative
+                          ? params.cu_seqlens_k[bidb + 1] - sum_s_k
+                          : params.cu_seqlens_k[bidb])) -
+              leftpad_k)
+
+        // actual_seqlen_k 是真正进入 attention 的 K 长度。
+        // 如果给了 seqused_k，它拥有更高优先级；否则使用 cache 长度，
+        // KV cache append 路径还会再加 seqlen_knew。
+        , actual_seqlen_k(params.seqused_k
+                              ? params.seqused_k[bidb] - leftpad_k
+                              : seqlen_k_cache +
+                                    (params.knew_ptr == nullptr
+                                         ? 0
+                                         : params.seqlen_knew)) {}
+
+    /**
+     * @brief 计算当前 batch 的 K 起始 offset。
+     *
+     * @param batch_stride 定长 batch 布局下，K 沿 batch 维前进一步的 stride。
+     * @param row_stride K 沿 token 行前进一步的 stride。
+     * @param bidb 当前 batch id。
+     * @return K 的起始元素偏移量；包含 leftpad_k 修正。
+     */
+    template <typename index_t>
+    __forceinline__ __device__ index_t
+    k_offset(const index_t batch_stride, const index_t row_stride, const int bidb) const {
+        return sum_s_k == -1
+                   // 定长 / 非 cumulative 情况：按 batch_stride 找样本起点，
+                   // 再跳过 leftpad_k 个 token。
+                   ? bidb * batch_stride + leftpad_k * row_stride
+                   // varlen cumulative 情况：按 cu_seqlens_k 找逻辑起点，
+                   // 再跳过 leftpad_k 个 token。
+                   : uint32_t(sum_s_k + leftpad_k) * row_stride;
+    }
+
+    const int sum_s_q;
+    const int sum_s_k;
+    const int actual_seqlen_q;
+    const int leftpad_k;
+    const int seqlen_k_cache;
+    const int actual_seqlen_k;
+};
+```
+
+把公式拆开看：
+
+- **没有 `leftpad_k_`，没有 `seqused_k` 时**：
+
+  ```cpp
+  seqlen_k_cache = cu_seqlens_k[b + 1] - cu_seqlens_k[b];
+  actual_seqlen_k = seqlen_k_cache;
+  k_offset = cu_seqlens_k[b] * k_row_stride;
+  ```
+
+  也就是标准 varlen：第 `b` 条 K/V 序列从 `cu_seqlens_k[b]` 开始，长度是前缀和差值。
+
+- **有 `leftpad_k_` 时**：
+
+  ```cpp
+  leftpad = leftpad_k[b];
+  seqlen_k_cache = (cu_seqlens_k[b + 1] - cu_seqlens_k[b]) - leftpad;
+  actual_seqlen_k = seqlen_k_cache;
+  k_offset = (cu_seqlens_k[b] + leftpad) * k_row_stride;
+  ```
+
+  这表示 `cu_seqlens_k` 覆盖的 K/V 片段里，前 `leftpad` 个 token 是左 padding，不参与 attention。kernel 起点直接跳过它们。
+
+- **有 `seqused_k` 时**：
+
+  ```cpp
+  leftpad = leftpad_k == nullptr ? 0 : leftpad_k[b];
+  actual_seqlen_k = seqused_k[b] - leftpad;
+  ```
+
+  `seqused_k[b]` 表示“这条样本最多使用到多少个 K token”。如果同时有 `leftpad_k`，还要减掉左 padding。它的优先级高于 `cu_seqlens_k` 差值：`cu_seqlens_k` 仍提供存储范围，但 `seqused_k` 决定真正参与 softmax 的有效长度。
+
+  一个典型场景是：K/V buffer 或 packed 序列中预留了更长范围，但本次 attention 只想看其中前一部分 token。这样不用重新压缩 K/V，只要给 `seqused_k` 就能缩短每条样本的 attention 边界。
+
+- **有 `block_table_` 时**：
+
+  `block_table_` 不是长度修正，而是 **寻址方式修正**。启用它之后，K/V 的形状不再是：
+
+  ```cpp
+  k: (total_k, Hkv, D)
+  v: (total_k, Hkv, D)
+  ```
+
+  而是：
+
+  ```cpp
+  k: (num_blocks, page_block_size, Hkv, D)
+  v: (num_blocks, page_block_size, Hkv, D)
+  block_table: (B, max_num_blocks_per_seq)
+  ```
+
+  对第 `b` 条样本的第 `j` 个逻辑 K token，paged KV 的寻址可以理解成：
+
+  ```cpp
+  logical_block = j / page_block_size;
+  offset_in_block = j % page_block_size;
+  physical_block = block_table[b, logical_block];
+
+  k_addr = k[physical_block, offset_in_block, hkv, d];
+  v_addr = v[physical_block, offset_in_block, hkv, d];
+  ```
+
+  所以 `block_table_` 解决的是“逻辑连续的 K/V 序列，物理上可以散落在不同 cache page 中”。这就是 paged attention / paged KV cache 的核心思想：避免每次扩容或重排 cache 时搬动整段 K/V，只改页表。
+
+这三个参数之间的关系可以简单记成：
+
+```cpp
+// cu_seqlens_k：这条样本的 K/V 存储大范围在哪里？
+storage_begin = cu_seqlens_k[b];
+storage_end   = cu_seqlens_k[b + 1];
+
+// leftpad_k：这个范围左边有多少 token 要跳过？
+logical_begin = storage_begin + leftpad_k[b];
+
+// seqused_k：真正参与 attention 的右边界在哪里？
+logical_len = seqused_k ? seqused_k[b] - leftpad_k[b]
+                        : storage_end - storage_begin - leftpad_k[b];
+
+// block_table：如果启用 paged KV，logical token 不直接变成 k[storage_begin + j]，
+// 而是先查 page table，再跳到物理 block。
+```
+
+注意源码里 `leftpad_k_` 和 `block_table_` 不能一起用：
+
+```cpp
+TORCH_CHECK(
+    !paged_KV,
+    "We don't support Paged KV and leftpad_k running at the same time yet");
+```
+
+原因不是数学上完全不能共存，而是当前 kernel 的 paged 寻址已经要处理逻辑 block 到物理 block 的映射，再叠加左 padding 会让 block index、block 内 offset、mask 边界都更复杂；这版实现直接禁止了这个组合。
+
+下面直接搬 `flash-attention/csrc/flash_attn/flash_api.cpp` 里的 `mha_varlen_fwd` 源码。除了新增中文注释外，函数签名、变量声明、检查顺序、分支结构和调用语句都按源码保留。
+
+```cpp
+/**
+ * @brief 执行变长 batch 的 FlashAttention 前向计算。
+ *
+ * @param q [in/out] CUDA Q tensor，普通变长形状为 `(total_q, Hq, D)`；
+ *        decode GQA/MQA 快路径中会临时 reshape 成 `(B * G, Hkv, D)`。
+ * @param k [in] CUDA K tensor。普通变长形状为 `(total_k, Hkv, D)`；
+ *        paged KV 时形状为 `(num_blocks, page_block_size, Hkv, D)`。
+ * @param v [in] CUDA V tensor，形状规则与 `k` 相同。
+ * @param out_ [in, optional] 调用方预分配输出。普通变长形状为 `(total_q, Hq, D)`。
+ * @param cu_seqlens_q [in] int32 CUDA tensor，形状 `(B + 1)`，
+ *        第 `b` 条 Q 序列的 token 范围是 `[cu_seqlens_q[b], cu_seqlens_q[b + 1])`。
+ * @param cu_seqlens_k [in] int32 CUDA tensor，形状 `(B + 1)`，
+ *        第 `b` 条 K/V 序列的 token 范围是 `[cu_seqlens_k[b], cu_seqlens_k[b + 1])`。
+ * @param seqused_k [in, optional] int32 CUDA tensor，形状 `(B)`；
+ *        若存在，第 `b` 条样本只使用前 `seqused_k[b]` 个 K/V token。
+ * @param leftpad_k_ [in, optional] int32 CUDA tensor，形状 `(B)`；
+ *        表示每条 K/V 序列左侧 padding 的 token 数，不能与 paged KV 同时使用。
+ * @param block_table_ [in, optional] int32 CUDA tensor，形状 `(B, max_num_blocks_per_seq)`；
+ *        存在时启用 paged KV，逻辑序列通过 block table 映射到物理 cache block。
+ * @param alibi_slopes_ [in, optional] fp32 ALiBi slope，形状 `(Hq)` 或 `(B, Hq)`。
+ * @param max_seqlen_q [in/out] 当前 batch 中最大的 Q 序列长度；decode GQA/MQA
+ *        快路径中会改写成 group 数。
+ * @param max_seqlen_k [in] 当前 batch 中最大的 K/V 序列长度。
+ * @param p_dropout dropout 丢弃概率。
+ * @param softmax_scale softmax 前的 QK 缩放。
+ * @param zero_tensors 是否在 launch 前清零输出和中间 tensor，通常用于调试或测试。
+ * @param is_causal 是否启用 causal mask；单 token、无 ALiBi 时会被改写为 false。
+ * @param window_size_left 左侧 local attention 窗口；负值表示不限。
+ * @param window_size_right 右侧 local attention 窗口；负值表示不限。
+ * @param softcap score softcap 系数；非正值表示关闭。
+ * @param return_softmax 是否返回 dropout probability/mask tensor。
+ * @param unused_generator_compat 旧 Python API 兼容参数，必须为空。
+ * @param num_splits paged KV 或 decode 快路径的 split-KV 分片数；0 表示交给启发式。
+ * @return `{out, softmax_lse, p, rng_state}`。
+ */
+std::vector<at::Tensor>
+mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+               const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               const at::Tensor &cu_seqlens_q,  // b+1
+               const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
+               std::optional<const at::Tensor> &leftpad_k_, // batch_size
+               std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
+               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               int max_seqlen_q,
+               const int max_seqlen_k,
+               const float p_dropout,
+               const float softmax_scale,
+               const bool zero_tensors,
+               bool is_causal,
+               int window_size_left,
+               int window_size_right,
+               const float softcap,
+               const bool return_softmax,
+               // Retained only for backwards-compat arg positioning; must be None.
+               std::optional<at::Tensor> unused_generator_compat,
+               int num_splits = 0) {
+
+    // 旧版 Python API 曾经在这个位置接收 generator。当前实现固定使用
+    // PyTorch 默认 CUDA generator，所以这里必须保证调用方传 None。
+    TORCH_CHECK(!unused_generator_compat.has_value(),
+                "flash-attn: the RNG `generator` argument is no longer supported and must be None; "
+                "dropout (when enabled) uses the default CUDA generator.");
+
+    // Otherwise the kernel will be launched from cuda:0 device
+    // 用 RAII 方式把当前 CUDA device 切到 q.device()；否则后续分配和 kernel launch
+    // 可能沿用外部线程状态中的 cuda:0。
+    at::cuda::CUDAGuard device_guard{q.device()};
+
+    // 读取当前 GPU 的 compute capability。FlashAttention-2 这套 kernel 只支持 SM80+。
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x_min = cc_major >= 8;
+    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+
+    // dtype 决定后续 FP16_SWITCH/BF16_SWITCH 走哪套已编译模板。
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
+                "FlashAttention only support fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+
+    // cu_seqlens 会作为 int* 传入 kernel；必须是 int32，不能是 int64。
+    TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+    TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+
+    // 所有参与 kernel 的输入都必须在 CUDA 上。
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
+    CHECK_DEVICE(cu_seqlens_q);
+    CHECK_DEVICE(cu_seqlens_k);
+
+    // block_table 是 optional tensor；源码先声明一个局部 at::Tensor 承接它。
+    // 注意这里不是复制 device 数据，只是多一个 Tensor 句柄持有同一块 storage。
+    at::Tensor block_table;
+
+    // block_table_ 有值表示启用 paged KV。
+    const bool paged_KV = block_table_.has_value();
+    if (paged_KV) {
+        // 取出页表，并检查它满足 kernel 裸指针读取契约。
+        block_table = block_table_.value();
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
+        TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
+    }
+
+    // Q/K/V 最后一维 D 必须连续，kernel 才能按向量化 load/store 读取 head dim。
+    TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+
+    // cu_seqlens 是一维前缀和数组，必须整体 contiguous。
+    CHECK_CONTIGUOUS(cu_seqlens_q);
+    CHECK_CONTIGUOUS(cu_seqlens_k);
+
+    // 保存 q.sizes()，后续 out_ 检查还会用到原始 q shape。
+    const auto sizes = q.sizes();
+
+    // varlen 的 batch_size 由前缀和长度反推：cu_seqlens_q 形状为 B + 1。
+    const int batch_size = cu_seqlens_q.numel() - 1;
+
+    // q: total_q x num_heads x head_size。
+    int num_heads = sizes[1];
+    const int head_size = sizes[2];
+
+    // paged KV 下 k 的第 2 维是 num_heads_k；普通 varlen 下第 1 维是 num_heads_k。
+    const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+
+    // softcap 与 dropout 的组合在当前实现里不支持。
+    if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
+
+    // paged KV 的页表容量和物理 K/V block 形状。
+    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    const int num_blocks = !paged_KV ? 0 : k.size(0);
+    const int page_block_size = !paged_KV ? 1 : k.size(1);
+
+    // paged KV kernel 要求 page_block_size 是 256 的倍数。
+    TORCH_CHECK(!paged_KV || page_block_size % 256 == 0, "Paged KV cache block size must be divisible by 256");
+
+    // Lq=1 且没有 ALiBi 时，causal=true 与 false 等价。
+    if (max_seqlen_q == 1 && !alibi_slopes_.has_value()) { is_causal = false; }  // causal=true is the same as causal=false in this case
+
+    // causal mask 统一编码成右窗口为 0。
+    if (is_causal) { window_size_right = 0; }
+
+    // 默认让 kernel 使用 cu_seqlens_q 解释 Q 的 batch 边界。
+    void *cu_seqlens_q_d = cu_seqlens_q.data_ptr();
+
+    // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
+    // H/t Daniel Haziza
+    // 单 token decode + GQA/MQA 时，把 group 维临时当成 seqlen_q 维，提高 CTA 并行度。
+    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    const int ngroups = num_heads / num_heads_k;
+    if (seqlenq_ngroups_swapped) {
+        // 原始 q: B x (Hkv * G) x D；这里变成 (B * G) x Hkv x D。
+        q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
+
+        // group 数成为 kernel 眼里的 max_seqlen_q。
+        max_seqlen_q = ngroups;
+
+        // head 数从 Hq 缩成 Hkv。
+        num_heads = num_heads_k;
+
+        // Q 已经被重排成新的压平解释，不再通过 cu_seqlens_q 定位。
+        cu_seqlens_q_d = nullptr;
+    }
+
+    // 注意 total_q 在 swapped 之后重新读取，因此普通路径是原始 total_q，
+    // swapped 路径是 batch_size * ngroups。
+    const int total_q = q.sizes()[0];
+
+    // 基本数值约束与 head 分组约束。
+    TORCH_CHECK(batch_size > 0, "batch size must be positive");
+    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    // 窗口大到覆盖整个 K 时，统一规范成 -1，表示不限制。
+    if (window_size_left >= max_seqlen_k) { window_size_left = -1; }
+    if (window_size_right >= max_seqlen_k) { window_size_right = -1; }
+
+    // q 当前形状必须匹配 kernel 实际解释。
+    CHECK_SHAPE(q, total_q, num_heads, head_size);
+
+    // 普通 varlen 与 paged KV 的 K/V shape 完全不同，这里分开检查。
+    if (!paged_KV) {
+        const int total_k = k.size(0);
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size);
+    } else {
+        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
+        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
+        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+    }
+
+    // cu_seqlens_q/k 必须都是 B+1。
+    CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+
+    // seqused_k 可选：如果提供，它逐 batch 覆盖实际使用的 K 长度。
+    if (seqused_k.has_value()){
+        auto seqused_k_ = seqused_k.value();
+        TORCH_CHECK(seqused_k_.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+        TORCH_CHECK(seqused_k_.is_cuda(), "seqused_k must be on CUDA device");
+        TORCH_CHECK(seqused_k_.is_contiguous(), "seqused_k must be contiguous");
+        CHECK_SHAPE(seqused_k_, batch_size);
+    }
+
+    // out 可由调用方传入；没有则内部创建。
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype, "Output must have the same dtype as inputs");
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
+
+        // 源码这里使用 sizes[0]/sizes[1]，也就是 q 进入函数时保存的原始 shape。
+        CHECK_SHAPE(out, sizes[0], sizes[1], head_size);
+        if (seqlenq_ngroups_swapped) {
+            // 输出也跟 q 做相同变换，让 kernel 写入 swapped 后的布局。
+            out = out.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
+        }
+    } else {
+        out = torch::empty_like(q);
+    }
+
+    // 向上取整到 kernel tile / head dim 对齐边界。
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int head_size_rounded = round_multiple(head_size, head_size <= 128 ? 32 : 64);
+    const int seqlen_q_rounded = round_multiple(max_seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(max_seqlen_k, 128);
+
+    // 沿用 q 的 TensorOptions 分配输出辅助 tensor。
+    auto opts = q.options();
+
+    // varlen LSE 布局是 (num_heads, total_q)，不是定长路径的 (B, H, Lq)。
+    auto softmax_lse = torch::empty({num_heads, total_q}, opts.dtype(at::kFloat));
+
+    at::Tensor p;
+    // Only return softmax if there's dropout to reduce compilation time
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        p = torch::empty({ batch_size, num_heads, seqlen_q_rounded, seqlen_k_rounded }, opts);
+    }
+    else {
+        // 不返回 softmax 时仍用空 CUDA tensor 占位，保持返回结构固定。
+        p = torch::empty({ 0 }, opts);
+    }
+
+    if (zero_tensors) {
+        // 调试/测试辅助分支：先清空输出和辅助 tensor。
+        out.zero_();
+        softmax_lse.fill_(-std::numeric_limits<float>::infinity());
+        if (return_softmax) {p.zero_();}
+    }
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     batch_size,
+                     max_seqlen_q, max_seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k, v, out,
+                     cu_seqlens_q_d,
+                     cu_seqlens_k.data_ptr(),
+                     seqused_k.has_value() ? seqused_k.value().data_ptr() : nullptr,
+                     return_softmax ? p.data_ptr() : nullptr,
+                     softmax_lse.data_ptr(),
+                     p_dropout,
+                     softmax_scale,
+                     window_size_left,
+                     window_size_right,
+                     softcap,
+                     seqlenq_ngroups_swapped,
+                     /*unpadded_lse*/true);
+
+    // varlen kernel 需要 total_q 来解释 unpadded LSE 和输出范围。
+    params.total_q = total_q;
+
+    if (paged_KV) {
+        // paged KV 用 block_table 做逻辑 block -> 物理 block 映射。
+        params.block_table = block_table.data_ptr<int>();
+        params.block_table_batch_stride = block_table.stride(0);
+
+        // 这里 batch_stride 字段被复用为“物理 block stride”。
+        params.k_batch_stride = k.stride(0);
+        params.v_batch_stride = v.stride(0);
+    }
+    params.page_block_size = page_block_size;
+
+    // Keep references to these tensors to extend their lifetime
+    // params 只保存裸指针，所以这两个局部 Tensor 必须活到 kernel launch 完成。
+    at::Tensor softmax_lse_accum, out_accum;
+    if (seqlenq_ngroups_swapped) {
+        std::tie(softmax_lse_accum, out_accum) =
+            set_params_splitkv(params, batch_size, num_heads, head_size,
+                               max_seqlen_k, max_seqlen_q, head_size_rounded,
+                               p_dropout, num_splits, get_num_sm(get_current_device()), opts);
+    } else if (paged_KV) {
+        // varlen paged KV 当前不支持 num_splits > 1。
+        TORCH_CHECK(num_splits <= 1, "num_splits > 1 is not supported for varlen paged KV");
+        params.num_splits = num_splits;
+    }
+
+    if (leftpad_k_.has_value()) {
+        auto leftpad_k = leftpad_k_.value();
+        // leftpad_k 与 paged KV 当前不能同时启用。
+        TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running at the same time yet");
+        TORCH_CHECK(leftpad_k.dtype() == torch::kInt32, "leftpad_k must have dtype int32");
+        CHECK_DEVICE(leftpad_k);
+        CHECK_CONTIGUOUS(leftpad_k);
+        CHECK_SHAPE(leftpad_k, batch_size);
+        params.leftpad_k = static_cast<int *>(leftpad_k.data_ptr());
+    }
+
+    // 返回给 Python 的 RNG 状态，forward kernel 会写入 seed 和 offset。
+    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
+    auto rng_state = torch::empty({2}, options.dtype(torch::kInt64));
+
+    // Forward kernel will populate memory with the seed and offset.
+    params.rng_state = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
+
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+    if (p_dropout > 0.0)  {
+        // number of times random will be generated per thread, to offset philox counter in thc random
+        // state
+        // We use a custom RNG that increases the offset by batch_size * nheads * 32.
+        // dropout 路径需要为 Philox 随机数预留 counter 区间。
+        int64_t counter_offset = params.b * params.h * 32;
+        auto gen = at::cuda::detail::getDefaultCUDAGenerator();
+        // See Note [Acquire lock when using random generators]
+        // PyTorch generator 是共享状态，取 Philox offset 时必须加锁。
+        std::lock_guard<std::mutex> lock(gen.mutex());
+        new (params.philox_args) at::PhiloxCudaState(gen.get<at::CUDAGeneratorImpl>()->philox_cuda_state(counter_offset));
+    }
+#endif
+
+    // 写入可选 ALiBi slope 指针和 stride。
+    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    if (max_seqlen_k > 0) {
+        // K 非空时进入真正的 dispatch。paged_KV=true 会强制走 split-KV kernel。
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd(params, stream, paged_KV);
+    } else {
+        // If seqlen_k == 0, then we have an empty tensor. We need to set the output to 0.
+        // 空 K/V 时不发射 kernel，直接写确定结果。
+        out.zero_();
+        softmax_lse.fill_(std::numeric_limits<float>::infinity());
+    }
+
+    if (seqlenq_ngroups_swapped) {
+        // 把 swapped 后的内部布局恢复成公开 API 期望的 `(B, Hq, D)` 解释。
+        int64_t size_before[] = {batch_size, max_seqlen_q, num_heads_k, head_size};
+        int64_t size_after[] = {batch_size, num_heads_k * max_seqlen_q, head_size};
+        out = out.reshape(size_before).transpose(1, 2).reshape(size_after);
+        q = q.reshape(size_before).transpose(1, 2).reshape(size_after);
+        softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
+    }
+
+    return {out, softmax_lse, p, rng_state};
+}
+```
+
+把它和定长路径对齐看，差异主要有四层：
+
+- **输入布局不同**：定长路径的第一维就是 `B`，第二维就是固定 `L`；变长路径的第一维是所有样本 token 拼起来的 `total_q/total_k`。因此 `batch_size = cu_seqlens_q.numel() - 1`，而不是 `q.size(0)`。
+- **寻址规则不同**：`mha_fwd` 传 `cu_seqlens_q_d = nullptr`，kernel 用 `q_batch_stride` 找第 `b` 条样本；`mha_varlen_fwd` 传真实 `cu_seqlens_q/k`，kernel 用前缀和找每条样本的起点。
+- **LSE 布局不同**：定长是 `(B, H, Lq)`；变长是 `(H, total_q)`，同时写 `params.unpadded_lse = true`。这里的 `total_q` 是压平后的 Q token 数，不能再拆成固定的 `B * Lq`。
+- **paged KV 是额外的物理寻址层**：`block_table[b, block_id]` 把第 `b` 条逻辑序列的第 `block_id` 个逻辑 block 映射到 `k/v` 的物理 block。于是 `k/v` 的形状变成 `(num_blocks, page_block_size, Hkv, D)`，`params.block_table`、`params.block_table_batch_stride` 和 `params.page_block_size` 会告诉 split-KV kernel 如何从逻辑 token 转到物理地址。
 
 ### `mha_fwd_kvcache`：融合追加 KV 与 attention
 
-**用途**
+KV cache 入口做了两件事情：
 
-该接口读取预分配 `kcache/vcache`，可选地追加本轮 `k_/v_`，再在更新后的上下文上计算 attention；它是 decode 路径的封装入口。
+1. 读取已有的 `kcache/vcache` 作为当前上下文。
+2. 如果本轮传入 `k_/v_`，先把新 token 追加到 cache，再用更新后的 cache 做 attention。
 
-**特殊参数与字段映射**
+这条路径看起来比 `mha_fwd` 多很多参数，但最后仍然是同一个套路：先调用 `set_params_fprop` 填基础 Q/K/V/O/LSE 字段，再把 cache 独有的 `knew/vnew`、`seqlens_k`、rotary、`block_table` 等字段补上，最后调用 `run_mha_fwd`。
 
-| 输入 | 写入 `Flash_fwd_params` | 约束 / 作用 |
-| --- | --- | --- |
-| `kcache/vcache` | 先作为 `k_ptr/v_ptr` 与普通 K/V stride。 | 可为 `(Bcache, Lcache, Hk, D)` 或 paged 物理 block。 |
-| `k_/v_` | `knew_ptr/vnew_ptr`、`seqlen_knew`、全部 `knew_*_stride`。 | 两者必须同时存在，并要求 `seqlens_k_` 存在。 |
-| `seqlens_k_` | `cu_seqlens_k`，同时设 `is_seqlens_k_cumulative = false`。 | 此时数组存的是每条 cache 的**长度**，不是 varlen 的前缀和。 |
-| `rotary_cos_/sin_` | rotary 指针、`rotary_dim`、`is_rotary_interleaved`。 | 仅追加 K/V 时允许；`rotary_dim <= D` 且为 16 的倍数。 |
-| `cache_batch_idx_` | `cache_batch_idx`。 | 把当前 batch 行映射到 cache 行；paged KV 不支持它。 |
-| `block_table_` | paged KV 字段。 | paged KV 时还检查可寻址容量不小于 `max(seqlens_k) + seqlen_knew`。 |
+这里先把 `rotary_cos_`、`rotary_sin_`、`cache_batch_idx_` 三个参数拆开讲清楚。它们解决的是两类问题：
 
-KV cache 路径允许原始 `head_size` 不是 8 的倍数：先用 `torch::nn::functional::pad` 把 Q/cache/新 K/V 补到 8 的倍数，kernel 后再用 `index` 裁回，并在必要时 `copy_` 回调用方的 cache。普通 `mha_fwd` 则把“8 的倍数”作为入口硬约束，这个差异来自 cache 接口承担了更强的兼容性封装。
+- `rotary_cos_ / rotary_sin_`：**位置编码问题**。当本轮追加新的 `k_/v_` 时，kernel 可以顺手对新 K 和当前 Q 应用 RoPE（rotary positional embedding，旋转位置编码），再把旋转后的 K 写进 cache、用旋转后的 Q 做 attention。
+- `cache_batch_idx_`：**cache 行重映射问题**。当前 Q 的 batch 第 `b` 行，不一定写入 / 读取 `kcache[b]`，而是可以通过 `cache_batch_idx_[b]` 映射到 cache 的另一个 batch slot。
 
-它以 `p_dropout=0` 调用 `set_params_splitkv`，可按启发式使用多个 split。只要追加 K/V、提供 `cache_batch_idx` 或使用 paged KV，最后一个参数 `force_split_kernel=true`，因为 `flash_fwd_splitkv_kernel` 才实现了 append、重映射和分页寻址。
+| 参数 | 形状 / dtype | 写入字段 | 核心作用 |
+| --- | --- | --- | --- |
+| `rotary_cos_` | `(seqlen_ro, rotary_dim / 2)`，dtype 与 Q 相同，CUDA contiguous | `params.rotary_cos_ptr`、`params.rotary_dim` | 提供 RoPE 的 cos 表。 |
+| `rotary_sin_` | `(seqlen_ro, rotary_dim / 2)`，dtype 与 Q 相同，CUDA contiguous | `params.rotary_sin_ptr` | 提供 RoPE 的 sin 表，必须和 `rotary_cos_` 同时存在。 |
+| `cache_batch_idx_` | 语义上是 `(B)`，int32 CUDA contiguous | `params.cache_batch_idx` | 把当前 batch id 映射到 KV cache 的实际 batch 行。 |
+
+源码里 rotary 相关检查是这样的：
+
+```cpp
+if (rotary_cos_.has_value()) {
+    TORCH_CHECK(
+        k_.has_value(),
+        "If rotary cos/sin are provided, new key / value to be appended to KV cache must also be provided");
+
+    auto rotary_cos = rotary_cos_.value();
+    CHECK_DEVICE(rotary_cos);
+
+    // cos/sin 表最后一维只存半个 rotary 维度，所以实际 rotary_dim 要乘 2。
+    params.rotary_dim = rotary_cos.size(1) * 2;
+
+    // rotary 只能覆盖 head dim 的前一部分或全部，不能超过 head_size。
+    TORCH_CHECK(params.rotary_dim <= head_size, "rotary_dim must be <= headdim");
+
+    // 当前 kernel 的 rotary 实现要求 16 对齐，方便向量化和 tile 处理。
+    TORCH_CHECK(
+        params.rotary_dim % 16 == 0,
+        "Only rotary dimensions divisible by 16 are currently supported");
+
+    // rotary 表长度至少要覆盖 KV cache 的位置范围。
+    const int seqlen_ro = rotary_cos.size(0);
+    TORCH_CHECK(seqlen_ro >= seqlen_k, "cos/sin seqlen must be at least the seqlen of KV cache");
+
+    CHECK_SHAPE(rotary_cos, seqlen_ro, params.rotary_dim / 2);
+    CHECK_CONTIGUOUS(rotary_cos);
+    TORCH_CHECK(rotary_cos.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+
+    TORCH_CHECK(rotary_sin_.has_value(), "If rotary cos is provided, rotary sin must also be provided");
+    auto rotary_sin = rotary_sin_.value();
+    CHECK_DEVICE(rotary_sin);
+    CHECK_SHAPE(rotary_sin, seqlen_ro, params.rotary_dim / 2);
+    CHECK_CONTIGUOUS(rotary_sin);
+    TORCH_CHECK(rotary_sin.scalar_type() == q_dtype, "rotary_cos must have the same dtype as query");
+
+    params.rotary_cos_ptr = rotary_cos.data_ptr();
+    params.rotary_sin_ptr = rotary_sin.data_ptr();
+    params.is_rotary_interleaved = is_rotary_interleaved;
+} else {
+    params.rotary_dim = 0;
+}
+```
+
+这里最容易误解的是：**传了 rotary 表，就必须同时传 `k_/v_`**。原因是这个接口里的 rotary 不是“对任意已有 cache 重新做位置编码”，而是服务于 **append KV cache** 这件事：
+
+- 新来的 `k_` 还没写进 `kcache`，kernel 会先对它应用 rotary，再写入 cache。
+- 当前 `q` 也会在 kernel 读取到 shared memory 时应用 rotary，然后用旋转后的 Q 和 cache 中的 K 做 attention。
+- 已经在 `kcache` 里的旧 K 默认被认为早就按对应位置编码处理好了，不会整段重新旋转。
+
+从 `flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h` 可以看到两个位置：
+
+```cpp
+// 追加 K/V 时：如果 params.rotary_dim != 0，新 K 写入 cache 前会经过 rotary。
+if (params.rotary_dim == 0) {
+    FLASH_NAMESPACE::copy_w_min_idx<Is_even_K>(...);
+} else {
+    if (params.is_rotary_interleaved) {
+        FLASH_NAMESPACE::copy_rotary_interleaved<Is_even_K, /*Clear_OOB_K=*/false>(...);
+    } else {
+        FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(...);
+    }
+}
+
+// 读取 Q 时：Append_KV 且 rotary_dim != 0，会对 Q 应用同一套 cos/sin。
+if (!Append_KV || params.rotary_dim == 0) {
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(...);
+} else {
+    // If not causal, all the queries get the same the cos/sin, taken at location seqlen_k_cache.
+    Tensor gCos = make_tensor(...);
+    Tensor gSin = make_tensor(...);
+}
+```
+
+`is_rotary_interleaved` 控制的是 RoPE 配对维度的布局：
+
+- `true`：interleaved 布局，通常按 `(0, 1), (2, 3), ...` 配对旋转。
+- `false`：contiguous / GPT-NeoX 风格布局，通常按 `(0, rotary_dim/2), (1, rotary_dim/2 + 1), ...` 配对旋转。
+
+`cache_batch_idx_` 则是另一类完全不同的参数。源码处理很短：
+
+```cpp
+if (cache_batch_idx_.has_value()) {
+    auto cache_batch_idx = cache_batch_idx_.value();
+    CHECK_DEVICE(cache_batch_idx);
+    CHECK_CONTIGUOUS(cache_batch_idx);
+    TORCH_CHECK(cache_batch_idx.scalar_type() == torch::kInt32, "cache_batch_idx must have dtype int32");
+    params.cache_batch_idx = reinterpret_cast<int *>(cache_batch_idx.data_ptr());
+}
+```
+
+它的语义可以理解成：
+
+```cpp
+// 没有 cache_batch_idx_：
+// 第 b 条请求读写 kcache[b] / vcache[b]。
+cache_row = b;
+
+// 有 cache_batch_idx_：
+// 第 b 条请求读写 kcache[cache_batch_idx[b]] / vcache[cache_batch_idx[b]]。
+cache_row = cache_batch_idx[b];
+```
+
+这常见于 decode / beam search / cache slot 复用场景：当前 batch 的排列可能变了，但 KV cache 的物理行不想搬动，就用 `cache_batch_idx_` 做一次间接寻址。
+
+有两个约束要记住：
+
+- `cache_batch_idx_` **不能和 paged KV 同时使用**。源码在 `paged_KV` 分支里直接检查：
+
+  ```cpp
+  TORCH_CHECK(!cache_batch_idx_.has_value(), "Paged KVcache does not support cache_batch_idx");
+  ```
+
+  因为 paged KV 已经通过 `block_table_` 做逻辑序列到物理 block 的间接映射，再叠加 cache 行重映射会让寻址语义更复杂，这版实现没有支持。
+
+- 只要传了 `k_/v_`、`cache_batch_idx_` 或 `block_table_`，最后都会强制走 split-KV kernel：
+
+  ```cpp
+  run_mha_fwd(
+      params,
+      stream,
+      /*force_split_kernel=*/k_.has_value() || cache_batch_idx_.has_value() || paged_KV);
+  ```
+
+  因为普通 forward kernel 只做常规 attention；**append KV、cache 行重映射、paged KV 寻址**这些额外能力都在 split-KV 前向 kernel 里实现。
+
+```cpp
+/**
+ * @brief 基于 KV cache 执行 FlashAttention 前向，并可在同一个 kernel 路径中追加新 K/V。
+ *
+ * @param q [in/out] CUDA Q tensor，形状 `(B, Lq, Hq, D)`；
+ *        decode GQA/MQA 快路径中会临时把 group 维解释为 seqlen_q。
+ * @param kcache [in/out] 已分配的 K cache。普通 cache 形状为 `(Bcache, Lcache, Hkv, D)`；
+ *        paged KV 时为 `(num_blocks, page_block_size, Hkv, D)`。
+ * @param vcache [in/out] 已分配的 V cache，形状规则与 `kcache` 相同。
+ * @param k_ [in, optional] 本轮需要追加的新 K，形状 `(B, Lnew, Hkv, D)`。
+ * @param v_ [in, optional] 本轮需要追加的新 V，形状 `(B, Lnew, Hkv, D)`。
+ * @param seqlens_k_ [in, optional] int32 CUDA tensor，形状 `(B)`；
+ *        在本接口里表示每条 cache 当前已使用长度，不是 cumulative offsets。
+ * @param rotary_cos_ [in, optional] rotary cos 表；只有追加新 K/V 时允许传入。
+ * @param rotary_sin_ [in, optional] rotary sin 表；必须与 `rotary_cos_` 同时存在。
+ * @param cache_batch_idx_ [in, optional] int32 CUDA tensor，形状 `(B)`；
+ *        将当前 batch 的第 `b` 行映射到 cache 的第 `cache_batch_idx[b]` 行。
+ * @param leftpad_k_ [in, optional] int32 CUDA tensor，形状 `(B)`；不能与 paged KV 同时使用。
+ * @param block_table_ [in, optional] int32 CUDA tensor，形状 `(B, max_num_blocks_per_seq)`；
+ *        存在时启用 paged KV cache。
+ * @param alibi_slopes_ [in, optional] fp32 ALiBi slope，形状 `(Hq)` 或 `(B, Hq)`。
+ * @param out_ [in, optional] 调用方预分配输出 `(B, Lq, Hq, D)`。
+ * @param softmax_scale softmax 前的 QK 缩放。
+ * @param is_causal 是否启用 causal mask。
+ * @param window_size_left 左侧 local attention 窗口；负值表示不限。
+ * @param window_size_right 右侧 local attention 窗口；负值表示不限。
+ * @param softcap score softcap 系数；非正值表示关闭。
+ * @param is_rotary_interleaved rotary 维度是否采用 GPT-NeoX 之外的 interleaved 布局。
+ * @param num_splits split-KV 分片数；0 表示由启发式决定。
+ * @return `{out, softmax_lse}`。
+ */
+std::vector<at::Tensor>
+mha_fwd_kvcache(
+    at::Tensor& q,
+    const at::Tensor& kcache,
+    const at::Tensor& vcache,
+    std::optional<const at::Tensor>& k_,
+    std::optional<const at::Tensor>& v_,
+    std::optional<const at::Tensor>& seqlens_k_,
+    std::optional<const at::Tensor>& rotary_cos_,
+    std::optional<const at::Tensor>& rotary_sin_,
+    std::optional<const at::Tensor>& cache_batch_idx_,
+    std::optional<const at::Tensor>& leftpad_k_,
+    std::optional<at::Tensor>& block_table_,
+    std::optional<at::Tensor>& alibi_slopes_,
+    std::optional<at::Tensor>& out_,
+    const float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    const float softcap,
+    bool is_rotary_interleaved,
+    int num_splits) {
+    // KV cache 前向同样必须先切换当前 CUDA device。
+    // 否则后续创建临时 padded tensor 或发射 kernel 时可能跑到错误 GPU。
+    at::cuda::CUDAGuard device_guard{q.device()};
+
+    // 读取当前设备架构。该 C++ 入口只面向 FlashAttention-2 的 SM80+ kernel。
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    TORCH_CHECK(cc_major >= 8, "FlashAttention only supports Ampere GPUs or newer.");
+
+    // dtype 决定后续模板分发类型 T。Q、已有 K cache、已有 V cache 必须完全一致。
+    auto q_dtype = q.dtype();
+    TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16);
+    TORCH_CHECK(kcache.dtype() == q_dtype && vcache.dtype() == q_dtype);
+
+    // 三个基础输入都要在 CUDA 上；cache 是 in/out 语义，但这里先按输入检查。
+    CHECK_DEVICE(q);
+    CHECK_DEVICE(kcache);
+    CHECK_DEVICE(vcache);
+
+    // kernel 沿 D 维做向量化 load/store，所以最后一维必须连续。
+    TORCH_CHECK(q.stride(-1) == 1);
+    TORCH_CHECK(kcache.stride(-1) == 1);
+    TORCH_CHECK(vcache.stride(-1) == 1);
+
+    // block_table 存在即启用 paged KV cache。
+    const bool paged_KV = block_table_.has_value();
+    if (paged_KV) {
+        // paged KV 已经通过 block_table 完成 batch->cache 的间接映射，
+        // 因此暂不支持再叠加 cache_batch_idx。
+        TORCH_CHECK(!cache_batch_idx_.has_value());
+
+        // 取出 optional 内部 tensor。这里仍是浅拷贝 view，不复制 device 数据。
+        auto block_table = block_table_.value();
+
+        // block_table 最终会以 int* 传给 kernel，必须是 CUDA int32。
+        CHECK_DEVICE(block_table);
+        TORCH_CHECK(block_table.dtype() == torch::kInt32);
+
+        // 最后一维连续意味着同一条序列的逻辑 block id 能被顺序读取。
+        TORCH_CHECK(block_table.stride(-1) == 1);
+    }
+
+    // Q 是公开 API 的定长布局 `(B, Lq, Hq, D)`。
+    const auto q_sizes = q.sizes();
+
+    // 当前 decode batch 大小。
+    const int batch_size = q_sizes[0];
+
+    // seqlen_q 后面可能被 GQA/MQA swapped 改写成 ngroups。
+    int seqlen_q = q_sizes[1];
+
+    // num_heads 后面也可能从 Hq 改写成 Hkv。
+    int num_heads = q_sizes[2];
+
+    // 原始 head size。KV cache 路径允许它不是 8 的倍数，所以单独保存 og 值。
+    const int head_size_og = q_sizes[3];
+
+    // 无论 paged 与否，kcache 的 head 维都在第 2 维。
+    const int num_heads_k = paged_KV ? kcache.size(2) : kcache.size(2);
+
+    // 基础合法性检查：非空 batch、head dim 上限、GQA/MQA head group 可整除。
+    TORCH_CHECK(batch_size > 0);
+    TORCH_CHECK(head_size_og <= 256);
+    TORCH_CHECK(num_heads % num_heads_k == 0);
+
+    // 普通 cache 下 batch_size_c 来自 kcache.size(0)；
+    // paged cache 下 K/V 第一维是物理 block，不再表示 batch。
+    int batch_size_c = 0;
+
+    // seqlen_k 在这里表示 cache 可寻址容量上界，而不一定是每条样本实际长度。
+    int seqlen_k = 0;
+
+    // 普通 cache 没有 page 概念，用 1 作为默认值。
+    int page_block_size = 1;
+
+    // paged KV 每条样本最多能引用多少个逻辑 block。
+    int max_num_blocks_per_seq = 0;
+    if (paged_KV) {
+        // 物理 cache block 总数。
+        const int num_blocks = kcache.size(0);
+
+        // 每个物理 block 中连续存放多少个 token。
+        page_block_size = kcache.size(1);
+
+        // block_table 的列数就是每条逻辑序列的 block 容量。
+        max_num_blocks_per_seq = block_table_.value().size(1);
+
+        // paged KV 时，逻辑 batch 仍然来自 Q，而不是 kcache 第一维。
+        batch_size_c = batch_size;
+
+        // 这是通过 block_table 可寻址的最大逻辑长度，不代表每条样本真实长度。
+        seqlen_k = max_num_blocks_per_seq * page_block_size;
+
+        // kernel 的 paged 寻址假设 page block size 是 256 的倍数。
+        TORCH_CHECK(page_block_size % 256 == 0);
+
+        // paged K/V 布局：物理 block id、block 内 token、KV head、D。
+        CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+        CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
+
+        // block_table 每行对应一个 request / batch 样本。
+        CHECK_SHAPE(block_table_.value(), batch_size, max_num_blocks_per_seq);
+    } else {
+        // 普通 cache 布局：cache batch、cache 容量、KV head、D。
+        batch_size_c = kcache.size(0);
+        seqlen_k = kcache.size(1);
+        CHECK_SHAPE(kcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+        CHECK_SHAPE(vcache, batch_size_c, seqlen_k, num_heads_k, head_size_og);
+    }
+
+    // Q 必须保持公开 API 输入形状；若触发 swapped，后面会再做 view 变换。
+    CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size_og);
+
+    if (seqlen_q == 1 && !alibi_slopes_.has_value()) {
+        // 单 token decode 且没有 ALiBi 时，causal 与非 causal 的可见 K 集合相同。
+        is_causal = false;
+    }
+    if (is_causal) {
+        // 统一把 causal 编码成右窗口为 0。
+        window_size_right = 0;
+    }
+    if (window_size_left >= seqlen_k) {
+        // 左窗口覆盖整个 cache 时，等价于不限制，用 -1 规范化。
+        window_size_left = -1;
+    }
+    if (window_size_right >= seqlen_k) {
+        // 右窗口同理，避免 kernel 里处理“很大但等价无限”的窗口。
+        window_size_right = -1;
+    }
+
+    // KV cache 路径会主动 padding 到 8 的倍数；普通 mha_fwd 则直接要求 D % 8 == 0。
+    // 这个 helper 既服务 D 维 padding，也服务 Lq/Lk tile 对齐。
+    auto round_multiple = [](int x, int m) {
+        return (x + m - 1) / m * m;
+    };
+
+    // kernel 实际看到的 head_size，至少是原始 D 向上补齐到 8。
+    const int head_size = round_multiple(head_size_og, 8);
+
+    // kernel traits 使用的 rounded D，进一步对齐到 32 或 64。
+    const int head_size_rounded =
+        round_multiple(head_size, head_size <= 128 ? 32 : 64);
+
+    // 这三个 tensor 代表 kernel 实际读写的 Q/K/V。
+    // 默认与原 tensor 共享 storage；只有 D 不对齐时才创建 padded 拷贝。
+    at::Tensor q_padded = q;
+    at::Tensor kcache_padded = kcache;
+    at::Tensor vcache_padded = vcache;
+    if (head_size != head_size_og) {
+        // pad 只补最后一维 D，不改变 B/L/H 语义。
+        q_padded = torch::nn::functional::pad(
+            q,
+            torch::nn::functional::PadFuncOptions({0, head_size - head_size_og}));
+        kcache_padded = torch::nn::functional::pad(
+            kcache,
+            torch::nn::functional::PadFuncOptions({0, head_size - head_size_og}));
+        vcache_padded = torch::nn::functional::pad(
+            vcache,
+            torch::nn::functional::PadFuncOptions({0, head_size - head_size_og}));
+    }
+
+    // decode GQA/MQA 快路径：把 Hq/Hkv 的 group 数挪到 seqlen_q 维，
+    // 让原本 Lq=1 的任务拥有更多 query row 可并行调度。
+    const bool seqlenq_ngroups_swapped =
+        seqlen_q == 1 &&
+        num_heads > num_heads_k &&
+        window_size_left < 0 &&
+        window_size_right < 0 &&
+        head_size % 8 == 0 &&
+        !alibi_slopes_.has_value();
+    const int ngroups = num_heads / num_heads_k;
+    if (seqlenq_ngroups_swapped) {
+        // `(B, 1, Hkv * G, D)` -> `(B, G, Hkv, D)`。
+        q_padded = q_padded.reshape({batch_size, num_heads_k, ngroups, head_size})
+                       .transpose(1, 2);
+
+        // group 数成为 kernel 眼中的 seqlen_q。
+        seqlen_q = ngroups;
+
+        // head 数缩回 Hkv，因为 group 已经不再放在 head 维。
+        num_heads = num_heads_k;
+    }
+
+    // 输出 tensor 的生命周期也由局部 at::Tensor 管理，params 只保存裸指针。
+    at::Tensor out;
+    if (out_.has_value()) {
+        // 如果调用方传入 out_，先按公开 API 形状检查。
+        out = out_.value();
+        CHECK_DEVICE(out);
+        TORCH_CHECK(out.dtype() == q_dtype);
+        TORCH_CHECK(out.stride(-1) == 1);
+        CHECK_SHAPE(out, batch_size, q_sizes[1], q_sizes[2], head_size_og);
+        if (head_size != head_size_og) {
+            // kernel 会写 padded D，所以不能直接写入原始 out_；
+            // 先写临时 out，kernel 后再 slice/copy 回 out_。
+            out = torch::empty_like(q_padded);
+        } else if (seqlenq_ngroups_swapped) {
+            // 如果 Q 做了 swapped，out 也必须以同样布局暴露给 kernel。
+            out = out.reshape({batch_size, num_heads_k, ngroups, head_size})
+                     .transpose(1, 2);
+        }
+    } else {
+        // 无预分配输出时，直接按 kernel 形状创建。
+        out = torch::empty_like(q_padded);
+    }
+
+    // 沿用 Q 的 device 和 allocator。
+    auto opts = q.options();
+
+    // cache 路径是定长 batch LSE 布局：`(B, H, Lq)`。
+    auto softmax_lse = torch::empty(
+        {batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+
+    // 先填基础 attention 参数：Q 来自 q_padded，K/V 来自已有 cache。
+    // 这里还不涉及本轮新增 K/V、rotary、block_table 等 cache 专用字段。
+    Flash_fwd_params params;
+    set_params_fprop(
+        params,
+        batch_size,
+        seqlen_q,
+        seqlen_k,
+        round_multiple(seqlen_q, 128),
+        round_multiple(seqlen_k, 128),
+        num_heads,
+        num_heads_k,
+        head_size,
+        head_size_rounded,
+        q_padded,
+        kcache_padded,
+        vcache_padded,
+        out,
+        /*cu_seqlens_q_d=*/nullptr,
+        /*cu_seqlens_k_d=*/nullptr,
+        /*seqused_k=*/nullptr,
+        /*p_ptr=*/nullptr,
+        softmax_lse.data_ptr(),
+        /*p_dropout=*/0.f,
+        softmax_scale,
+        window_size_left,
+        window_size_right,
+        softcap);
+    // 注意：当前源码没有把 `seqlenq_ngroups_swapped` 继续传给 `set_params_fprop`。
+    // 它只改变 Q/out/LSE 的 host 侧形状解释；`params.seqlenq_ngroups_swapped`
+    // 保持默认 false。这一点和定长 `mha_fwd` 类似，和 varlen 路径不同。
+
+    // 本轮新增 K/V 的长度；没有 k_ 时保持 0。
+    int seqlen_knew = 0;
+
+    // knew/vnew 是局部 Tensor 持有者，保证 padded 新 K/V 的 storage 活到 kernel launch 后。
+    at::Tensor knew, vnew;
+    if (k_.has_value()) {
+        // 追加新 K/V 时，必须同时给出 V 和每条 cache 当前已使用长度。
+        TORCH_CHECK(v_.has_value());
+        TORCH_CHECK(seqlens_k_.has_value());
+
+        // 取出 optional 中的新 K/V。这里不复制数据，除非后面需要 pad。
+        knew = k_.value();
+        vnew = v_.value();
+
+        // 新 K/V 同样会被 kernel 直接读，必须满足 CUDA、dtype、最后一维连续。
+        CHECK_DEVICE(knew);
+        CHECK_DEVICE(vnew);
+        TORCH_CHECK(knew.dtype() == q_dtype && vnew.dtype() == q_dtype);
+        TORCH_CHECK(knew.stride(-1) == 1 && vnew.stride(-1) == 1);
+
+        // 本轮追加的 token 数来自新 K 的第 1 维。
+        seqlen_knew = knew.size(1);
+
+        // 源码约束：带新 K/V 更新时，当前 Q 长度不能超过 cache 容量。
+        TORCH_CHECK(seqlen_q <= seqlen_k);
+
+        // 新 K/V 公开形状与当前 batch 对齐，head 数使用 KV head。
+        CHECK_SHAPE(knew, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        CHECK_SHAPE(vnew, batch_size, seqlen_knew, num_heads_k, head_size_og);
+        if (head_size != head_size_og) {
+            // 如果 cache 路径使用 padded D，新 K/V 也必须 pad 到同样的 D。
+            knew = torch::nn::functional::pad(
+                knew,
+                torch::nn::functional::PadFuncOptions({0, head_size - head_size_og}));
+            vnew = torch::nn::functional::pad(
+                vnew,
+                torch::nn::functional::PadFuncOptions({0, head_size - head_size_og}));
+        }
+
+        // knew/vnew 是“本轮追加”的 device 指针。kernel 会先根据 seqlens_k
+        // 把它们写入 cache 对应位置，再参与后续 attention。
+        params.seqlen_knew = seqlen_knew;
+
+        // device 指针：split-KV kernel 会从这里读取本轮新增 K/V。
+        params.knew_ptr = knew.data_ptr();
+        params.vnew_ptr = vnew.data_ptr();
+
+        // 新 K/V 的 stride 均以元素为单位，不是字节。
+        // kernel 根据这些 stride 在 `(B, Lnew, Hkv, D)` 中寻址。
+        params.knew_batch_stride = knew.stride(0);
+        params.vnew_batch_stride = vnew.stride(0);
+        params.knew_row_stride = knew.stride(1);
+        params.vnew_row_stride = vnew.stride(1);
+        params.knew_head_stride = knew.stride(2);
+        params.vnew_head_stride = vnew.stride(2);
+    }
+
+    if (seqlens_k_.has_value()) {
+        // cache 路径中的 seqlens_k 是每条样本当前有效 cache 长度。
+        auto seqlens_k = seqlens_k_.value();
+
+        // 它会作为 int* 传入 kernel，按 batch id 读取。
+        CHECK_DEVICE(seqlens_k);
+        TORCH_CHECK(seqlens_k.dtype() == torch::kInt32);
+        CHECK_CONTIGUOUS(seqlens_k);
+        CHECK_SHAPE(seqlens_k, batch_size);
+        if (paged_KV) {
+            // 这是一次 host-device 同步：需要知道当前 batch 最大 cache 长度，
+            // 才能验证 block_table 总容量是否够放旧 token + 本轮新 token。
+            int max_seqlen_k = seqlens_k.max().item<int>();
+
+            // 如果实际长度超过 block_table 可寻址容量，split kernel 会越界读 table。
+            TORCH_CHECK(
+                max_seqlen_k + seqlen_knew <= max_num_blocks_per_seq * page_block_size);
+        }
+
+        // 复用 cu_seqlens_k 字段保存“长度数组”指针。
+        params.cu_seqlens_k = static_cast<int*>(seqlens_k.data_ptr());
+    }
+    // 与 varlen 不同：这里 cu_seqlens_k 实际存的是“每条 cache 的长度”，不是前缀和。
+    params.is_seqlens_k_cumulative = !seqlens_k_.has_value();
+
+    if (leftpad_k_.has_value()) {
+        // leftpad_k 表示每条 cache 左侧 padding 长度，用于修正逻辑位置。
+        auto leftpad_k = leftpad_k_.value();
+
+        // paged KV 暂不支持 left padding，避免 table 寻址与偏移修正叠加。
+        TORCH_CHECK(!paged_KV, "We don't support Paged KV and leftpad_k running together yet");
+        CHECK_DEVICE(leftpad_k);
+        TORCH_CHECK(leftpad_k.dtype() == torch::kInt32);
+        CHECK_CONTIGUOUS(leftpad_k);
+        CHECK_SHAPE(leftpad_k, batch_size);
+
+        // 保存 device 指针，kernel 按 batch id 读取。
+        params.leftpad_k = static_cast<int*>(leftpad_k.data_ptr());
+    }
+
+    if (rotary_cos_.has_value()) {
+        // rotary 只在“追加新 K/V”时生效：它用于把新 K 写入 cache 前做位置旋转。
+        TORCH_CHECK(k_.has_value(), "Rotary embedding is only supported when updating KV cache");
+
+        // cos/sin 表必须同时存在，分别提供旋转的两个分量。
+        auto rotary_cos = rotary_cos_.value();
+        auto rotary_sin = rotary_sin_.value();
+
+        // rotary 表由 kernel 读取，必须在 CUDA 上且 dtype 与 Q 一致。
+        CHECK_DEVICE(rotary_cos);
+        CHECK_DEVICE(rotary_sin);
+        TORCH_CHECK(rotary_cos.dtype() == q_dtype);
+        TORCH_CHECK(rotary_sin.dtype() == q_dtype);
+
+        // 最后一维连续，保证 rotary pair 的向量化读取。
+        TORCH_CHECK(rotary_cos.stride(-1) == 1);
+        TORCH_CHECK(rotary_sin.stride(-1) == 1);
+
+        // rotary 表的最后一维通常是 rotary_dim / 2，因为 cos/sin 各覆盖一半配对维。
+        params.rotary_dim = rotary_cos.size(1) * 2;
+
+        // rotary 只能覆盖 head 维的一部分或全部，不能超过实际 D。
+        TORCH_CHECK(params.rotary_dim <= head_size);
+
+        // 当前 kernel 只支持 rotary_dim 是 16 的倍数，方便向量化和 tile 对齐。
+        TORCH_CHECK(params.rotary_dim % 16 == 0);
+
+        // 写入 device 指针和布局标志，真正旋转在 split-KV kernel 中完成。
+        params.rotary_cos_ptr = rotary_cos.data_ptr();
+        params.rotary_sin_ptr = rotary_sin.data_ptr();
+        params.is_rotary_interleaved = is_rotary_interleaved;
+    } else {
+        // 没有 rotary 时显式置 0，kernel 可以直接跳过该分支。
+        params.rotary_dim = 0;
+    }
+
+    if (cache_batch_idx_.has_value()) {
+        // cache_batch_idx 把当前请求 batch 映射到 cache 中的行。
+        // 常见于 beam search 或复用 cache slot 的 decode 场景。
+        auto cache_batch_idx = cache_batch_idx_.value();
+        CHECK_DEVICE(cache_batch_idx);
+        TORCH_CHECK(cache_batch_idx.dtype() == torch::kInt32);
+        CHECK_CONTIGUOUS(cache_batch_idx);
+        CHECK_SHAPE(cache_batch_idx, batch_size);
+
+        // 保存 device int*，split kernel 通过它找到真正的 cache batch。
+        params.cache_batch_idx = static_cast<int*>(cache_batch_idx.data_ptr());
+    }
+
+    // KV cache 路径总是准备 split-KV 参数。即使最终 num_splits=1，
+    // 这套 split kernel 也承载了 append/cache_batch_idx/paged KV 的额外逻辑。
+    at::Tensor softmax_lse_accum, out_accum;
+    std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
+        params,
+        batch_size,
+        num_heads,
+        head_size,
+        seqlen_k,
+        seqlen_q,
+        head_size_rounded,
+        /*p_dropout=*/0.f,
+        num_splits,
+        get_num_sm(get_current_device()),
+        opts);
+
+    if (paged_KV) {
+        // paged KV 的页表指针在 split-KV 参数准备后补入。
+        auto block_table = block_table_.value();
+        params.block_table = block_table.data_ptr<int>();
+        params.block_table_batch_stride = block_table.stride(0);
+    }
+
+    // 普通 cache 为 1；paged cache 为每个物理 block 的 token 数。
+    params.page_block_size = page_block_size;
+
+    // 可选 ALiBi 位置偏置，同样通过 params 裸指针传给 kernel。
+    set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
+
+    // 使用 PyTorch 当前 CUDA stream，保持和外部 PyTorch op 的流语义一致。
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    // 只有 split-KV kernel 支持“更新 cache / cache_batch_idx / paged KV”这些额外能力。
+    // 因此只要出现其中任意一种，就强制 force_split_kernel。
+    run_mha_fwd(
+        params,
+        stream,
+        /*force_split_kernel=*/k_.has_value() ||
+            cache_batch_idx_.has_value() ||
+            paged_KV);
+
+    if (head_size != head_size_og) {
+        // kernel 看到的是 padded D，公开 API 返回原始 D。
+        out = out.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)});
+        if (out_.has_value()) {
+            // 如果调用方提供了 out_，需要把裁剪后的结果复制回调用方 storage。
+            out_.value().copy_(out);
+        }
+        if (k_.has_value()) {
+            // 若 cache 被 padding 过，追加后的 cache 也要裁回原始 D 并写回调用方 cache。
+            kcache.copy_(
+                kcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+            vcache.copy_(
+                vcache_padded.index({"...", torch::indexing::Slice(torch::indexing::None, head_size_og)}));
+        }
+    }
+    if (seqlenq_ngroups_swapped) {
+        // 把内部 `(B, G, Hkv, D)` 的输出还原为公开 API 的 `(B, 1, Hq, D)`。
+        out = out.transpose(1, 2)
+                 .reshape({batch_size, 1, num_heads_k * seqlen_q, head_size_og});
+
+        // LSE 同样恢复到 `(B, Hq, 1)`。
+        softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
+    }
+
+    // KV cache 前向只返回 out 和 LSE；没有 dropout p，也没有 rng_state。
+    return {out, softmax_lse};
+}
+```
+
+这条路径和定长输入最不一样的地方有三块：
+
+- **cache 长度不是 `seqlen_k` 本身**。普通 cache 的 `seqlen_k = kcache.size(1)` 是 cache 最大容量；如果传入 `seqlens_k_`，每条样本实际已使用长度来自 `seqlens_k[b]`。源码复用了 `params.cu_seqlens_k` 这个字段保存它，但马上用 `params.is_seqlens_k_cumulative = false` 告诉 kernel：“这里不是前缀和，而是每条样本的当前长度。”这个命名容易让人误会。
+- **`knew_ptr/vnew_ptr` 表示本轮新增 token**。如果传入 `k_/v_`，host 侧不会先单独调用一个 copy kernel 更新 cache，而是把 `knew/vnew` 指针、stride、`seqlen_knew` 都塞进 `Flash_fwd_params`。split-KV 前向 kernel 看到这些字段后，会按 `seqlens_k` 和可选 `cache_batch_idx/block_table` 把新 K/V 写进 cache，再基于更新后的 cache 做 attention。
+- **paged KV 的 table 是逻辑到物理的页表**。没有 `block_table` 时，第 `b` 条 cache 基本按 `kcache[b, token, head, dim]` 寻址；有 `block_table` 时，`kcache` 第一维是物理 block 编号，逻辑 token 先除以 `page_block_size` 得到逻辑 block，再查 `block_table[b, logical_block]` 得到物理 block。因此 paged KV 不能和 `cache_batch_idx`、`leftpad_k` 混用，代码里也直接检查了。
+- **decode GQA/MQA 的 `seqlenq_ngroups_swapped` 只在 host 侧改形状**。这条路径和定长 `mha_fwd` 一样，没有把该局部变量继续传进 `set_params_fprop`；真正显式写入 `params.seqlenq_ngroups_swapped` 的是上面的 `mha_varlen_fwd`。
+
+最终三条前向路径可以压成同一张控制流图：
+
+```mermaid
+flowchart TD
+    A["mha_fwd<br/>定长 (B, L, H, D)"] --> P["set_params_fprop<br/>基础 Q/K/V/O/LSE 字段"]
+    B["mha_varlen_fwd<br/>压平 token + cu_seqlens"] --> P
+    C["mha_fwd_kvcache<br/>cache + 可选 knew/vnew"] --> P
+    P --> E["补充路径特有字段<br/>splitkv / block_table / leftpad / rotary / cache_batch_idx"]
+    E --> R["run_mha_fwd(params, stream, force_split_kernel)"]
+    R --> K["普通 forward kernel 或 split-KV forward kernel"]
+```
+
+这也是 FlashAttention C++ API 封装层最核心的设计：**外部输入形式可以很多，但底层 kernel ABI 尽量固定为一个 `Flash_fwd_params`**。差异不是扩散到 kernel launch 参数列表里，而是被 host 侧提前整理成指针、stride、长度数组和几个布尔标志。
 
 ## Split-KV：用 K/V 维度换取 CTA 并行度
 
