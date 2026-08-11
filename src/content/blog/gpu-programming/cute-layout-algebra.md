@@ -1,3 +1,10 @@
+---
+title: CuTe Layout Algebra 笔记
+date: 2026-08-11
+tags: [CUDA, CuTe, CUTLASS, Layout, GPU 编程]
+summary: 整理 CuTe Layout 的核心布局代数。
+---
+
 # CuTe Layout Algebra：复合、补集、分块与平铺
 
 CuTe 把 `Layout` 看作**从逻辑坐标到物理偏移的函数**。设布局为 $L$，则可以把一次访问写成 $L(c)$：输入逻辑坐标 $c$，得到对应的内存偏移。
