@@ -363,6 +363,126 @@ class SchedulerOutput:
     num_spec_tokens_to_schedule: int = 0
 ```
 
+### `NewRequestData`：首次进入 worker 的初始化快照
+
+它的单位是**一个 request**。worker 还没有此 request 的 `CachedRequestState`，因此需要接收足以创建持久状态的 prompt、采样参数、LoRA、multimodal feature 和完整初始 block table。正常 V1 路径中它对应本轮 newly admitted request；V2 model runner 会把 resumed request 也编码成这一形式。
+
+```python
+@dataclass
+class NewRequestData:
+    # scheduler 与 worker 两侧使用的稳定请求标识。
+    req_id: str
+    # 文本 prompt token；使用 prompt embeds 时可能为 None。
+    prompt_token_ids: list[int] | None
+    # 多模态 feature 的描述及其在 token 序列中的位置。
+    mm_features: list[MultiModalFeatureSpec]
+    # 生成请求的采样配置；pooling 请求通常不使用它。
+    sampling_params: SamplingParams | None
+    # embedding / rerank 等 pooling 请求的配置；生成请求通常为 None。
+    pooling_params: PoolingParams | None
+    # 每个 KV cache group 的完整物理 block id 表，而非仅本轮新增 block。
+    block_ids: tuple[list[int], ...]
+    # 本轮 forward 开始前的计算前沿 C；worker 从该位置构造 query position / slot。
+    num_computed_tokens: int
+    # 请求绑定的 LoRA adapter；worker 据此把 request 放到正确的 LoRA batch。
+    lora_request: LoRARequest | None
+    # token ids 之外的 prompt embedding 输入，可用于多模态或 embedding prompt。
+    prompt_embeds: torch.Tensor | None = None
+    # 与 prompt 的逻辑位置对齐：每个位置是否由 token id 而非 embedding 提供。
+    prompt_is_token_ids: list[bool] | None = None
+
+    # 仅 V2 model runner 使用：初始化时额外传当前完整 token 序列（字段名沿用 prefill）。
+    prefill_token_ids: list[int] | None = None
+```
+
+`NewRequestData.from_request()` 基本是一次字段投影：它从 `Request` 取静态输入与调度前的 `num_computed_tokens`，调用者提供 `block_ids`。它不携带 `num_scheduled_tokens`，因为后者是 batch 级 map，统一放在 `SchedulerOutput`。
+
+### `CachedRequestData`：已有 worker 状态的按列增量包
+
+它不是 `list[CachedRequestData]`，而是 **struct of arrays（按列组织）**：`req_ids[i]` 描述第 `i` 个更新对象，其余 list 的第 `i` 项都必须属于同一个 request。worker 用 `enumerate(req_ids)` 逐行取出数据，再将各列更新到 persistent batch 的 tensor / block table。
+
+```python
+@dataclass
+class CachedRequestData:
+    # 第 i 个增量对象的 request id；其余按 request 的 list 都以 i 对齐。
+    req_ids: list[str]
+
+    # 被抢占后恢复的 request id 集合。
+    # 这些 request 的 new_block_ids 是“完整替换旧表”，不是“追加到旧表”。
+    resumed_req_ids: set[str]
+
+    # 仅 pipeline parallelism 使用：把上一轮 sampled token 送回其它 PP stage。
+    # 非 PP 时整个 list 为空；存在时 new_token_ids[i] 与 req_ids[i] 对齐。
+    new_token_ids: list[list[int]]
+
+    # req_id -> 完整 token 序列副本。
+    # 仅未在上一调度步执行的 request 放入，用于 connector 或 async 恢复状态。
+    all_token_ids: dict[str, list[int]]
+
+    # 第 i 个 request 本步新增 KV block ids；None 表示本步无需更新 block table。
+    # 普通 running request：worker 将其 append 到已有 block_ids。
+    # resumed request：worker 用它整体替换已有 block_ids。
+    new_block_ids: list[tuple[list[int], ...] | None]
+
+    # 第 i 个 request 在本轮 forward 开始前的计算前沿 C。
+    num_computed_tokens: list[int]
+
+    # 第 i 个 request 已确认输出数加 async placeholders。
+    # worker 用它判断 context phase（为 0）以及回滚 / 补齐 output_token_ids。
+    num_output_tokens: list[int]
+```
+
+可以把它理解成下表。`i` 是唯一连接键；这个对齐不变量比字段名更重要：
+
+| 第 `i` 行 | 含义 |
+| --- | --- |
+| `req_ids[i]` | 本次更新哪个 worker 侧 `CachedRequestState`。 |
+| `num_computed_tokens[i]` | worker 本轮从哪个逻辑 token 位置开始准备输入与 KV slot。它是 **schedule 后乐观推进之前** 的 `C`。 |
+| `new_block_ids[i]` | 普通 running request 追加的 block 差量；`req_ids[i] in resumed_req_ids` 时则是重建后的完整 block table。 |
+| `new_token_ids[i]` | 只给 PP 的其它 stage 补传 sampled token；不是普通 decode / spec decode 的主输入。 |
+| `num_output_tokens[i]` | 已确认 output 加 placeholder 的长度快照；用于同步 worker 的 output token 状态。 |
+| `all_token_ids[req_ids[i]]` | 只有该 request 未在上一步调度时才可能存在；async 恢复时 worker 可用它重建 output token 后缀，connector 也可拿到完整序列。 |
+
+`Scheduler._make_cached_request_data()` 正是构造这个“按列增量包”的地方。下面摘录其核心赋值，保留与字段语义直接相关的分支：
+
+```python
+for idx, req in enumerate(itertools.chain(running_reqs, resumed_reqs)):
+    # 每一轮循环只处理一个 request；后续每个 list 都 append 一项以保持 i 对齐。
+    req_id = req.request_id
+    req_ids.append(req_id)
+
+    # PP 且非 async 时，scheduler 需要显式补传上一轮 sampled token。
+    if self.use_pp and not self.scheduler_config.async_scheduling:
+        num_tokens = num_scheduled_tokens[req_id] - len(
+            spec_decode_tokens.get(req_id, ())
+        )
+        token_ids = req.all_token_ids[
+            req.num_computed_tokens : req.num_computed_tokens + num_tokens
+        ]
+        new_token_ids.append(token_ids)
+
+    # resumed_reqs 位于 chain 的后半段；它们的 block table 要整体替换。
+    scheduled_in_prev_step = req_id in self.prev_step_scheduled_req_ids
+    if idx >= num_running_reqs:
+        assert not scheduled_in_prev_step
+        resumed_req_ids.add(req_id)
+
+    # 未在上一轮执行时，附完整 token 序列，供 connector / async 恢复路径使用。
+    if not scheduled_in_prev_step:
+        all_token_ids[req_id] = req.all_token_ids.copy()
+
+    # allow_none=True 让“没有新增 block”编码为 None。
+    new_block_ids.append(
+        req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+    )
+    # 记录 forward 前的 C，不能换成 _update_after_schedule 后的乐观值。
+    num_computed_tokens.append(req.num_computed_tokens)
+    # placeholder 同样影响 worker 看到的输出长度。
+    num_output_tokens.append(
+        req.num_output_tokens + req.num_output_placeholders
+    )
+```
+
 ### 为什么区分新请求与旧请求
 
 `NewRequestData.from_request()` 发送 prompt、multimodal features、采样参数、LoRA 和完整 block id；worker 据此建立持久 `CachedRequestState`。之后同一请求只用 `CachedRequestData` 发送变更，避免每步重传大段 prompt。
