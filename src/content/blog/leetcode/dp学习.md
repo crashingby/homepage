@@ -11733,3 +11733,412 @@ else:
 ```
 
 如果 583 和 712 是“只能删，所以要保留共同部分”，那 72 就是“能改能补，所以要直接模拟两个前缀之间的最短编辑过程”。
+
+## [1458. 两个子序列的最大点积 - 力扣（LeetCode）](https://leetcode.cn/problems/max-dot-product-of-two-subsequences/description/)
+
+给你两个数组 `nums1` 和 `nums2`。
+
+请返回 `nums1` 和 `nums2` 中两个长度相同的**非空子序列**的最大点积。
+
+数组的非空子序列，是通过删除原数组中某些元素后剩余数字组成的序列，但不能改变数字间相对顺序。
+
+示例 1：
+
+```text
+输入：nums1 = [2,1,-2,5], nums2 = [3,0,-6]
+输出：18
+解释：
+从 nums1 中得到子序列 [2,-2]，从 nums2 中得到子序列 [3,-6]。
+点积为 2 * 3 + (-2) * (-6) = 18。
+```
+
+示例 2：
+
+```text
+输入：nums1 = [3,-2], nums2 = [2,-6,7]
+输出：21
+解释：
+从 nums1 中得到子序列 [3]，从 nums2 中得到子序列 [7]。
+点积为 3 * 7 = 21。
+```
+
+示例 3：
+
+```text
+输入：nums1 = [-1,-1], nums2 = [1,1]
+输出：-1
+解释：
+从 nums1 中得到子序列 [-1]，从 nums2 中得到子序列 [1]。
+点积为 -1。
+```
+
+提示：
+
+- `1 <= nums1.length, nums2.length <= 500`
+- `-1000 <= nums1[i], nums2[i] <= 1000`
+
+### 题目如何识别成双序列 DP？
+
+这题和 LCS 有同一个骨架：
+
+> 从两个数组中分别选一个子序列，并且保持相对顺序。
+
+所以仍然是两个前缀状态：
+
+- `nums1` 的前一段。
+- `nums2` 的前一段。
+
+每一步都在想：
+
+> 当前 `nums1[row]` 和 `nums2[col]` 要不要配成一对？
+
+它和 LCS 的区别在于：
+
+- LCS 中，两个字符相等才能配对，配对收益是 `+1`。
+- 这题中，任意两个数字都能配对，配对收益是 `nums1[row] * nums2[col]`。
+
+但是这题有一个额外坑点：**两个子序列必须非空**。
+
+如果把 DP 默认初始化成 0，就会在示例 3 中出错：
+
+```text
+nums1 = [-1, -1]
+nums2 = [1, 1]
+```
+
+所有合法点积都是负数，答案应该是 `-1`。如果允许空子序列，空点积会是 0，就会错误地返回 0。
+
+所以这题必须显式区分“还没有选任何一对”和“已经选了非空子序列”。
+
+### 递归切入（配对逻辑）
+
+定义 `dfs(i, j)` 表示：
+
+> 从 `nums1[0..i]` 和 `nums2[0..j]` 中，各选一个长度相同的非空子序列，能得到的最大点积。
+
+站在 `nums1[i]` 和 `nums2[j]` 面前，有几种选择：
+
+- **跳过 `nums1[i]`**：答案来自 `dfs(i - 1, j)`。
+- **跳过 `nums2[j]`**：答案来自 `dfs(i, j - 1)`。
+- **把 `nums1[i]` 和 `nums2[j]` 配成一对**：
+  - 可以只选这一对，点积是 `nums1[i] * nums2[j]`。
+  - 也可以接在之前已经选好的非空子序列后面，点积是 `dfs(i - 1, j - 1) + nums1[i] * nums2[j]`。
+
+这里“只选这一对”非常关键，因为它保证了答案可以从一个非空配对开始。
+
+递归边界：
+
+- 如果 `i < 0` 或 `j < 0`，说明至少有一个数组已经没有元素，无法组成非空配对，返回无效小值 `kInvalid`。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求两个非空子序列的最大点积。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个长度相同的非空子序列的最大点积。
+     */
+    int maxDotProduct(vector<int>& nums1, vector<int>& nums2) {
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        return dfs(nums1, nums2, memo, rows - 1, cols - 1);
+    }
+
+private:
+    static constexpr int kInvalid = -1000000000;
+    static constexpr int kUnknown = 1000000001;
+
+    int dfs(
+        const vector<int>& nums1,
+        const vector<int>& nums2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0 || col < 0) {
+            return kInvalid;
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        const int product = nums1[row] * nums2[col];
+        const int previous = dfs(nums1, nums2, memo, row - 1, col - 1);
+        const int take_pair = max(product, previous + product);
+
+        cached = max({
+            dfs(nums1, nums2, memo, row - 1, col),
+            dfs(nums1, nums2, memo, row, col - 1),
+            take_pair,
+        });
+
+        return cached;
+    }
+};
+```
+
+这个递归里，`product` 单独参与 `max`，含义是“从当前这一对开始一个新的非空子序列”。如果少了这一项，状态就很难从空状态正确启动。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> 从 `nums1` 的前 `row + 1` 个元素，和 `nums2` 的前 `col + 1` 个元素中，各选一个长度相同的非空子序列，能得到的最大点积。
+
+也可以写成：
+
+`dp[i][j]` 表示：
+
+> 从 `nums1` 的前 `i` 个元素，和 `nums2` 的前 `j` 个元素中，各选一个长度相同的非空子序列，能得到的最大点积。
+
+最终答案是：
+
+$$
+dp[nums1.size()][nums2.size()]
+$$
+
+### 状态转移
+
+处理真实元素 `nums1[row]` 和 `nums2[col]`。
+
+先计算当前配对收益：
+
+$$
+product = nums1[row] \times nums2[col]
+$$
+
+对于 `dp[row + 1][col + 1]`，有三类选择：
+
+- 跳过 `nums1[row]`：`dp[row][col + 1]`
+- 跳过 `nums2[col]`：`dp[row + 1][col]`
+- 让 `nums1[row]` 和 `nums2[col]` 配对：
+  - 只选当前这一对：`product`
+  - 接在之前的配对后面：`dp[row][col] + product`
+
+合起来：
+
+$$
+dp[row + 1][col + 1] =
+\max(
+dp[row][col + 1],\
+dp[row + 1][col],\
+product,\
+dp[row][col] + product
+)
+$$
+
+也可以把后两项写成：
+
+$$
+\max(0,\ dp[row][col]) + product
+$$
+
+但在学习阶段，把 `product` 单独写出来更直观：它就是“只选当前一对”的非空起点。
+
+### 初始化
+
+因为题目要求非空子序列，所以不能让第 0 行、第 0 列为 0。
+
+- `dp[0][j] = kInvalid`：`nums1` 为空，无法选出非空子序列。
+- `dp[i][0] = kInvalid`：`nums2` 为空，无法选出非空子序列。
+
+整个 `dp` 可以初始化为一个足够小的无效值 `kInvalid`。
+
+这里和 LCS 最大的区别就是：
+
+- LCS 可以让空子序列长度为 0。
+- 这题不能把空子序列当作合法答案。
+
+### 遍历顺序
+
+每个状态依赖：
+
+- 上方：`dp[row][col + 1]`
+- 左方：`dp[row + 1][col]`
+- 左上：`dp[row][col]`
+
+所以仍然从左到右、从上到下遍历。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求两个非空子序列的最大点积。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个长度相同的非空子序列的最大点积。
+     */
+    int maxDotProduct(vector<int>& nums1, vector<int>& nums2) {
+        constexpr int kInvalid = -1000000000;
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, kInvalid));
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                const int product = nums1[row] * nums2[col];
+
+                // 当前这一对可以单独作为非空子序列，也可以接在左上角之后。
+                const int take_pair = max(product, dp[row][col] + product);
+
+                dp[row + 1][col + 1] = max({
+                    dp[row][col + 1],
+                    dp[row + 1][col],
+                    take_pair,
+                });
+            }
+        }
+
+        return dp[rows][cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums1.size() \times nums2.size())$。
+- 空间复杂度：$O(nums1.size() \times nums2.size())$。
+
+### 为什么不能初始化为 0？
+
+这题的坑几乎都在“非空”两个字上。
+
+如果把 `dp` 初始化为 0，那么当所有合法点积都是负数时，DP 会选择“什么都不选”的 0。
+
+例如：
+
+```text
+nums1 = [-1, -1]
+nums2 = [1, 1]
+```
+
+所有配对乘积都是 `-1`，合法答案必须是 `-1`。如果空子序列被允许，才会得到 0。
+
+所以这里必须用无效小值初始化，并且让 `product` 单独进入转移：
+
+```cpp
+const int take_pair = max(product, dp[row][col] + product);
+```
+
+其中：
+
+- `product`：从当前这一对开始，保证非空。
+- `dp[row][col] + product`：接在之前已经形成的非空子序列后面。
+
+### 空间优化
+
+二维转移依赖：
+
+- 上方：旧的 `dp[col + 1]`
+- 左方：当前行的 `dp[col]`
+- 左上：旧的 `dp[col]`
+
+所以一维压缩仍然需要 `prev_diagonal` 保存左上角旧值。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求两个非空子序列的最大点积。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个长度相同的非空子序列的最大点积。
+     */
+    int maxDotProduct(vector<int>& nums1, vector<int>& nums2) {
+        constexpr int kInvalid = -1000000000;
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<int> dp(cols + 1, kInvalid);
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = kInvalid;
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方状态；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+                const int product = nums1[row] * nums2[col];
+                const int take_pair = max(product, prev_diagonal + product);
+
+                dp[col + 1] = max({
+                    old_up,
+                    dp[col],
+                    take_pair,
+                });
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return dp[cols];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums1.size() \times nums2.size())$。
+- 空间复杂度：$O(nums2.size())$。
+
+### 和 LCS 的对照
+
+这题可以看成 LCS 的“带收益配对版本”。
+
+| 题目 | 配对条件 | 配对收益 | 空子序列是否合法 |
+| --- | --- | --- | --- |
+| 1143. 最长公共子序列 | 字符相等才能配对 | `+1` | 合法，长度为 0 |
+| 1458. 两个子序列的最大点积 | 任意两个数字都能配对 | `nums1[row] * nums2[col]` | 不合法 |
+
+因此 1458 的状态仍然是两个前缀，但转移多了一层“要不要把两个尾元素配成一对”的选择。
+
+### 这题的核心手感
+
+1458 的核心，是在两个数组前缀之间维护“已经选了非空配对”的最大点积。
+
+每个位置都有三种大方向：
+
+- 跳过 `nums1[row]`。
+- 跳过 `nums2[col]`。
+- 把 `nums1[row]` 和 `nums2[col]` 配成一对。
+
+配成一对时又有两个细节：
+
+- **只选当前这一对**：`product`
+- **接在之前的配对后面**：`dp[row][col] + product`
+
+所以最重要的转移是：
+
+```text
+product = nums1[row] * nums2[col]
+take_pair = max(product, dp[row][col] + product)
+
+dp[row + 1][col + 1] = max(
+    dp[row][col + 1],
+    dp[row + 1][col],
+    take_pair
+)
+```
+
+如果你看到“两个子序列、保持相对顺序、要做最优配对”，就应该先想到 LCS 这张二维前缀表；然后再根据题目要求，把“相等才配对 +1”改成当前题目的配对收益。

@@ -1,11 +1,11 @@
 ---
-title: FlashAttention-2 源码学习笔记（四）：进入 Forward Kernel 前的专用接口
+title: FlashAttention-2 源码学习笔记（四）：Forward Kernel 的专用接口与主计算循环
 date: 2026-08-12
 tags: [FlashAttention, CUDA, C++, CUTLASS, CuTe, GPU 编程, Attention]
-summary: 在逐句进入 compute_attn_1rowblock 前，整理 forward kernel 使用的专用状态对象和 device 接口：序列边界、mask、dropout、online softmax、搬运与两次 GEMM。
+summary: 先整理 forward kernel 使用的专用状态对象和 device 接口，再完整追踪 compute_attn_1rowblock 如何对一个 Q tile 遍历全部可见 K/V tile，完成 online softmax、PV 累加、O 与 LSE 写回。
 ---
 
-# FlashAttention-2 源码学习笔记（四）：进入 Forward Kernel 前的专用接口
+# FlashAttention-2 源码学习笔记（四）：Forward Kernel 的专用接口与主计算循环
 
 [[flash-attn-3#先给结论：FA2 没有保存完整 $P$，但保存了足够的三类状态|上一篇]]已经确定了 forward 的数学主线：对一个 Q tile，沿 K/V 轴扫描，在线维护每行的 $m_i$、$\ell_i$、$u_{i,:}$，最后得到 $O_{i,:}=u_{i,:}/\ell_i$。
 
@@ -15,9 +15,9 @@ summary: 在逐句进入 compute_attn_1rowblock 前，整理 forward kernel 使�
 flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h
 ```
 
-但暂时**不逐句展开** `compute_attn_1rowblock`。该函数同时出现 CuTe layout、异步拷贝、两次 Tensor Core GEMM、边界 mask、dropout 和 online softmax；若不先认识它调用的专用接口，很容易把“数据视图变化”误读为“数学状态变化”。
+`compute_attn_1rowblock` 同时出现 CuTe layout、异步拷贝、两次 Tensor Core GEMM、边界 mask、dropout 和 online softmax。本文先介绍它使用的专用接口，再在文末沿真实控制流完整展开这个函数；这样进入主循环时，就不会把“数据视图变化”误读为“数学状态变化”。
 
-本文先建立一张接口词典。默认读者已经了解 CuTe 的 `Tensor`、`local_tile`、`partition_*`、`retile_*` 和 `cute::copy`：它们出现时只说明**这次视图或搬运的逻辑意图**，不重复讲 CuTe 本身。
+默认读者已经了解 CuTe 的 `Tensor`、`local_tile`、`partition_*`、`retile_*` 和 `cute::copy`：它们出现时只说明**这次视图或搬运的逻辑意图**，不重复讲 CuTe 本身。
 
 > 数学符号完全沿用 [[flash-attn-3#全文记号以这里为准|FA3 的统一记号]]。特别地：`acc_s` 在进入 `softmax_rescale_o` 前是 raw score $r$，之后原地变成当前 tile 的稳定指数权重 $E$；`acc_o` 对应未归一化输出分子 $u$。
 
@@ -806,6 +806,163 @@ if (Is_dropout) {
 }
 ```
 
+## 从 MMA accumulator 看线程负责的 score 区域
+
+在进入 softmax / mask 之前，需要先知道 `acc_s` 这个 fp32 accumulator fragment 的线程划分。否则后面的 `lane_id % 4`、`(tidx % 32) / 4`、`warp_row_stride` 都很难直觉化。
+
+这里不重新讲 CuTe，只把 FA forward 这条路径用到的 MMA 形状代入一下。`Flash_kernel_traits` 在 sm80+ 上选用的 MMA atom 是：
+
+```cpp
+/**
+ * @brief sm80+ forward 使用的 Tensor Core MMA atom。
+ *
+ * SM80_16x8x16_F32F16F16F32_TN 表示：
+ * - 一个 warp-level MMA atom 产生 16 x 8 的 fp32 accumulator tile；
+ * - K 方向一次吃 16；
+ * - 输入是 fp16/fp16，输出累加到 fp32。
+ */
+using MMA_Atom_Arch = MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>;
+```
+
+对这个 atom，可以用下面的简化心智模型看每个 warp 的 accumulator：
+
+- 一个 warp 的一个 MMA atom 覆盖 $16\times8$ 的 `acc_s`。
+- 32 个 lane 分成 8 个 row group，每组 4 个 lane。
+- 一个 lane 在这个 $16\times8$ atom 中负责同一行的 2 个 N 向元素。
+- 同一个 lane 还负责第二行，第二行与第一行相隔 8 行。
+
+因此 warp 内的 row 坐标可以拆成：
+
+$$
+\text{row within warp}
+=
+\frac{\texttt{lane\_id}}{4}
++ i\cdot 8,\qquad i\in\{0,1\}.
+$$
+
+而 N 向列坐标可以拆成：
+
+$$
+\text{col within 8-col atom}
+=
+(\texttt{lane\_id}\bmod 4)\cdot2+j,\qquad j\in\{0,1\}.
+$$
+
+然后 forward traits 又把 atom 组装成 `TiledMma`：
+
+```cpp
+/**
+ * @brief forward QK^T / PV 使用的 tiled MMA 组织。
+ *
+ * Layout<Shape<Int<kNWarps>, _1, _1>> 表示 warp group 只沿 M 方向排列：
+ * - warp 0 负责当前 MMA tile 的第 0..15 行；
+ * - warp 1 负责第 16..31 行；
+ * - warp w 负责第 16w..16w+15 行。
+ *
+ * Tile<Int<16 * kNWarps>, _16, _16> 表示：
+ * - M 方向一次覆盖 16 * kNWarps 行；
+ * - N 方向一次覆盖 16 列；
+ * - K 方向一次覆盖 16。
+ *
+ * 注意：atom 的 N 是 8，而这里 tile 的 N 是 16，所以 N 方向有两个 8-col atom。
+ */
+using TiledMma = TiledMMA<
+    typename Base::MMA_Atom_Arch,
+    Layout<Shape<Int<kNWarps>, _1, _1>>,
+    Tile<Int<16 * kNWarps>, _16, _16>>;
+```
+
+这就解释了为什么一个 lane 在 row/col view 里会看到 4 个 N 向元素：一个 `SM80_16x8x16` atom 给它 2 个元素，`TiledMma` 的 N 方向从 8 扩到 16，相当于重复两个 N atom，所以变成 4 个元素。
+
+用代码里的列坐标公式看就是：
+
+```cpp
+const int lane_id = threadIdx.x % 32;
+const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+
+for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+    const int col_idx_base = col_idx_offset + nj * 8;
+    for (int j = 0; j < size<1, 0>(tensor); ++j) {
+        const int col_idx = col_idx_base + j;
+    }
+}
+```
+
+代入后：
+
+$$
+k
+=\texttt{col\_idx\_offset\_}
++(\texttt{lane\_id}\bmod4)\cdot2
++nj\cdot8+j.
+$$
+
+其中 `j` 负责 lane 内的 2 列，`nj` 负责两个 8-col atom。于是同一行的 16 个 N 列由 4 个 lane 合作覆盖：
+
+```text
+lane%4 = 0: col 0,1   和 col 8,9
+lane%4 = 1: col 2,3   和 col 10,11
+lane%4 = 2: col 4,5   和 col 12,13
+lane%4 = 3: col 6,7   和 col 14,15
+```
+
+这也是 softmax 规约里使用 `Allreduce<4>` 的原因：**一条 query row 在一个 16-col MMA tile 内由 4 个 lane 分摊 N 向元素**。先每个 lane 在自己的寄存器里规约，再用 4-lane quad 合并，正好得到这一行的完整 row max。
+
+Q 行坐标也同理。`Mask::apply_mask` 的调用点传入：
+
+```cpp
+mask.template apply_mask<Is_causal, Is_even_MN>(
+    acc_s,
+    n_block * kBlockN,
+    m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+    kNWarps * 16);
+```
+
+其中 `row_idx_offset` 的三项分别是：
+
+| 表达式 | 含义 |
+| --- | --- |
+| `m_block * kBlockM` | 当前 CTA 在 Q 方向的全局 block 起点。 |
+| `(tidx / 32) * 16` | 当前 warp 在 CTA 内负责的 16 行起点；warp 按 M 方向排列。 |
+| `(tidx % 32) / 4` | 当前 lane 所在的 row group；4 个 lane 一组负责同一行。 |
+
+`row_idx_offset` 只给出这个线程负责的第一条 row。真正访问 `tensor(make_coord(i,mi),...)` 时，还会加上：
+
+```cpp
+const int row_idx_base = row_idx_offset + mi * warp_row_stride;
+const int row_idx = row_idx_base + i * 8;
+```
+
+这里 `i * 8` 对应前面说的“一个 lane 负责两行，第二行相隔 8 行”。剩下最容易误解的是：
+
+```cpp
+warp_row_stride = kNWarps * 16;
+```
+
+它不是 warp 内的 stride，而是 **同一线程在 `MMA_M` 重复块之间的 Q 行跨度**。`TiledMma` 的一个 M 向 tiled MMA 覆盖 `16 * kNWarps` 行；如果 `kBlockM` 更大，CuTe 的 accumulator layout 会在 M 方向再出现多个 `MMA_M` 重复块。`mi` 每加 1，就跳到下一组完整的 `16 * kNWarps` 行，所以：
+
+$$
+\texttt{warp\_row\_stride}=16\cdot\texttt{kNWarps}.
+$$
+
+例如 `kNWarps=4` 时，`warp_row_stride=64`：
+
+- 若 `kBlockM=64`，通常只有一个 `mi` 组，`mi * 64` 不显眼。
+- 若 `kBlockM=128`，同一个线程会在 `mi=0` 和 `mi=1` 两个 M 重复块里各持有一组 rows；第二组 row 比第一组整体下移 64 行。
+
+于是完整 Q row 公式是：
+
+$$
+q
+=m_{\mathrm{block}}\cdot kBlockM
++\left\lfloor\frac{\texttt{tidx}}{32}\right\rfloor\cdot16
++\left\lfloor\frac{\texttt{tidx}\bmod32}{4}\right\rfloor
++mi\cdot(16\cdot kNWarps)
++i\cdot8.
+$$
+
+这套映射就是后面 `apply_mask`、`reduce_max`、`reduce_sum` 都围绕的线程视角：每个 lane 持有若干 `(q,k)` score 元素；同一 row 的 N 向元素由 4-lane quad 合作覆盖；跨 `mi` 时才跳过一整组 `16*kNWarps` 行。
+
 ## softmax 基础算子：row 规约与指数变换
 
 `Softmax<kNRows>` 里面频繁调用：
@@ -1397,23 +1554,61 @@ $$
 | `FLASH_NAMESPACE::apply_mask` | `mask.h` 的自由函数 | 只按 `col_idx >= max_seqlen_k` 屏蔽 K 尾部越界列。 |
 | `Mask<...>::apply_mask` | `Mask` 成员函数 | 统一处理 ALiBi、causal、local window 与非整 tile 边界；forward 主路径调用它。 |
 
-自由函数的真实原型如下；它是较窄的尾块工具，在没有 causal/local/ALiBi 时也可单独使用：
+### 自由函数 `apply_mask`：只处理 K 尾部越界
+
+自由函数是最窄的一种 mask：它不关心 Q 行，也不处理 causal/local/ALiBi，只根据 K 列号是否越过 `max_seqlen_k` 来写 `-INFINITY`。
 
 ```cpp
 /**
- * @brief 将当前寄存器 score tile 中列号不小于 max_seqlen_k 的元素原地设为 -INFINITY。
+ * @brief 将当前 score tile 中 K 列越界的位置写成 -INFINITY。
  *
- * @param tensor [in,out] 已转换成逻辑 row/column 视图的 score fragment。
- * @param max_seqlen_k [in] 当前 batch 的有效 K token 数。
- * @param col_idx_offset_ [in] 本 tile 的 K 列全局起点，默认 0。
+ * @tparam Engine CuTe tensor 的底层存储类型。
+ * @tparam Layout CuTe tensor 的 layout 类型；要求已经是 row/column 视图。
+ * @param tensor [in,out] 当前线程寄存器中的 score fragment，逻辑形状为
+ *                         (nrow=(2,MMA_M), ncol=(2,MMA_N))。
+ * @param max_seqlen_k [in] 当前 batch 的有效 K 长度。
+ * @param col_idx_offset_ [in] 当前 K tile 的全局列起点，通常是 n_block * kBlockN。
  */
 template<typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask(
-    Tensor<Engine, Layout>& tensor, const int max_seqlen_k,
-    const int col_idx_offset_ = 0);
+        Tensor<Engine, Layout> &tensor,
+        const int max_seqlen_k,
+        const int col_idx_offset_ = 0) {
+    // tensor 已经是 row/col 视图；这里只按列处理，所以要求 rank=2。
+    static_assert(Layout::rank == 2, "Only support 2D Tensor");
+
+    // 当前 CUDA thread 在 warp 内的 lane id。
+    const int lane_id = threadIdx.x % 32;
+
+    // 每个 4-lane quad 分摊一组连续 K 列。
+    // lane%4=0 负责 col + 0/1，lane%4=1 负责 col + 2/3，以此类推。
+    const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+
+    #pragma unroll
+    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+        // nj 每加 1，跳到下一组 8 列。
+        const int col_idx_base = col_idx_offset + nj * 8;
+
+        #pragma unroll
+        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+            const int col_idx = col_idx_base + j;
+
+            // 当前列超过有效 K 长度，则这一列对所有 row 都不可见。
+            if (col_idx >= max_seqlen_k) {
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                    // make_coord(j,nj) 用于索引嵌套的 ncol=(2,MMA_N) 坐标。
+                    tensor(mi, make_coord(j, nj)) = -INFINITY;
+                }
+            }
+        }
+    }
+}
 ```
 
 ### `Mask<Is_causal, Is_local, Has_alibi>`
+
+forward 主路径使用的是 `Mask` 成员函数。它的参数更容易让人晕，因为它要从“当前线程持有的寄存器 fragment”反推出每个元素对应的全局 Q/K token 坐标。
 
 ```cpp
 /**
@@ -1464,11 +1659,28 @@ struct Mask {
 };
 ```
 
-在 forward kernel 中的构造与调用是：
+这些参数可以先按“谁决定行、谁决定列、谁决定规则”来记：
+
+| 参数 | 来源 | 含义 |
+| --- | --- | --- |
+| `tensor_` | `acc_s` | 当前线程寄存器里的 score fragment，原始 layout 是 `(MMA=4,MMA_M,MMA_N)`。 |
+| `col_idx_offset_` | `n_block * kBlockN` | 当前 K tile 的全局列起点。 |
+| `row_idx_offset` | `m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4` | 当前线程所负责 Q 行组的全局行起点。 |
+| `warp_row_stride` | `kNWarps * 16` | 同一个线程 fragment 中相邻 `mi` 行组对应的全局 Q 行跨度。 |
+| `max_seqlen_k` | `binfo.actual_seqlen_k` | 当前 batch 的有效 K 长度，用于尾部越界和右边界。 |
+| `max_seqlen_q` | `binfo.actual_seqlen_q` | 当前 batch 的有效 Q 长度，用于 Q/K 长度不等时的 causal/local 对齐。 |
+| `window_size_left/right` | params | local attention 的左右窗口。 |
+| `alibi_slope` | params | 当前 `(batch,head)` 的 ALiBi 斜率；host 已经除过 `scale_softmax`，所以这里可以加到 raw score 上。 |
+
+调用点是：
 
 ```cpp
-// 注意：先除 scale，再把 ALiBi 加进 raw acc_s；后续 softmax 再乘 scale，
-// 因而最终 x 中的 bias 仍恰为用户给定的 slope。
+/**
+ * @brief 构造当前 CTA 的 mask 规则，并对当前 score tile 原地应用。
+ *
+ * ALiBi slope 先除以 params.scale_softmax，是因为 acc_s 此时还在 raw score 坐标；
+ * 后续 softmax 会统一乘 params.scale_softmax，最终 bias 恢复成用户语义。
+ */
 const float alibi_slope =
     !Has_alibi || params.alibi_slopes_ptr == nullptr
         ? 0.0f
@@ -1480,12 +1692,225 @@ FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(
     binfo.actual_seqlen_k, binfo.actual_seqlen_q,
     params.window_size_left, params.window_size_right, alibi_slope);
 
-// 当前 n_block 的 K 列起点，以及当前线程所代表 Q 行的起点。
+// col_idx_offset_ 是当前 K tile 的列起点。
+// row_idx_offset 是当前线程所代表 Q row 子块的行起点。
 mask.template apply_mask<Is_causal, Is_even_MN>(
     acc_s, n_block * kBlockN,
     m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
     kNWarps * 16);
 ```
+
+### `Mask::apply_mask` 的完整实现
+
+下面是成员函数的实现，注释按执行路径加在源码里：
+
+```cpp
+/**
+ * @brief 原地加入 ALiBi，并把不可见 score 写成 -INFINITY。
+ *
+ * @tparam Causal_mask 当前 K/V 迭代是否需要 causal mask。
+ *                      即使类模板 Is_causal=true，某些已知全可见的 n_block 也可跳过。
+ * @tparam Is_even_MN 当前 Q/K tile 是否保证不越界；false 时要检查 K 尾部。
+ * @tparam Engine acc_s 的 CuTe tensor engine。
+ * @tparam Layout acc_s 的 CuTe tensor layout。
+ * @param tensor_ [in,out] 原始 MMA accumulator fragment，形状为 (MMA=4,MMA_M,MMA_N)。
+ * @param col_idx_offset_ [in] 当前 K tile 的全局列起点。
+ * @param row_idx_offset [in] 当前线程负责的第一个 Q row 全局下标。
+ * @param warp_row_stride [in] 相邻 warp row 组之间的全局 Q 行跨度。
+ */
+template<bool Causal_mask=false, bool Is_even_MN=true,
+         typename Engine, typename Layout>
+__forceinline__ __device__ void apply_mask(
+        Tensor<Engine, Layout> &tensor_,
+        const int col_idx_offset_,
+        const int row_idx_offset,
+        const int warp_row_stride) {
+    // 一次调用不能同时走 causal 和 local；二者的可见区间定义不同。
+    static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
+
+    // 入口 acc_s 仍是 MMA fragment layout。
+    static_assert(Layout::rank == 3, "Only support 3D Tensor");
+    static_assert(decltype(size<0>(tensor_))::value == 4,
+                  "First dimension must be 4");
+
+    // 编译期判断：如果没有 ALiBi、没有 causal/local、且 tile 完整，
+    // 整个函数体会被 if constexpr 消掉。
+    static constexpr bool Need_masking =
+        Has_alibi || Causal_mask || Is_local || !Is_even_MN;
+
+    if constexpr (Need_masking) {
+        // 将 (MMA=4,MMA_M,MMA_N) 改看成
+        // (nrow=(2,MMA_M), ncol=(2,MMA_N))，方便按 row/col 坐标 mask。
+        Tensor tensor = make_tensor(
+            tensor_.data(),
+            FLASH_NAMESPACE::convert_layout_acc_rowcol(tensor_.layout()));
+
+        // 如果只需要列坐标，就可以省掉 row_idx 计算。
+        // 典型场景：只做 K 尾部越界，或 causal ALiBi 的 row 无关形式。
+        static constexpr bool Col_idx_only =
+            !(Has_alibi && !Is_causal) && !Is_local && !Causal_mask;
+
+        const int lane_id = threadIdx.x % 32;
+
+        // 每个 4-lane quad 覆盖一组 8 个 K 列：
+        // lane%4=0 -> 列 0/1，lane%4=1 -> 列 2/3，
+        // lane%4=2 -> 列 4/5，lane%4=3 -> 列 6/7。
+        const int col_idx_offset =
+            col_idx_offset_ + (lane_id % 4) * 2;
+
+        if constexpr (Col_idx_only) {
+            #pragma unroll
+            // 遍历(2,MMA_N) 中的 MMA_N
+            for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                const int col_idx_base = col_idx_offset + nj * 8;
+
+                #pragma unroll
+                // 遍历(2,MMA_N) 中的 2
+                for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                    const int col_idx = col_idx_base + j;
+
+                    #pragma unroll
+                    // 遍历整个 nrow
+                    for (int mi = 0; mi < size<0>(tensor); ++mi) {
+                        // causal 场景下的 ALiBi 可写成只依赖 col_idx 的形式。
+                        if constexpr (Has_alibi) {
+                            tensor(mi, make_coord(j, nj)) +=
+                                alibi_slope * col_idx;
+                        }
+
+                        // 非整 K tile 时，超过 max_seqlen_k 的列设为 -inf。
+                        if constexpr (!Is_even_MN) {
+                            if (col_idx >= max_seqlen_k) {
+                                tensor(mi, make_coord(j, nj)) = -INFINITY;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
+                // mi 对应当前线程 fragment 中的一个 row 组。
+                const int row_idx_base =
+                    row_idx_offset + mi * warp_row_stride;
+
+                #pragma unroll
+                for (int i = 0; i < size<0, 0>(tensor); ++i) {
+                    // i 在 row 组内部继续跨 8 行。
+                    const int row_idx = row_idx_base + i * 8;
+
+                    // local/causal 的可见 K 区间。
+                    // max_seqlen_k - max_seqlen_q 用于对齐 Q/K 长度不等的情况，
+                    // 例如 decode 时 Q 很短但 K cache 很长。
+                    const int col_idx_limit_left = std::max(
+                        0,
+                        row_idx + max_seqlen_k - max_seqlen_q
+                            - window_size_left);
+                    const int col_idx_limit_right = std::min(
+                        max_seqlen_k,
+                        row_idx + 1 + max_seqlen_k - max_seqlen_q
+                            + window_size_right);
+
+                    #pragma unroll
+                    for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
+                        const int col_idx_base = col_idx_offset + nj * 8;
+
+                        #pragma unroll
+                        for (int j = 0; j < size<1, 0>(tensor); ++j) {
+                            const int col_idx = col_idx_base + j;
+
+                            if constexpr (Has_alibi) {
+                                if constexpr (Is_causal) {
+                                    // causal ALiBi 的 row 相关常数项可被吸收，
+                                    // 这里只保留 col_idx 项。
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) +=
+                                        alibi_slope * col_idx;
+                                } else {
+                                    // 非 causal ALiBi 使用 |q-k| 距离，
+                                    // 所以必须同时知道 row_idx 和 col_idx。
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) -=
+                                        alibi_slope * abs(
+                                            row_idx + max_seqlen_k
+                                                - max_seqlen_q - col_idx);
+                                }
+                            }
+
+                            if constexpr (Causal_mask) {
+                                // causal 只允许 col_idx < 当前 row 对应的右边界。
+                                if (col_idx >= col_idx_limit_right) {
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) =
+                                        -INFINITY;
+                                }
+                            }
+
+                            if constexpr (Is_local) {
+                                // local window 同时检查左边界和右边界。
+                                if (col_idx >= col_idx_limit_right ||
+                                    col_idx < col_idx_limit_left) {
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) =
+                                        -INFINITY;
+                                }
+                            }
+
+                            if constexpr (!Causal_mask && !Is_local && !Is_even_MN) {
+                                // causal/local 已经包含右边界；普通路径才单独检查 K 尾部。
+                                if (col_idx >= max_seqlen_k) {
+                                    tensor(make_coord(i, mi), make_coord(j, nj)) =
+                                        -INFINITY;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+```
+
+### 坐标如何算出来
+
+mask 的本质是判断一个 score 元素
+
+$$
+\texttt{tensor}[q,k]
+$$
+
+是否可见。源码里 `q` 和 `k` 分别由 row/col 坐标还原：
+
+| 坐标 | 源码表达式 | 含义 |
+| --- | --- | --- |
+| K 列起点 | `col_idx_offset_ = n_block * kBlockN` | 当前 K tile 的全局起点。 |
+| 当前 lane 的 K 偏移 | `(lane_id % 4) * 2` | 一个 4-lane quad 中每个 lane 管 2 个相邻 K 列。 |
+| K 列组偏移 | `nj * 8` | `nj` 每增加 1，跳到下一组 8 列。 |
+| K 列组内偏移 | `j` | 组内的第 `j` 列。 |
+| 最终 K 下标 | `col_idx = col_idx_offset_ + (lane_id % 4) * 2 + nj * 8 + j` | 当前 score 元素对应的全局 K token 下标。 |
+| Q 行起点 | `row_idx_offset` | 当前线程负责的第一条 Q row。 |
+| Q 行组偏移 | `mi * warp_row_stride` | 同一个线程 fragment 中相邻 row 组的跨度。 |
+| Q 行组内偏移 | `i * 8` | row 组内部的第 `i` 个位置。 |
+| 最终 Q 下标 | `row_idx = row_idx_offset + mi * warp_row_stride + i * 8` | 当前 score 元素对应的全局 Q token 下标。 |
+
+因此，如果只做 K 尾部越界，判断条件很简单：
+
+$$
+k\ge L_k.
+$$
+
+如果做 causal mask，可见条件是：
+
+$$
+k < q+1+L_k-L_q.
+$$
+
+如果做 local window，可见条件是：
+
+$$
+\max(0,q+L_k-L_q-w_{\mathrm{left}})
+\le k <
+\min(L_k,q+1+L_k-L_q+w_{\mathrm{right}}).
+$$
+
+其中 $L_k=\texttt{max\_seqlen\_k}$、$L_q=\texttt{max\_seqlen\_q}$。这里的 $L_k-L_q$ 是对齐项：当 Q/K 长度不等时，例如 decode 中 $L_q$ 很短、$L_k$ 很长，当前 Q 行要对齐到 K cache 的尾部。
 
 **副作用 / 约束**
 
@@ -1501,50 +1926,273 @@ mask.template apply_mask<Is_causal, Is_even_MN>(
 - `MN` 方向：Q 行或 K token 是否越过实际序列长度。
 - `K` 方向：head dimension $d$ 是否落在 padding 后的 rounded head dim 之外。
 
+先把 `S` 和 `D` 的维度讲清楚。源码里要求 `S` 和 `D` 都是 rank-3 tensor，并且三个维度完全相同：
+
+| 维度 | 源码里的下标 | 在 `copy` 里的含义 | Q 搬运时的语义 | K/V 搬运时的语义 |
+| --- | --- | --- | --- | --- |
+| 第 0 维 | `_` | 一次 `cute::copy` 要搬的 copy atom 向量维。源码注释写成 `MMA`，但在这里更适合理解成 `CPY`。 | 某个线程在一个 `(q, d)` 坐标附近负责搬的若干元素。 | 某个线程在一个 `(k, d)` 坐标附近负责搬的若干元素。 |
+| 第 1 维 | `m` | 逻辑 `MN` 维，也是序列行维。这个维度会用 `identity_MN` 和 `max_MN` 做边界判断。 | Q tile 里的 query row。 | K/V tile 里的 key/value token。 |
+| 第 2 维 | `k` | 逻辑 head-dim 维。这个维度会用 `predicate_K(k)` 判断是否超过真实 $d$。 | Q 的 head dimension。 | K/V 的 head dimension。 |
+
+所以 `S(_, m, k)` / `D(_, m, k)` 不是一个标量，而是**固定一个序列位置 `m` 和一个 head-dim 分片 `k` 后，第 0 维上的一小串 copy atom 元素**。`copy` 的双层循环枚举第 1 维和第 2 维，真正搬运时把第 0 维整段交给 `cute::copy`。
+
+调用前，kernel 会用同一个 tiled-copy layout 去 partition identity tensor，从而拿到每个 `m` / `k` 对应的逻辑坐标：
+
 ```cpp
-/**
- * @brief 按 CuTe tiled-copy 规则搬运一个 3D fragment，并在必要时跳过或清零越界元素。
- *
- * @tparam Is_even_MN MN 方向是否保证完整；true 时省掉运行时行/列边界判断。
- * @tparam Is_even_K head-dimension K 是否保证完整。
- * @tparam Clear_OOB_MN MN 越界时是否将目标清零。
- * @tparam Clear_OOB_K K 越界时是否将目标清零。
- * @param tiled_copy [in] CuTe copy atom 的 tiled 版本。
- * @param S [in] 源 fragment，可能来自 global memory 或 shared memory。
- * @param D [out] 目标 fragment；通常是 shared memory。
- * @param identity_MN [in] 与 S 相同分块方式的逻辑 MN 坐标。
- * @param predicate_K [in] 每个 K lane 是否仍在有效 head dimension 内。
- * @param max_MN [in] 有效 MN 上界；仅 Is_even_MN=false 时读取。
- */
-template<bool Is_even_MN = true, bool Is_even_K = true,
-         bool Clear_OOB_MN = false, bool Clear_OOB_K = true,
-         typename TiledCopy, typename Engine0, typename Layout0,
-         typename Engine1, typename Layout1, typename Engine2,
-         typename Layout2, typename Engine3, typename Layout3>
-__forceinline__ __device__ void copy(
-    TiledCopy tiled_copy, Tensor<Engine0, Layout0> const& S,
-    Tensor<Engine1, Layout1>& D,
-    Tensor<Engine2, Layout2> const& identity_MN,
-    Tensor<Engine3, Layout3> const& predicate_K,
-    const int max_MN = 0);
+// cQ 的逻辑坐标是 (query row, head-dim)。
+Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+
+// cKV 的逻辑坐标是 (key/value token, head-dim)。
+Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+
+// tQcQ 的形状与 tQgQ / tQsQ 的 copy partition 对齐：
+// (ACPY, ACPY_M, ACPY_K) -> (blk_m, blk_k)。
+Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+
+// tKVcKV 的形状与 tKgK / tKsK / tVgV / tVsV 的 copy partition 对齐：
+// (BCPY, BCPY_N, BCPY_K) -> (blk_n, blk_k)。
+Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
+
+// predicate 只按第 2 维保存，因为 head dimension 的越界只与 k 相关。
+Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+
+if (!Is_even_K) {
+    #pragma unroll
+    for (int k = 0; k < size(tQpQ); ++k) {
+        // get<1> 取 identity 坐标的第二个分量，也就是 head-dim 坐标。
+        tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d;
+    }
+
+    #pragma unroll
+    for (int k = 0; k < size(tKVpKV); ++k) {
+        // K/V 和 Q 一样：只要 head-dim 坐标小于真实 d，就允许搬运。
+        tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d;
+    }
+}
 ```
 
-典型的 K 预取如下：
+然后看 `copy` 的完整实现。下面保留了源码中的执行逻辑，也把源码末尾那段已经注释掉的历史 loop-order 实验一起放上来；后者不参与编译，只用于理解作者为什么最后选择现在的循环结构。
 
 ```cpp
 /**
- * @brief 将第 n_block 个 K tile 异步搬入 sK。
+ * @brief 按 CuTe tiled-copy 规则搬运一个 rank-3 fragment，并处理 MN / K 两类边界。
  *
- * tKVcKV 提供逻辑 (key token, head-dim) 坐标；
- * tKVpKV 指出 head-dim 是否越过真实 d；
- * 当 K 尾块不完整时，max_MN 限制可读 token 数。
+ * @tparam Is_even_MN MN 方向是否一定完整。
+ *         true 表示当前 Q 行或 K/V token tile 不会越过实际序列长度，
+ *         因而可以省掉运行时的序列边界判断。
+ * @tparam Is_even_K head dimension 是否一定完整。
+ *         true 表示 rounded head dim 内的所有 copy 分片都小于真实 params.d。
+ * @tparam Clear_OOB_MN MN 越界时是否清零目标 D。
+ *         读 V 的尾块通常需要清零，避免 shared memory 残留值参与后续 PV。
+ * @tparam Clear_OOB_K K 越界时是否清零目标 D。
+ *         读 Q/K/V 到 shared memory 时通常需要清零 head-dim padding 区。
+ * @tparam TiledCopy CuTe 的 tiled-copy 类型，决定每个线程搬哪些元素。
+ * @tparam Engine0 S 的 CuTe storage engine 类型。
+ * @tparam Layout0 S 的 CuTe layout 类型。
+ * @tparam Engine1 D 的 CuTe storage engine 类型。
+ * @tparam Layout1 D 的 CuTe layout 类型。
+ * @tparam Engine2 identity_MN 的 CuTe storage engine 类型。
+ * @tparam Layout2 identity_MN 的 CuTe layout 类型。
+ * @tparam Engine3 predicate_K 的 CuTe storage engine 类型。
+ * @tparam Layout3 predicate_K 的 CuTe layout 类型。
+ * @param tiled_copy [in] CuTe copy atom 的 tiled 版本。
+ *        真正的数据搬运仍由 cute::copy(tiled_copy, ...) 完成。
+ * @param S [in] 源 tensor fragment，rank 为 3。
+ *        形状可读作 (CPY, CPY_MN, CPY_K)，例如 tQgQ 或 tKgK(_, _, _, n_block)。
+ * @param D [out] 目标 tensor fragment，rank 为 3。
+ *        形状必须与 S 完全一致，例如 tQsQ / tKsK / tVsV。
+ * @param identity_MN [in] 与 S 使用同一 copy partition 的 identity 坐标。
+ *        identity_MN(0, m, 0) 的第 0 个坐标分量表示当前 m 对应的逻辑 MN 坐标。
+ * @param predicate_K [in] 第 2 维每个 k 分片是否在真实 head dimension 内。
+ *        当 Is_even_K 为 true 时不会读取它。
+ * @param max_MN [in] 当前 tile 内 MN 方向的有效上界。
+ *        例如 K tile 中是 actual_seqlen_k - n_block * kBlockN。
+ */
+template <bool Is_even_MN=true, bool Is_even_K=true,
+          bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+          typename TiledCopy,
+          typename Engine0, typename Layout0,
+          typename Engine1, typename Layout1,
+          typename Engine2, typename Layout2,
+          typename Engine3, typename Layout3>
+__forceinline__ __device__ void copy(
+    TiledCopy tiled_copy,
+    Tensor<Engine0, Layout0> const &S,
+    Tensor<Engine1, Layout1> &D,
+    Tensor<Engine2, Layout2> const &identity_MN,
+    Tensor<Engine3, Layout3> const &predicate_K,
+    const int max_MN=0
+) {
+    // S 必须是三维 fragment。源码注释里第一维写作 MMA；
+    // 在 copy 场景里，它对应 tiled-copy 的 CPY 向量维。
+    CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
+
+    // D 也必须是三维 fragment，才能与 S 使用同一套 (_, m, k) 坐标访问。
+    CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
+
+    // 第 0 维一致：固定 (m, k) 后，一次 cute::copy 看到的向量长度相同。
+    CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));  // MMA / CPY
+
+    // 第 1 维一致：源和目标拥有相同数量的 MN 分片。
+    CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));  // MMA_M / CPY_MN
+
+    // 第 2 维一致：源和目标拥有相同数量的 head-dim 分片。
+    CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));  // MMA_K / CPY_K
+
+    // 源码约束：不存在“MN 越界要清零，但 K 越界不清零”的合法场景。
+    // 因为如果要清整行 / 整个 token 的越界区域，就不能同时放任 K padding 残留。
+    static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
+
+    #pragma unroll
+    for (int m = 0; m < size<1>(S); ++m) {
+        // m 是第 1 维，也就是 MN 方向。
+        //
+        // Is_even_MN=true：
+        //   编译期已知这个 tile 的所有 query row 或 key/value token 都有效。
+        //
+        // Is_even_MN=false：
+        //   读取 identity_MN(0, m, 0) 的第 0 个坐标分量，
+        //   判断当前 m 对应的真实序列坐标是否小于 max_MN。
+        if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+            #pragma unroll
+            for (int k = 0; k < size<2>(S); ++k) {
+                // k 是第 2 维，也就是 head dimension 分片。
+                //
+                // Is_even_K=true：
+                //   编译期已知 rounded head dim 没有无效 padding。
+                //
+                // Is_even_K=false：
+                //   predicate_K(k) 表示这个 k 分片是否落在真实 params.d 内。
+                if (Is_even_K || predicate_K(k)) {
+                    // 固定 m 和 k 后，把第 0 维整段交给 CuTe copy atom。
+                    // 这里真正搬运的是 S(_, m, k) -> D(_, m, k)，
+                    // 不是单个标量，而是一小组由 tiled_copy 定义的元素。
+                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                } else if (Clear_OOB_K) {
+                    // head-dim padding 越界，并且调用方要求清零目标。
+                    // 这样后续读 shared memory 时不会读到上一轮残留。
+                    cute::clear(D(_, m, k));
+                }
+            }
+        } else if (Clear_OOB_MN) {
+            // 整个 m 对应的 query row 或 K/V token 已越过实际序列长度。
+            // 如果调用方要求清零，就清掉这个 m 下所有 k 分片。
+            cute::clear(D(_, m, _));
+        }
+    }
+
+    // 下面是源码中保留但已经注释掉的旧写法。
+    // 作者注释说：这个版本在某些情况下会出现 race condition；
+    // 他猜测原因与 copy 放在 if 分支内部有关。
+    //
+    // 注意：这段代码不参与编译，只是作为源码里的历史记录。
+    //
+    // if (Is_even_K) {
+    //     #pragma unroll
+    //     for (int m = 0; m < size<1>(S); ++m) {
+    //         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+    //             copy(tiled_copy, S(_, m, _), D(_, m, _));
+    //         } else if (Clear_OOB_MN) {
+    //             clear(D(_, m, _));
+    //         }
+    //     }
+    // } else {  // 当 K 不完整时，先遍历 K 曾经略快一点。
+    //     #pragma unroll
+    //     for (int k = 0; k < size<2>(S); ++k) {
+    //         if (predicate_K(k)) {
+    //             #pragma unroll
+    //             for (int m = 0; m < size<1>(S); ++m) {
+    //                 if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+    //                     copy(tiled_copy, S(_, m, k), D(_, m, k));
+    //                 } else if (Clear_OOB_MN) {
+    //                     clear(D(_, m, k));
+    //                 }
+    //             }
+    //         } else if (Clear_OOB_K) {
+    //             if (Clear_OOB_MN || Is_even_MN) {
+    //                 clear(D(_, _, k));
+    //             } else {
+    //                 #pragma unroll
+    //                 for (int m = 0; m < size<1>(S); ++m) {
+    //                     if (!(Is_even_MN ||
+    //                           get<0>(identity_MN(0, m, 0)) < max_MN)) {
+    //                         clear(D(_, m, k));
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+}
+```
+
+在普通 forward prologue 里，它被调用三类：搬 Q、搬 K、搬 V。
+
+```cpp
+/**
+ * @brief 将当前 CTA 的 Q tile 从 global memory 搬入 shared memory。
+ *
+ * S = tQgQ：
+ *   源 fragment，逻辑上来自当前 batch/head 的 Q 全局内存。
+ *
+ * D = tQsQ：
+ *   目标 fragment，逻辑上写入 shared memory 中的 sQ。
+ *
+ * identity_MN = tQcQ：
+ *   第 1 维 m 对应 query row，第 2 维 k 对应 head-dim。
+ *
+ * predicate_K = tQpQ：
+ *   判断 Q 的 head-dim 分片是否小于真实 params.d。
+ *
+ * max_MN = actual_seqlen_q - m_block * kBlockM：
+ *   当前 Q row block 里还剩多少个有效 query row。
+ */
+FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(
+    gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+    binfo.actual_seqlen_q - m_block * kBlockM);
+
+/**
+ * @brief 将第 n_block 个 K tile 从 global memory 搬入 shared memory。
+ *
+ * S = tKgK(_, _, _, n_block)：
+ *   固定 K-block 坐标后的源 fragment，逻辑上来自 K 全局内存。
+ *
+ * D = tKsK：
+ *   目标 fragment，逻辑上写入 shared memory 中的 sK。
+ *
+ * identity_MN = tKVcKV：
+ *   第 1 维 m 对应 key token，第 2 维 k 对应 head-dim。
+ *
+ * predicate_K = tKVpKV：
+ *   判断 K 的 head-dim 分片是否小于真实 params.d。
+ *
+ * max_MN = actual_seqlen_k - n_block * kBlockN：
+ *   当前 K tile 里还剩多少个有效 key token。
  */
 FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(
     gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK,
     tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+
+/**
+ * @brief 将第 n_block 个 V tile 从 global memory 搬入 shared memory。
+ *
+ * V 的尾块比较特殊：如果 MN 方向越界，后续 PV 仍可能从 shared memory
+ * 读取对应位置，所以这里打开 Clear_OOB_MN，把越界 token 对应的 sV 清零。
+ */
+FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+    gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV,
+    tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
 ```
 
-`Clear_OOB_MN=true` 常用于读 V：即使尾块有被 predicate 掉的 global load，也把 shared-memory 目标清零，避免随后 $PV$ 误读前一轮残留数据。相反，写回 O 时通常是 `Clear_OOB_K=false`：越界输出根本不该写回 global memory。
+这三个调用共享同一个 mental model：
+
+- **`S` 是源 view，`D` 是目标 view**。它们的 layout 可能来自 global memory 或 shared memory，但经过 `partition_S` / `partition_D` 后都变成同构的 rank-3 fragment。
+- **第 1 维 `m` 管序列边界**。Q 时是 query row，K/V 时是 key/value token。`max_MN` 是当前 block 内剩余的有效行数。
+- **第 2 维 `k` 管 head-dim 边界**。因为 FA 常把 head dim round 到更适合 MMA/copy 的宽度，所以真实 $d$ 之外的 padding 要靠 `predicate_K` 过滤。
+- **第 0 维 `_` 不参与边界判断**。它只是 CuTe copy atom 的内部向量维；只要 `(m, k)` 有效，就整段搬运。
+- **`Clear_OOB_MN=true` 常用于读 V**。即使尾块有被 predicate 掉的 global load，也把 shared-memory 目标清零，避免随后 $PV$ 误读前一轮残留数据。
+- **`Clear_OOB_K=false` 常用于写回 O**。越界输出根本不该写回 global memory，因此跳过即可，不需要清零目标。
 
 ## `gemm` 与 `gemm_rs`：同一套 MMA，不同的数据来源
 
@@ -1713,20 +2361,630 @@ Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
 
 它**不改变数学含义**，只发生有限精度转换；`acc_s`、`acc_o` 本身仍保留 fp32，直到不再需要。
 
-## 本篇接口的最小记忆表
+## 完整解读 `compute_attn_1rowblock`
 
-| 接口 / 对象 | 读什么 | 改什么 | 对应数学步骤 |
-| --- | --- | --- | --- |
-| `BlockInfo` | 参数包中的长度与变长边界 | 不改数据 | 确定当前 batch 的有效 $L_q,L_k$ 与地址。 |
-| `copy` | global/shared tile、边界谓词 | 目标 tile | 将 Q/K/V/O 分块搬运，避免越界数据污染。 |
-| `gemm` | Q、K fragment | `acc_s` | $r\leftarrow QK^T$。 |
-| `apply_softcap` | `acc_s` | `acc_s` | 可选 $r\leftarrow\tanh((a/c)QK^T)$。 |
-| `Mask::apply_mask` | `acc_s` 与 token 坐标 | `acc_s` | ALiBi 加法；不可见位置设为 $-\infty$。 |
-| `Softmax::softmax_rescale_o` | `acc_s`、`acc_o`、旧状态 | 三者 | 更新 $m,\ell,u$ 的基准，并产生 $E$。 |
-| `convert_type` | fp32 fragment | 返回新 fragment | 为 MMA 输入/输出做 fp32 ↔ fp16/bf16 转换。 |
-| `Dropout::apply_dropout` | `rP` 与 Philox 坐标 | `rP` | 对 $E$ 施加 keep mask。 |
-| `gemm_rs` | `rP`、V | `acc_o` | $u\leftarrow u+EV$。 |
-| `normalize_softmax_lse` | `acc_o`、`row_max`、`row_sum` | `acc_o`，返回 `lse` | $O=u/\ell$，并计算 $\operatorname{LSE}=m+\log\ell$。 |
-| `get_lse_tile` | LSE 指针与布局标志 | 不改数据 | 找到当前 Q tile 的 LSE 写回地址。 |
+前面出现的所有专用接口，到这里终于连成一次完整的 attention 计算。一个 CTA 固定逻辑坐标 $(b,h,m_{\text{block}})$：它持有一个 $Q$ 行块 $Q_m\in\mathbb{R}^{kBlockM\times d}$，依次访问这个 Q 行块可见的全部 $K/V$ 列块。每次循环处理
 
-下一篇将沿这张表逐句追踪 `compute_attn_1rowblock` 的 prologue 和第一轮 K/V 迭代：先从 Q/K/V 的 global tile、shared-memory tile、寄存器 MMA fragment 是怎样建出来的开始，再解释为什么代码反向扫描 `n_block`。
+$$
+K_n,V_n\in\mathbb{R}^{kBlockN\times d},\qquad
+S_{m,n}=Q_mK_n^T\in\mathbb{R}^{kBlockM\times kBlockN}.
+$$
+
+`acc_s` 是当前一个 $S_{m,n}$ 的 fp32 寄存器 fragment；`acc_o` 是贯穿所有 $n$ 的 fp32 输出分子状态。`Softmax` 对象保存每个 query row 的 $m_i$ 与 $\ell_i$，而 `acc_o` 保存同一基准下的 $u_{i,:}$。因此，循环结束时只需一次归一化就得到输出 $O_{i,:}=u_{i,:}/\ell_i$。
+
+### 一个 CTA 内的数据流与计算流
+
+```mermaid
+flowchart TD
+    A["CTA 坐标<br>(bidb, bidh, m_block)"] --> B["BlockInfo<br>得到当前序列有效 Lq/Lk 与地址偏移"]
+    B --> C["Q global tile gQ<br>copy 到 shared memory sQ"]
+    C --> D["Q MMA fragment tSrQ<br>必要时先搬入寄存器"]
+    B --> E["反向枚举可见 n_block<br>最后一个 K/V tile 先进入 shared memory"]
+    E --> F["K: gK → sK → tSrK<br>QK^T GEMM"]
+    D --> F
+    F --> G["acc_s：当前 raw score tile<br>形状 kBlockM × kBlockN"]
+    G --> H["softcap / ALiBi / 因果或窗口 mask"]
+    H --> I["online softmax<br>更新 m、ℓ，并把 acc_s 改写为 E"]
+    E --> J["V: gV → sV / sVt → tOrVt"]
+    I --> K["P×V GEMM<br>acc_o ← acc_o + E V"]
+    J --> K
+    K --> E
+    K --> L["normalize_softmax_lse<br>O = acc_o / ℓ，得到 LSE"]
+    L --> M["O：寄存器 → sO → global O<br>LSE → global softmax_lse"]
+```
+
+图中的箭头有两个很容易混淆的时间关系：
+
+- K 与 V 都会从 global memory 搬到 shared memory，但 **K 是下一轮 QK^T 的右操作数**，V 则是**当前轮 PV 的右操作数**。代码用 `cp_async`、`cp_async_wait` 和循环尾部的预取把它们交叠起来。
+- `acc_s` 的含义在一次循环中会改变：QK^T 后它是 raw score $r_{i,j}$；经 mask 后仍是 score；调用 `softmax_rescale_o` 后，它被原地改写为稳定指数权重 $E_{i,j}$，才可以参与 $EV$。
+
+### 函数边界、模板开关与张量状态
+
+函数定义在 `flash-attention/csrc/flash_attn/src/flash_fwd_kernel.h`。它不是 `__global__` kernel，而是由 `flash_fwd_kernel` 在每个 CTA 内调用的 `__device__` 函数；`blockIdx`、`threadIdx` 与动态 shared memory 因而都继承当前 CTA 的上下文。
+
+| 项目 | 这里的具体含义 |
+| --- | --- |
+| `Kernel_traits` | 编译期固定 tile 尺寸、warp 数、MMA layout、global/shared-memory copy atom 与 shared-memory layout。本文前面已经解读过它。 |
+| `Is_dropout` | 是否在 $E$ 上施加 dropout，并保存 Philox RNG 状态。 |
+| `Is_causal` / `Is_local` | 是否有下三角因果约束 / 局部窗口约束；它们决定可访问的 `n_block` 区间与 mask 行为。 |
+| `Has_alibi` | 是否将每个 head 的 ALiBi slope 加到 score。 |
+| `Is_even_MN` | Q/K 序列长度是否恰好对齐 tile；为 `false` 时同时表示变长路径，需读 `BlockInfo` 的实际长度并施加行边界谓词。 |
+| `Is_even_K` | head dimension $d$ 是否恰好等于编译期 `kHeadDim`；为 `false` 时拷贝和最终写回要屏蔽 padding 列。 |
+| `Is_softcap` | 是否在 raw score 上应用 softcap 的 `tanh`。 |
+| `Return_softmax` | 是否把 dropout 编码后的概率写到 `params.p_ptr`，用于调试/兼容接口。 |
+| `params` | host 侧 `Flash_fwd_params` 参数包：指针、stride、有效长度、缩放、窗口、dropout 与 LSE 输出地址都在这里。 |
+| `(bidb,bidh,m_block)` | 当前 CTA 的 batch、query head、Q tile 编号。它固定以后，函数只沿 K/V tile 编号 `n_block` 移动。 |
+
+下面是函数的**完整实际执行路径**。保留了原始语句顺序和所有控制分支；新增的中文注释只解释语义，不改变源码。源码中纯 `printf` 排查用的注释行不影响编译或控制流，未放入正文。
+
+```cpp
+/**
+ * @brief 计算一个 Q row block 对所有可见 K/V block 的 FlashAttention 前向结果。
+ *
+ * 一个 CTA 固定 (batch=bidb, q_head=bidh, q_tile=m_block)。它维护该 Q tile
+ * 每一行的 online-softmax 状态 (m_i, ell_i, u_i)，反向扫描可见的 K/V tile，
+ * 最终将 O 与每个 query row 唯一的 LSE 写回 global memory。
+ *
+ * @tparam Kernel_traits 编译期 kernel 配置，提供 kBlockM、kBlockN、kHeadDim、
+ *         MMA/copy layout、shared-memory layout 和是否将 Q 放在寄存器等策略。
+ * @tparam Is_dropout 是否对 softmax 权重 E 应用 dropout。
+ * @tparam Is_causal 是否启用 causal mask。
+ * @tparam Is_local 是否启用滑动窗口 local mask。
+ * @tparam Has_alibi 是否启用 ALiBi 位置偏置。
+ * @tparam Is_even_MN Q/K 长度是否 tile 对齐；false 也走变长序列地址与边界路径。
+ * @tparam Is_even_K head dimension 是否等于编译期 kHeadDim。
+ * @tparam Is_softcap 是否对 raw score 应用 softcap。
+ * @tparam Return_softmax 是否额外写回编码了 dropout 的 P。
+ * @tparam Params 通常为 Flash_fwd_params；保存所有 device 指针、shape、stride 与标量。
+ * @param params [in] 当前 forward 调用的参数包；其中指针均指向 device memory。
+ * @param bidb 当前 CTA 对应的逻辑 batch 编号。
+ * @param bidh 当前 CTA 对应的 query head 编号；GQA/MQA 时由它映射到 KV head。
+ * @param m_block 当前 CTA 负责的 Q tile 编号，每个 tile 有 kBlockM 个 query row。
+ */
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local,
+         bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap,
+         bool Return_softmax, typename Params>
+inline __device__ void compute_attn_1rowblock(
+    const Params &params, const int bidb, const int bidh, const int m_block) {
+
+    // Element 是 Q/K/V/O 的低精度存储类型（fp16 或 bf16）；
+    // ElementAccum 是 MMA accumulator 的 fp32 类型；index_t 用于内部地址索引。
+    using Element = typename Kernel_traits::Element;
+    using ElementAccum = typename Kernel_traits::ElementAccum;
+    using index_t = typename Kernel_traits::index_t;
+
+    // 当前 CTA 的动态 shared memory。之后从这块线性 storage 切出 sQ、sK、sV 和 sO 视图。
+    extern __shared__ char smem_[];
+
+    // 同一 CTA 内每个线程不同；它决定 copy partition、MMA fragment 与 RNG lane 坐标。
+    const int tidx = threadIdx.x;
+
+    // 从 traits 取出编译期常量，后续 shape、循环边界和 row 映射都依赖它们。
+    constexpr int kBlockM = Kernel_traits::kBlockM;
+    constexpr int kBlockN = Kernel_traits::kBlockN;
+    constexpr int kHeadDim = Kernel_traits::kHeadDim;
+    constexpr int kNWarps = Kernel_traits::kNWarps;
+
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+    // 若编译进 dropout 支持，解包 host 传入的 Philox seed 与 offset。
+    auto seed_offset = at::cuda::philox::unpack(
+        *reinterpret_cast<at::PhiloxCudaState const*>(params.philox_args));
+#else
+    // 禁用 dropout 的构建仍构造对象，但 seed/offset 为零且不会真正生成随机数。
+    auto seed_offset = std::make_tuple(uint64_t(0), uint64_t(0));
+#endif
+
+    // 将 (batch, head, lane) 编入 dropout 坐标；这样 forward/backward 即使 tile 遍历不同，
+    // 也能为 attention 矩阵同一位置生成相同随机位。
+    FLASH_NAMESPACE::Dropout dropout(
+        std::get<0>(seed_offset), std::get<1>(seed_offset),
+        params.p_dropout_in_uint8_t, bidb, bidh, tidx, params.h);
+
+    // 必须在任何早退前由唯一线程写 RNG state：否则第 0 个 CTA 恰好早退时，backward
+    // 无法复现 forward 的 dropout 掩码。
+    if (Is_dropout && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx == 0) {
+        params.rng_state[0] = std::get<0>(seed_offset);
+        params.rng_state[1] = std::get<1>(seed_offset);
+    }
+
+    // 定长时 Varlen=false，变长/尾 tile 路径时 Varlen=true；binfo 统一给出本 batch 的
+    // 实际 Lq/Lk 以及 Q/K/V/O 的基址偏移。
+    const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
+
+    // grid.x 可能按 rounded seqlen 发射；超过当前序列实际 Q 长度的 CTA 不读写任何数据。
+    if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
+
+    // 不使用 local window 时，所有 K tile 都可能可见，起点为 0；
+    // local window 时，把窗口左边界换算为 K tile 编号并截断为非负值。
+    const int n_block_min = !Is_local
+        ? 0
+        : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k
+                       - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
+
+    // 默认末端是当前序列最后一个 K tile 的后一格，即 ceil(Lk / kBlockN)。
+    int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
+    if (Is_causal || Is_local) {
+        // 因果/局部约束还限制右边界。Q/K 长度不相同时，Lk-Lq 是二者逻辑坐标的平移量。
+        n_block_max = std::min(
+            n_block_max,
+            cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k
+                           - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
+    }
+
+    // 没有任何可见 K tile 时（空 K、causal/local 完全遮住当前 Q tile、或变长尾部），
+    // 不能进入后续 global K/V 读取。语义上 O=0，LSE=+inf。
+    if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
+        // 将全局输出 O 解释为 (actual_Lq, Hq, d)；先只切出当前 head 的 Q tile。
+        Tensor mO = make_tensor(
+            make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
+                          + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+            make_shape(binfo.actual_seqlen_q, params.h, params.d),
+            make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+        Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                               make_coord(m_block, 0));
+
+        // 同一 Q tile 的每行只有一个 LSE 标量；get_lse_tile 已处理定长、packed 和 swapped layout。
+        Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
+            params, bidb, bidh, m_block, binfo);
+
+        // 以 O 的 global-copy atom 切分当前线程负责的输出元素，并构造全零寄存器源。
+        typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+        Tensor tOrO = make_tensor<Element>(shape(tOgO));
+        clear(tOrO);
+
+        // identity tensor 保留每个分片元素的逻辑 (row, d) 坐标，供 copy 判断越界。
+        Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
+        Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+        if (!Is_even_K) {
+            #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) {
+                // 尾部 padding 的 d 列不写 global O。
+                tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d;
+            }
+        }
+
+        // Clear_OOB_K=false：这里只想跳过无效列，绝不能把零写到真实 tensor 边界外。
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K,
+                              /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
+            binfo.actual_seqlen_q - m_block * kBlockM);
+
+        // 每行只由一个持有 d=0 的线程写 LSE，避免多个 lane 对同一标量重复普通 store。
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOgO); ++m) {
+            const int row = get<0>(tOcO(0, m, 0));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM
+                && get<1>(tOcO(0, m, 0)) == 0) {
+                gLSE(row) = INFINITY;
+            }
+        }
+        return;
+    }
+
+    // 从右向左扫描 K/V tile。这样最右侧 tile（唯一必然可能有 K 长度尾边界）先处理；
+    // 同时循环变量只需 n_block，不必同时保存 n_block 与 n_block_max。
+    const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
+        + m_block * kBlockM) * params.seqlen_k_rounded
+        + (n_block_max - 1) * kBlockN;
+
+    // Q: (actual_Lq, Hq, d) → 当前 head 的 gQ: (kBlockM, kHeadDim)。
+    Tensor mQ = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
+                      + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_q, params.h, params.d),
+        make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+    Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                           make_coord(m_block, 0));
+
+    // K/V: (actual_Lk, Hkv, d)。bidh / h_h_k_ratio 完成 GQA/MQA 的 Q-head → KV-head 映射；
+    // local_tile 的第三维保留全部 n_block，循环时再取其中一片。
+    Tensor mK = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
+                      + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
+        make_stride(params.k_row_stride, params.k_head_stride, _1{}));
+    Tensor gK = local_tile(mK(_, bidh / params.h_h_k_ratio, _),
+                           Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
+    Tensor mV = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.v_ptr)
+                      + binfo.k_offset(params.v_batch_stride, params.v_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
+        make_stride(params.v_row_stride, params.v_head_stride, _1{}));
+    Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _),
+                           Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
+
+    // 可选返回 P 的 global tile。row_offset_p 指向最后一个 n_block；之后每轮令 tSgS
+    // 的基址向左移动 kBlockN，因此与反向扫描顺序一致。
+    Tensor gP = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
+        Shape<Int<kBlockM>, Int<kBlockN>>{}, make_stride(params.seqlen_k_rounded, _1{}));
+
+    // 动态 shared memory 的线性切分：sQ；sK；sV。Share_Q_K_smem 时 sQ 与 sK 复用同一段，
+    // 因而稍后必须等待 Q 已读入寄存器，并在复用前后同步。
+    Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
+                            typename Kernel_traits::SmemLayoutQ{});
+    Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
+                            typename Kernel_traits::SmemLayoutKV{});
+    Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+    // sVt 与 sVtNoSwizzle 指向同一 storage，只是 PV 的 shared→register copy 使用不同逻辑布局。
+    Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
+    Tensor sVtNoSwizzle = make_tensor(
+        sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+
+    // 以同一种 global-memory copy atom 切分 Q/K/V。每个 t*g* / t*s* 都是当前线程的 rank-3 分片；
+    // K/V 额外含 nblocksN 维，循环按 n_block 取其中一个 tile。
+    typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
+    auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
+    Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
+    Tensor tQsQ = gmem_thr_copy_QKV.partition_D(sQ);
+    Tensor tKgK = gmem_thr_copy_QKV.partition_S(gK);
+    Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
+    Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);
+    Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+    // 取得当前线程的 Tensor Core MMA 分片。
+    // tSrQ/tSrK 是 QK^T 的 operand；tOrVt 是 PV 的 V operand；tSgS 是 P 的 global 写回分片。
+    typename Kernel_traits::TiledMma tiled_mma;
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
+    Tensor tSrK = thr_mma.partition_fragment_B(sK);
+    Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
+    Tensor tSgS = thr_mma.partition_C(gP);
+
+    // acc_o 是整个函数生命周期内的 fp32 输出分子 accumulator，逻辑形状为 kBlockM × kHeadDim。
+    Tensor acc_o = partition_fragment_C(
+        tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
+
+    // 为 shared→register 搬运构造与两次 GEMM operand 对齐的 tiled copy。
+    auto smem_tiled_copy_Q = make_tiled_copy_A(
+        typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
+    Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
+
+    auto smem_tiled_copy_K = make_tiled_copy_B(
+        typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
+    auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
+    Tensor tSsK = smem_thr_copy_K.partition_S(sK);
+
+    auto smem_tiled_copy_V = make_tiled_copy_B(
+        typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
+    auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
+    Tensor tOsVt = smem_thr_copy_V.partition_S(sVt);
+
+    // cQ/cKV 将 shared-memory 的逻辑坐标 (row, d) 原样携带到每个线程 copy partition；
+    // 它们不是数据，而是后面判断 M/N 尾部与 K 维 padding 的“坐标真相”。
+    Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
+    Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
+    Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
+    Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
+
+    // 每个 K-copy 子分片只需一个按 d-shard 的谓词；copy 内部会把它应用到 dim-2 的所有元素。
+    Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
+    Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tQpQ); ++k) {
+            tQpQ(k) = get<1>(tQcQ(0, 0, k)) < params.d;
+        }
+        #pragma unroll
+        for (int k = 0; k < size(tKVpKV); ++k) {
+            tKVpKV(k) = get<1>(tKVcKV(0, 0, k)) < params.d;
+        }
+    }
+
+    // ------------------------------ Prologue ------------------------------
+
+    // 异步搬运 Q。无效 Q 行不会最终写 O，故无需清空 sQ 的行尾；K 维 padding 由谓词跳过。
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(
+        gmem_tiled_copy_QKV, tQgQ, tQsQ, tQcQ, tQpQ,
+        binfo.actual_seqlen_q - m_block * kBlockM);
+    // Q 走寄存器路径时，先封闭当前 cp.async group，后面才能精确 wait。
+    if (Kernel_traits::Is_Q_in_regs) { cute::cp_async_fence(); }
+
+    if (Kernel_traits::Share_Q_K_smem) {
+        // sQ 与 sK 别名：必须先确认 Q global→smem 完成，再把 Q smem→register；
+        // 此后才允许 sK 覆盖这块 shared memory。
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+        __syncthreads();
+    }
+
+    // 先预取最右侧 K tile；反向循环的第一轮直接消费它。
+    int n_block = n_block_max - 1;
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(
+        gmem_tiled_copy_QKV, tKgK(_, _, _, n_block), tKsK, tKVcKV, tKVpKV,
+        binfo.actual_seqlen_k - n_block * kBlockN);
+    cute::cp_async_fence();
+
+    if (Kernel_traits::Is_Q_in_regs && !Kernel_traits::Share_Q_K_smem) {
+        // Q 没与 K 复用 smem 时可以延迟到 K 已发起预取后再等待 Q，形成一次搬运重叠。
+        FLASH_NAMESPACE::cp_async_wait<1>();
+        __syncthreads();
+        Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
+        cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
+    }
+
+    // u 初值为零。Softmax 对象同时为当前 CTA 的所有局部 query row 维护 row_max 与 row_sum。
+    clear(acc_o);
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+
+    // apply_mask 接收的是相对于 raw score 的 ALiBi slope；除以 scale_softmax 的原因是
+    // softmax_rescale_o 稍后统一给 score 乘 scale_softmax。
+    const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr
+        ? 0.0f
+        : reinterpret_cast<float *>(params.alibi_slopes_ptr)[
+              bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(
+        binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left,
+        params.window_size_right, alibi_slope);
+
+    // 最右端 K tile 可能有 N 尾部；causal/local 的对角线附近也必须屏蔽不可见 score。
+    // 因此先执行至少一次“带 mask”循环，之后的左侧完整 tile 才能走更快路径。
+    // 若 K 长度不对齐，causal 的最后一块 Q tile 可能跨越两个需 mask 的 K tile，故多一轮。
+    constexpr int n_masking_steps = (!Is_causal && !Is_local)
+        ? 1
+        : ((Is_even_MN && Is_causal)
+            ? cute::ceil_div(kBlockM, kBlockN)
+            : cute::ceil_div(kBlockM, kBlockN) + 1);
+
+    // ---------------------- 带 mask 的最右侧若干 K tile ----------------------
+    #pragma unroll
+    for (int masking_step = 0; masking_step < n_masking_steps;
+         ++masking_step, --n_block) {
+        // 当前 score tile 的 fp32 accumulator；每轮重新从零开始计算一个 QK^T。
+        Tensor acc_s = partition_fragment_C(
+            tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s);
+
+        // 等待 prologue/上一轮预取的 K 到达 sK，所有线程再同步后读取 shared memory。
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+
+        // V 与当前 K 使用同一 n_block。第一轮可能读到 K/V 的 N 尾部，必须把无效 V 行清零；
+        // 否则后续 PV 会把 shared-memory 残值当作有效 V。后续带 mask 轮已在完整 tile 范围内。
+        if (masking_step > 0) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
+                gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV,
+                tKVcKV, tKVpKV);
+        } else {
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV,
+                tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN);
+        }
+        cute::cp_async_fence();
+
+        // Tensor Core 计算当前 raw score：acc_s ← Q_m K_n^T。
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q,
+            smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+        if constexpr (Is_softcap) {
+            // 在缩放前将 raw score 限制为 tanh 形式；参数已在 host 侧重参数化。
+            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+        }
+
+        // 加 ALiBi，并将 N 尾部、因果上三角或窗口外位置置为 -inf。
+        // row_idx_offset 把当前线程的 MMA fragment 起点映射回全局 Q 行；warp_row_stride
+        // 用于同一线程持有的后续 MMA_M 行组。
+        mask.template apply_mask<Is_causal, Is_even_MN>(
+            acc_s, n_block * kBlockN,
+            m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+            kNWarps * 16);
+
+        // 等待 V 到达 shared memory。与此同时，若左边还有 K tile，提前发起下一轮 K 预取。
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
+                gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK,
+                tKVcKV, tKVpKV);
+            // fence 必须在该条件分支内：只有真的发起下一次 async copy 时才封闭 group，
+            // 否则 wait/fence 的 group 对齐会被破坏，源码注释指出会出现 race condition。
+            cute::cp_async_fence();
+        }
+
+        // 第一个 tile 初始化 m/ell/u；后续 tile 将旧 ell 与旧 u 重标定到新 max 基准。
+        // Check_inf 处理一整行均被 mask 为 -inf 的情形，避免 (-inf)-(-inf) 产生 NaN。
+        masking_step == 0
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,
+                                                  /*Check_inf=*/Is_causal || Is_local>(
+                  acc_s, acc_o, params.scale_softmax_log2)
+            : softmax.template softmax_rescale_o</*Is_first=*/false,
+                                                  /*Check_inf=*/Is_causal || Is_local>(
+                  acc_s, acc_o, params.scale_softmax_log2);
+
+        // 此时 acc_s 已由 raw score 原地变为 E；转为 fp16/bf16，作为第二次 MMA 的 P operand。
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+
+        if (Return_softmax) {
+            // 返回 P 的接口要保存“带 dropout、并将 drop 编到符号位”的版本；
+            // 先复制一份，因此真正用于 PV 的 rP 不会被这条调试/兼容写回路径修改。
+            Tensor rP_drop = make_fragment_like(rP);
+            cute::copy(rP, rP_drop);
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                rP_drop, block_row_idx, block_col_idx, kNWarps);
+            cute::copy(rP_drop, tSgS);
+            // 下轮 n_block 向左减一，P 的 global 基址也向左退一个 kBlockN。
+            tSgS.data() = tSgS.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            // 真正的 attention 输出也使用 dropout 后的 E。
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+        }
+
+        // 重解释 rP 的 layout，使它成为 PV GEMM 的 A operand；只改 CuTe view，不搬运数据。
+        Tensor tOrP = make_tensor(
+            rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<
+                typename Kernel_traits::TiledMma>(rP.layout()));
+        // 第二次 Tensor Core GEMM：acc_o ← acc_o + E_{m,n} V_n。
+        FLASH_NAMESPACE::gemm_rs(
+            acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+        // 这个循环保证至少一次迭代。若需要 mask 的 tile 已经抵达左边界，手动越过后退出；
+        // 否则 for 的递减表达式自然进入下一次带 mask 迭代。
+        if (n_masking_steps > 1 && n_block <= n_block_min) {
+            --n_block;
+            break;
+        }
+    }
+
+    // ---------------------------- 无 mask 的完整 K tile ----------------------------
+    // 剩余 tile 位于序列内部且不跨 causal/window 边界；仍调用 apply_mask<false>，
+    // 但它只保留可能存在的 ALiBi 加法，不再逐元素进行 causal/N 尾部判断。
+    for (; n_block >= n_block_min; --n_block) {
+        Tensor acc_s = partition_fragment_C(
+            tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s);
+
+        // 当前 K 已由上轮预取到 sK；等待后开始本轮，并同时异步搬入当前 V。
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
+            gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q,
+            smem_tiled_copy_K, smem_thr_copy_Q, smem_thr_copy_K);
+        if constexpr (Is_softcap) {
+            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+        }
+
+        // 先保证 V 可读，再把左侧下一 K tile 发起预取，与本轮 softmax/PV 重叠。
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(
+                gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK,
+                tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
+
+        // Causal 与 N 尾部在此处均不可能发生；local 仍可能需要窗口边界判断，
+        // 所以 Is_local 继续作为 Check_inf 的编译期参数传入 softmax。
+        mask.template apply_mask</*Causal_mask=*/false>(
+            acc_s, n_block * kBlockN,
+            m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4,
+            kNWarps * 16);
+        softmax.template softmax_rescale_o</*Is_first=*/false,
+                                              /*Check_inf=*/Is_local>(
+            acc_s, acc_o, params.scale_softmax_log2);
+
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+        if (Return_softmax) {
+            Tensor rP_drop = make_fragment_like(rP);
+            cute::copy(rP, rP_drop);
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                rP_drop, block_row_idx, block_col_idx, kNWarps);
+            cute::copy(rP_drop, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+        }
+
+        Tensor tOrP = make_tensor(
+            rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<
+                typename Kernel_traits::TiledMma>(rP.layout()));
+        FLASH_NAMESPACE::gemm_rs(
+            acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+    }
+
+    // ------------------------------ Epilogue ------------------------------
+
+    // 将所有 K tile 累积的 (u, ell, m) 收尾：acc_o 从 u 变为 O=u/ell；
+    // lse 为每个 query row 的 m + log(ell)，供 backward 重建 softmax。
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(
+        acc_o, params.scale_softmax, params.rp_dropout);
+
+    // O 仍是 fp32 accumulator；先转回输出元素类型，然后临时借用 sQ 那块 shared memory 做 staged store。
+    Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
+    Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});
+    auto smem_tiled_copy_O = make_tiled_copy_C(
+        typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
+    auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
+    Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
+
+    // Q/K shared-memory 复用时，所有线程先离开最后一次 QK^T 读取，才能覆盖其 storage 为 sO。
+    if (Kernel_traits::Share_Q_K_smem) { __syncthreads(); }
+    cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
+
+    // 重新构造当前 Q tile 的 global O 与 LSE 视图；这与早退路径使用同一逻辑坐标。
+    Tensor mO = make_tensor(
+        make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
+                      + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
+        make_shape(binfo.actual_seqlen_q, params.h, params.d),
+        make_stride(params.o_row_stride, params.o_head_stride, _1{}));
+    Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                           make_coord(m_block, 0));
+    Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
+        params, bidb, bidh, m_block, binfo);
+
+    // 先将 shared O 按 global-copy atom 切分。tOsO 是 shared 源，tOgO 是 global 目的。
+    typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
+    auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
+    Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
+    Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+
+    // 保证所有线程都已完成 rO→sO，才允许任一线程从 sO 读走写 global O。
+    __syncthreads();
+    Tensor tOrO = make_tensor<Element>(shape(tOgO));
+    cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
+
+    // 对 O 的 identity layout 重做 MMA partition，取得“哪个 accumulator 元素属于哪一逻辑 Q 行”。
+    Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
+    Tensor taccOcO = thr_mma.partition_C(caccO);
+    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    // 一个线程的 C fragment 第一维含四个元素；按 2 分块并选坐标 0 后，每个 mi 对应一条 Q 行。
+    Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+    CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));
+    if (get<1>(taccOcO_row(0)) == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < size(lse); ++mi) {
+            const int row = get<0>(taccOcO_row(mi));
+            // 每行由唯一的 d=0 持有者写一次 LSE；尾部无效 Q 行不写。
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM) {
+                gLSE(row) = lse(mi);
+            }
+        }
+    }
+
+    // 为 O 的 global 写回创建逻辑坐标和 K/d 维谓词，屏蔽 head-dim padding。
+    Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
+    Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
+    Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
+    if (!Is_even_K) {
+        #pragma unroll
+        for (int k = 0; k < size(tOpO); ++k) {
+            tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d;
+        }
+    }
+    // 两个 Clear 选项都为 false：无效 Q 行、无效 d 列都只跳过 store，绝不越界写零。
+    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K,
+                          /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+        gmem_tiled_copy_O, tOrO, tOgO, tOcO, tOpO,
+        binfo.actual_seqlen_q - m_block * kBlockM);
+}
+```
+
+### 把整段代码压缩回一条状态递推
+
+如果暂时忽略 async copy、layout 和 dropout，循环主体就是下面四步；这也是阅读上面两段 `for` 时最可靠的主线。设当前 K tile 为 $J_n$，进入该轮前的状态为 $(m_i,\ell_i,u_{i,:})$：
+
+1. `gemm` 计算当前 raw score $r_{i,j}=Q_iK_j^T$；`apply_softcap` 与 `apply_mask` 将它变成可用于 softmax 的 score，所有不可见位置变为 $-\infty$。
+2. `softmax_rescale_o` 根据当前块的 row max 更新全局 $m_i$，把旧的 $\ell_i,u_{i,:}$ 乘以重标定因子；再把 `acc_s` 改为当前块的稳定权重 $E_{i,j}$，并把 $\sum_{j\in J_n}E_{i,j}$ 加进 $\ell_i$。
+3. 若启用 dropout，则对 `rP`（`acc_s` 的低精度副本）应用 keep mask；`gemm_rs` 累加 $u_{i,:}\leftarrow u_{i,:}+\sum_{j\in J_n}E_{i,j}V_{j,:}$。
+4. 所有 $n$ 完成后，`normalize_softmax_lse` 计算 $O_{i,:}=u_{i,:}/\ell_i$ 与 $\operatorname{LSE}_i$，随后将 O 和 LSE 写回。
+
+两段 K 循环的数学状态机完全相同；差别只在访问安全性和性能：最右/对角线附近的 tile 必须逐元素 mask，内部完整 tile 可以去掉这些分支。反向扫描使“可能越界的最后 K tile”总在循环开头被单独处理，也使下一块 K 的异步预取天然是 `n_block - 1`。
