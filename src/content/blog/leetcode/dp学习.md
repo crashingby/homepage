@@ -12142,3 +12142,783 @@ dp[row + 1][col + 1] = max(
 ```
 
 如果你看到“两个子序列、保持相对顺序、要做最优配对”，就应该先想到 LCS 这张二维前缀表；然后再根据题目要求，把“相等才配对 +1”改成当前题目的配对收益。
+
+## [718. 最长重复子数组 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-length-of-repeated-subarray/description/)
+
+给两个整数数组 `nums1` 和 `nums2`，返回两个数组中公共的、长度最长的**子数组**的长度。
+
+这里的子数组要求连续。
+
+示例 1：
+
+```text
+输入：nums1 = [1,2,3,2,1], nums2 = [3,2,1,4,7]
+输出：3
+解释：长度最长的公共子数组是 [3,2,1]。
+```
+
+示例 2：
+
+```text
+输入：nums1 = [0,0,0,0,0], nums2 = [0,0,0,0,0]
+输出：5
+```
+
+提示：
+
+- `1 <= nums1.length, nums2.length <= 1000`
+- `0 <= nums1[i], nums2[i] <= 100`
+
+### 题目如何和 LCS 区分？
+
+这题看起来也在找“公共部分”，但关键词不是子序列，而是**子数组**。
+
+区别非常关键：
+
+- **子序列**：可以跳过中间元素，只要相对顺序不变。
+- **子数组**：必须连续，中间不能断。
+
+所以 718 不能像 LCS 那样在不相等时取上方和左方最大值。
+
+LCS 不相等时可以写：
+
+```text
+dp[row + 1][col + 1] = max(dp[row][col + 1], dp[row + 1][col])
+```
+
+但最长公共子数组不行。因为一旦 `nums1[row] != nums2[col]`，以这两个位置结尾的连续公共部分就断了，长度必须变成 0。
+
+这题的状态要换成：
+
+> 以 `nums1[row]` 和 `nums2[col]` 结尾的最长公共后缀长度。
+
+### 递归切入（公共后缀逻辑）
+
+定义 `dfs(i, j)` 表示：
+
+> 必须以 `nums1[i]` 和 `nums2[j]` 结尾的最长公共子数组长度。
+
+注意这里不是“两个前缀里的全局最长答案”，而是“必须以当前两个元素结尾”。
+
+如果两个元素相等：
+
+```text
+nums1[i] == nums2[j]
+```
+
+当前这两个元素可以接在前一个公共后缀后面：
+
+$$
+dfs(i, j) = dfs(i - 1, j - 1) + 1
+$$
+
+如果两个元素不相等：
+
+```text
+nums1[i] != nums2[j]
+```
+
+连续公共子数组在这里断掉：
+
+$$
+dfs(i, j) = 0
+$$
+
+递归边界：
+
+- 如果 `i < 0` 或 `j < 0`，说明至少有一个数组已经越过开头，公共后缀长度为 0。
+
+最终答案不是某一个固定的 `dfs(m - 1, n - 1)`，而是所有位置的最大值：
+
+$$
+\max_{i,j} dfs(i, j)
+$$
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求两个数组的最长公共连续子数组长度。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个数组中最长公共子数组的长度。
+     */
+    int findLength(vector<int>& nums1, vector<int>& nums2) {
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<vector<int>> memo(rows, vector<int>(cols, kUnknown));
+        int answer = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                answer = max(answer, dfs(nums1, nums2, memo, row, col));
+            }
+        }
+
+        return answer;
+    }
+
+private:
+    static constexpr int kUnknown = -1;
+
+    int dfs(
+        const vector<int>& nums1,
+        const vector<int>& nums2,
+        vector<vector<int>>& memo,
+        int row,
+        int col) {
+        if (row < 0 || col < 0) {
+            return 0;
+        }
+
+        int& cached = memo[row][col];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (nums1[row] == nums2[col]) {
+            // 当前两个元素相等，连续长度可以从左上角延续。
+            cached = dfs(nums1, nums2, memo, row - 1, col - 1) + 1;
+        } else {
+            // 当前两个元素不相等，以它们结尾的连续公共子数组断开。
+            cached = 0;
+        }
+
+        return cached;
+    }
+};
+```
+
+这个递归的状态定义和 LCS 不一样。LCS 的 `dp[i][j]` 是两个前缀的全局最优；这里的 `dfs(i, j)` 是以两个位置结尾的局部连续长度。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[row + 1][col + 1]` 表示：
+
+> 以 `nums1[row]` 和 `nums2[col]` 结尾的最长公共子数组长度。
+
+也可以写成：
+
+`dp[i][j]` 表示：
+
+> 以 `nums1[i - 1]` 和 `nums2[j - 1]` 结尾的最长公共子数组长度。
+
+最终答案不是 `dp[nums1.size()][nums2.size()]`，而是整张表里的最大值。
+
+这是 718 最重要的状态差异。
+
+### 状态转移
+
+处理真实元素 `nums1[row]` 和 `nums2[col]`。
+
+如果两个元素相等：
+
+$$
+dp[row + 1][col + 1] = dp[row][col] + 1
+$$
+
+如果两个元素不相等：
+
+$$
+dp[row + 1][col + 1] = 0
+$$
+
+没有 `max(dp[row][col + 1], dp[row + 1][col])`。
+
+因为上方和左方代表的是别的位置结尾的答案，它们不能延续到当前这两个不相等的尾元素上。
+
+### 初始化
+
+安全垫第 0 行和第 0 列都为 0：
+
+- `dp[0][j] = 0`：`nums1` 没有元素时，不存在以某个元素结尾的公共子数组。
+- `dp[i][0] = 0`：`nums2` 没有元素时，同理为 0。
+
+整个 `dp` 初始化为 0 即可。
+
+### 遍历顺序
+
+每个状态只依赖左上角：
+
+- `dp[row][col]`
+
+从左到右、从上到下遍历即可，并在计算每个状态时更新全局答案。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求两个数组的最长公共连续子数组长度。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个数组中最长公共子数组的长度。
+     */
+    int findLength(vector<int>& nums1, vector<int>& nums2) {
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<vector<int>> dp(rows + 1, vector<int>(cols + 1, 0));
+        int answer = 0;
+
+        for (int row = 0; row < rows; row++) {
+            for (int col = 0; col < cols; col++) {
+                if (nums1[row] == nums2[col]) {
+                    // 当前两个元素相等，连续公共长度从左上角延续。
+                    dp[row + 1][col + 1] = dp[row][col] + 1;
+                    answer = max(answer, dp[row + 1][col + 1]);
+                }
+                // 不相等时保持 0，表示连续公共子数组在这里断开。
+            }
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums1.size() \times nums2.size())$。
+- 空间复杂度：$O(nums1.size() \times nums2.size())$。
+
+### 空间优化
+
+二维转移只依赖左上角，所以一维压缩仍然可以用 `prev_diagonal`。
+
+压缩后：
+
+- `dp[col + 1]` 更新前是旧的上方状态。
+- `dp[col]` 更新前是旧的左上角，但由于 `dp[col]` 可能已经被当前行更新过，所以更稳妥地用 `prev_diagonal` 保存。
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求两个数组的最长公共连续子数组长度。
+     *
+     * @param nums1 第一个整数数组。
+     * @param nums2 第二个整数数组。
+     * @return 两个数组中最长公共子数组的长度。
+     */
+    int findLength(vector<int>& nums1, vector<int>& nums2) {
+        const int rows = static_cast<int>(nums1.size());
+        const int cols = static_cast<int>(nums2.size());
+        vector<int> dp(cols + 1, 0);
+        int answer = 0;
+
+        for (int row = 0; row < rows; row++) {
+            int prev_diagonal = 0;
+
+            for (int col = 0; col < cols; col++) {
+                // 保存旧的上方状态；下一列会把它当成左上角。
+                const int old_up = dp[col + 1];
+
+                if (nums1[row] == nums2[col]) {
+                    dp[col + 1] = prev_diagonal + 1;
+                    answer = max(answer, dp[col + 1]);
+                } else {
+                    // 连续子数组不能跨过不相等位置，必须清零。
+                    dp[col + 1] = 0;
+                }
+
+                prev_diagonal = old_up;
+            }
+        }
+
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums1.size() \times nums2.size())$。
+- 空间复杂度：$O(nums2.size())$。
+
+### 和 LCS 的对照
+
+718 和 1143 都是在两个序列里找公共部分，但状态含义完全不同。
+
+| 题目 | 找的对象 | `dp[i][j]` 的含义 | 不相等时 |
+| --- | --- | --- | --- |
+| 1143. 最长公共子序列 | 子序列，可跳过元素 | 两个前缀中的最长公共子序列长度 | 取上方 / 左方最大值 |
+| 718. 最长重复子数组 | 子数组，必须连续 | 必须以两个当前位置结尾的最长公共后缀长度 | 直接清零 |
+
+这就是为什么 718 不能写成：
+
+```cpp
+dp[row + 1][col + 1] = max(dp[row][col + 1], dp[row + 1][col]);
+```
+
+因为那样是在继承别处的全局最优，但最长公共子数组要求连续，当前不相等时必须断开。
+
+### 这题的核心手感
+
+718 的核心，是把状态从“两个前缀的全局最优”改成“以两个位置结尾的连续长度”。
+
+所以只需要盯住当前两个元素：
+
+- **相等**：从左上角延续，长度 `+1`。
+- **不相等**：连续关系断开，当前状态为 0。
+
+安全垫写法里就是：
+
+```text
+if nums1[row] == nums2[col]:
+    dp[row + 1][col + 1] = dp[row][col] + 1
+else:
+    dp[row + 1][col + 1] = 0
+```
+
+最终答案要在所有 `dp[row + 1][col + 1]` 里取最大值，而不是直接返回右下角。
+
+如果 LCS 的关键词是“可以跳过”，那最长公共子数组的关键词就是“不能断”。
+
+## [3290. 最高乘法得分 - 力扣（LeetCode）](https://leetcode.cn/problems/maximum-multiplication-score/description/)
+
+给你一个大小为 4 的整数数组 `a`，和一个大小至少为 4 的整数数组 `b`。
+
+需要从数组 `b` 中选择四个下标 `i0, i1, i2, i3`，并满足：
+
+```text
+i0 < i1 < i2 < i3
+```
+
+得分为：
+
+$$
+a[0] \times b[i0] +
+a[1] \times b[i1] +
+a[2] \times b[i2] +
+a[3] \times b[i3]
+$$
+
+返回能够获得的最大得分。
+
+示例 1：
+
+```text
+输入：a = [3,2,5,6], b = [2,-6,4,-5,-3,2,-7]
+输出：26
+解释：
+选择下标 0, 1, 2 和 5。
+得分为 3 * 2 + 2 * (-6) + 5 * 4 + 6 * 2 = 26。
+```
+
+示例 2：
+
+```text
+输入：a = [-1,4,5,-2], b = [-5,-1,-3,-2,-4]
+输出：-1
+解释：
+选择下标 0, 1, 3 和 4。
+得分为 (-1) * (-5) + 4 * (-1) + 5 * (-2) + (-2) * (-4) = -1。
+```
+
+提示：
+
+- `a.length == 4`
+- `4 <= b.length <= 10^5`
+- `-10^5 <= a[i], b[i] <= 10^5`
+
+### 题目如何思考？
+
+这题最重要的限制是：
+
+> `a` 的长度固定为 4，但 `b` 很长，而且只能从 `b` 里按下标递增地选 4 个数。
+
+不要先想“我扫描到一个 `b[index]` 要不要选”。更自然的入口是：
+
+> 如果我只看 `b[0..index]` 这一段前缀，并且要选出若干个数，那么最后一个位置 `b[index]` 到底有没有被选？
+
+假设现在要从 `b[0..index]` 里选出 `picked` 个数，去匹配：
+
+```text
+a[0], a[1], ..., a[picked - 1]
+```
+
+那么 `b[index]` 只有两种可能：
+
+- **不选 `b[index]`**：答案就等于只看更短前缀 `b[0..index - 1]`，仍然选 `picked` 个数。
+- **选 `b[index]`**：因为它是当前前缀的最后一个位置，所以它一定是第 `picked` 个被选中的数，只能匹配 `a[picked - 1]`。
+
+第二种情况里，前面的 `picked - 1` 个数必须全部来自 `b[0..index - 1]`。
+
+所以这题的核心不是复杂的匹配，而是一个很标准的“看前缀，问最后一个元素选不选”的 DP。
+
+### 递归切入（最后一个位置选不选）
+
+定义 `dfs(a_index, b_index)` 表示：
+
+> 使用 `a[0..a_index]`，从 `b[0..b_index]` 中按下标递增选择 `a_index + 1` 个数时，能够得到的最大得分。
+
+这个定义是从前缀角度来的：
+
+- `a_index` 表示当前要匹配到 `a[a_index]`。
+- `b_index` 表示当前允许使用的 `b` 前缀是 `b[0..b_index]`。
+
+站在最后一个位置 `b[b_index]` 上，有两个选择。
+
+**不选 `b[b_index]`**：
+
+此时还要用 `a[0..a_index]`，但只能从更短的 `b[0..b_index - 1]` 中选。
+
+$$
+dfs(a\_index,\ b\_index - 1)
+$$
+
+**选择 `b[b_index]`**：
+
+因为 `b[b_index]` 已经是当前前缀里的最后一个位置，如果选它，它必然是第 `a_index + 1` 个被选中的数，也就是匹配 `a[a_index]`。
+
+前面的 `a_index` 个数，就要从 `b[0..b_index - 1]` 里继续选。
+
+$$
+dfs(a\_index - 1,\ b\_index - 1) +
+a[a\_index] \times b[b\_index]
+$$
+
+递归边界：
+
+- 如果 `a_index < 0`，说明需要匹配的 `a` 都已经匹配完了，返回 0。
+- 如果 `b_index < 0` 但 `a_index >= 0`，说明 `b` 已经没有数了，但还没选够，返回无效小值。
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求选择 4 个 b 下标后的最大乘法得分。
+     *
+     * @param a 长度固定为 4 的系数数组。
+     * @param b 候选数组，需要按下标递增顺序选择 4 个元素。
+     * @return 能获得的最大得分。
+     */
+    long long maxScore(vector<int>& a, vector<int>& b) {
+        const int b_size = static_cast<int>(b.size());
+        vector<vector<long long>> memo(kPickCount, vector<long long>(b_size, kUnknown));
+        return dfs(a, b, memo, kPickCount - 1, b_size - 1);
+    }
+
+private:
+    static constexpr int kPickCount = 4;
+    static constexpr long long kInvalid = LLONG_MIN / 4;
+    static constexpr long long kUnknown = LLONG_MAX;
+
+    long long dfs(
+        const vector<int>& a,
+        const vector<int>& b,
+        vector<vector<long long>>& memo,
+        int a_index,
+        int b_index) {
+        if (a_index < 0) {
+            return 0;
+        }
+        if (b_index < 0) {
+            return kInvalid;
+        }
+
+        long long& cached = memo[a_index][b_index];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        // 不选 b[b_index]：仍然用当前 a 前缀，但 b 的可用前缀缩短。
+        const long long skip_current = dfs(a, b, memo, a_index, b_index - 1);
+
+        // 选择 b[b_index]：它作为当前前缀里最后一个被选数，匹配 a[a_index]。
+        const long long previous_score = dfs(a, b, memo, a_index - 1, b_index - 1);
+        long long take_current = kInvalid;
+        if (previous_score != kInvalid) {
+            take_current = previous_score + 1LL * a[a_index] * b[b_index];
+        }
+
+        cached = max(skip_current, take_current);
+        return cached;
+    }
+};
+```
+
+记忆化搜索能表达清楚思路，但 `b.length` 最大是 `10^5`，递归深度也可能达到 `10^5`。实际提交时更推荐下面的迭代 DP。
+
+### 状态定义
+
+使用安全垫写法：
+
+`dp[picked][index + 1]` 表示：
+
+> 从 `b[0..index]` 这个前缀里，刚好选择 `picked` 个数，去匹配 `a[0..picked - 1]` 时，能够得到的最大得分。
+
+这里：
+
+- `index + 1` 表示 `b` 的前缀长度，真实处理的最后一个元素是 `b[index]`。
+- `picked` 表示从这个前缀里已经选择了多少个数，范围是 `0..4`。
+- 如果选择当前 `b[index]`，它会成为第 `picked` 个被选中的数，对应乘上 `a[picked - 1]`。
+
+最终答案是：
+
+$$
+dp[4][b.size()]
+$$
+
+### 状态转移
+
+处理真实元素 `b[index]`。
+
+如果要从 `b[0..index]` 中刚好选 `picked` 个数，最后一个位置 `b[index]` 还是两个选择。
+
+**不选 `b[index]`**：
+
+答案直接继承更短前缀 `b[0..index - 1]`。
+
+$$
+dp[picked][index + 1] =
+dp[picked][index]
+$$
+
+**选择 `b[index]`**：
+
+它会作为第 `picked` 个被选中的数，匹配 `a[picked - 1]`。前面的 `picked - 1` 个数只能来自 `b[0..index - 1]`。
+
+$$
+dp[picked][index + 1] =
+\max(
+dp[picked][index + 1],\
+dp[picked - 1][index] + a[picked - 1] \times b[index]
+)
+$$
+
+合起来就是：
+
+$$
+dp[picked][index + 1] =
+\max(
+dp[picked][index],\
+dp[picked - 1][index] + a[picked - 1] \times b[index]
+)
+$$
+
+这个转移天然保证下标递增，因为选择 `b[index]` 之后，前面的选择只能来自 `index` 之前的前缀。
+
+### 初始化
+
+因为数组里有负数，而且必须刚好选择 4 个数，所以不能把所有状态初始化为 0。
+
+- `dp[0][prefix] = 0`：从任意 `b` 前缀里选择 0 个数，得分都是 0。
+- `dp[picked][0] = kInvalid`：如果 `picked > 0`，从空前缀里不可能选出正数个元素。
+- 其它状态初始化为无效小值 `kInvalid`：表示当前选择数量无法达到。
+
+这里和前面的“非空必须不能默认 0”是同一个道理：如果默认 0，负数答案会被错误覆盖。
+
+### 遍历顺序
+
+二维 DP 中：
+
+- 外层从 `picked = 1` 到 `4`，枚举当前要选出几个数。
+- 内层从 `index = 0` 到 `b.size() - 1`，枚举当前 `b` 前缀的最后一个位置。
+
+这样写会非常贴近递归式：
+
+```text
+dfs(a_index, b_index)
+```
+
+翻译成 DP 后就是：
+
+```text
+dp[picked][index + 1]
+```
+
+其中 `picked = a_index + 1`。
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维 DP 求选择 4 个 b 下标后的最大乘法得分。
+     *
+     * @param a 长度固定为 4 的系数数组。
+     * @param b 候选数组，需要按下标递增顺序选择 4 个元素。
+     * @return 能获得的最大得分。
+     */
+    long long maxScore(vector<int>& a, vector<int>& b) {
+        constexpr int kPickCount = 4;
+        constexpr long long kInvalid = LLONG_MIN / 4;
+        const int b_size = static_cast<int>(b.size());
+        vector<vector<long long>> dp(
+            kPickCount + 1,
+            vector<long long>(b_size + 1, kInvalid));
+
+        for (int prefix = 0; prefix <= b_size; prefix++) {
+            dp[0][prefix] = 0;
+        }
+
+        for (int picked = 1; picked <= kPickCount; picked++) {
+            for (int index = 0; index < b_size; index++) {
+                // 不选 b[index]：仍然只从更短前缀里选 picked 个数。
+                dp[picked][index + 1] = dp[picked][index];
+
+                if (dp[picked - 1][index] != kInvalid) {
+                    // 选 b[index]：它作为第 picked 个被选数，匹配 a[picked - 1]。
+                    dp[picked][index + 1] = max(
+                        dp[picked][index + 1],
+                        dp[picked - 1][index] + 1LL * a[picked - 1] * b[index]);
+                }
+            }
+        }
+
+        return dp[kPickCount][b_size];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(4 \times b.size())$，也就是 $O(b.size())$。
+- 空间复杂度：$O(4 \times b.size())$。
+
+### 空间优化
+
+二维 DP 里，每一层 `picked` 只依赖：
+
+- 当前层的左边状态 `dp[picked][index]`，表示不选当前 `b[index]`。
+- 上一层的左边状态 `dp[picked - 1][index]`，表示选择当前 `b[index]`。
+
+因为只需要选 4 个数，可以压成长度为 5 的一维数组：
+
+`dp[picked]` 表示：
+
+> 当前已经扫描过一部分 `b` 后，选择了 `picked` 个元素时的最大得分。
+
+处理一个新的 `num = b[index]` 时，如果要选择它作为第 `picked` 个数：
+
+$$
+dp[picked] =
+\max(dp[picked],\ dp[picked - 1] + a[picked - 1] \times num)
+$$
+
+这里必须逆序遍历 `picked`：
+
+```cpp
+for (int picked = 4; picked >= 1; picked--)
+```
+
+原因是每个 `b[index]` 只能被选择一次。如果正序遍历，刚用当前 `num` 更新了 `dp[picked]`，后面又可能继续用这个新值更新 `dp[picked + 1]`，相当于同一个 `b[index]` 被用在多个位置。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用一维 DP 求选择 4 个 b 下标后的最大乘法得分。
+     *
+     * @param a 长度固定为 4 的系数数组。
+     * @param b 候选数组，需要按下标递增顺序选择 4 个元素。
+     * @return 能获得的最大得分。
+     */
+    long long maxScore(vector<int>& a, vector<int>& b) {
+        constexpr int kPickCount = 4;
+        constexpr long long kInvalid = LLONG_MIN / 4;
+        array<long long, kPickCount + 1> dp{};
+        dp.fill(kInvalid);
+        dp[0] = 0;
+
+        for (const int num : b) {
+            // 逆序遍历选择数量，避免同一个 b 元素在本轮被重复使用。
+            for (int picked = kPickCount; picked >= 1; picked--) {
+                if (dp[picked - 1] == kInvalid) {
+                    continue;
+                }
+
+                dp[picked] = max(
+                    dp[picked],
+                    dp[picked - 1] + 1LL * a[picked - 1] * num);
+            }
+        }
+
+        return dp[kPickCount];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(4 \times b.size())$，也就是 $O(b.size())$。
+- 空间复杂度：$O(1)$。
+
+### 为什么一维必须逆序？
+
+假设正序遍历：
+
+```cpp
+for (int picked = 1; picked <= 4; picked++) {
+    dp[picked] = max(dp[picked], dp[picked - 1] + a[picked - 1] * num);
+}
+```
+
+当 `picked = 1` 时，当前 `num` 可以更新 `dp[1]`。
+
+接着 `picked = 2` 时，`dp[1]` 可能已经包含了当前 `num`，再用它更新 `dp[2]`，就等于同一个 `num` 同时作为第 1 个和第 2 个被选元素。
+
+这违反了题目中下标必须严格递增的要求。
+
+逆序遍历时，`dp[picked]` 还保持上一轮扫描结束后的状态，不会被当前 `num` 污染。
+
+### 这题的核心手感
+
+3290 的核心，是把问题看成：
+
+> 看 `b` 的前缀，最后一个位置 `b[index]` 要么不选，要么作为当前前缀里最后一个被选中的数。
+
+因为 `a.length == 4`，状态非常小：
+
+```text
+dp[picked] = 已经选了 picked 个 b 元素时的最大得分
+```
+
+当看到新的 `num` 时：
+
+```text
+选择它作为第 picked 个元素：
+dp[picked] = max(dp[picked], dp[picked - 1] + a[picked - 1] * num)
+```
+
+这题真正要记住的是两个点：
+
+- **必须刚好选 4 个**，所以无效状态不能初始化为 0。
+- **一维压缩必须逆序遍历 picked**，因为每个 `b[index]` 只能被用一次。
