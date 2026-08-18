@@ -2514,7 +2514,9 @@ inline __device__ void compute_attn_1rowblock(
     // 没有任何可见 K tile 时（空 K、causal/local 完全遮住当前 Q tile、或变长尾部），
     // 不能进入后续 global K/V 读取。语义上 O=0，LSE=+inf。
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
-        // 将全局输出 O 解释为 (actual_Lq, Hq, d)；先只切出当前 head 的 Q tile。
+        // mO: global O 的三维 view，逻辑形状 (actual_Lq, Hq, d)，
+        //     stride 为 (o_row_stride, o_head_stride, 1)。
+        // gO: 当前 CTA 要写的 O tile，逻辑形状 (kBlockM, kHeadDim)。
         Tensor mO = make_tensor(
             make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                           + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
@@ -2523,18 +2525,22 @@ inline __device__ void compute_attn_1rowblock(
         Tensor gO = local_tile(mO(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                                make_coord(m_block, 0));
 
-        // 同一 Q tile 的每行只有一个 LSE 标量；get_lse_tile 已处理定长、packed 和 swapped layout。
+        // gLSE: 当前 Q tile 的 LSE 向量，逻辑形状 (kBlockM)。
+        //        同一 query row 只有一个 LSE 标量；get_lse_tile 已处理定长、packed 和 swapped layout。
         Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
             params, bidb, bidh, m_block, binfo);
 
-        // 以 O 的 global-copy atom 切分当前线程负责的输出元素，并构造全零寄存器源。
+        // tOgO: 当前线程负责写的 global O 分片，形状约为 (CPY, CPY_M, CPY_K)。
+        // tOrO: 与 tOgO 同形状的寄存器源分片，这里填零后写回 O。
         typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
         auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
         Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
         Tensor tOrO = make_tensor<Element>(shape(tOgO));
         clear(tOrO);
 
-        // identity tensor 保留每个分片元素的逻辑 (row, d) 坐标，供 copy 判断越界。
+        // cO: O tile 的 identity 坐标张量，逻辑形状 (kBlockM, kHeadDim)，元素值为 (row, d)。
+        // tOcO: 当前线程对应的坐标分片，形状与 tOgO 对齐，约为 (CPY, CPY_M, CPY_K)。
+        // tOpO: 只按 K/d 维保存列谓词，形状为 (CPY_K)。
         Tensor cO = make_identity_tensor(make_shape(size<0>(gO), size<1>(gO)));
         Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
         Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));
@@ -2570,7 +2576,8 @@ inline __device__ void compute_attn_1rowblock(
         + m_block * kBlockM) * params.seqlen_k_rounded
         + (n_block_max - 1) * kBlockN;
 
-    // Q: (actual_Lq, Hq, d) → 当前 head 的 gQ: (kBlockM, kHeadDim)。
+    // mQ: global Q 的三维 view，逻辑形状 (actual_Lq, Hq, d)。
+    // gQ: 当前 CTA 的 Q tile，逻辑形状 (kBlockM, kHeadDim)，其中 M 维是 query row。
     Tensor mQ = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                       + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
@@ -2579,8 +2586,10 @@ inline __device__ void compute_attn_1rowblock(
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));
 
-    // K/V: (actual_Lk, Hkv, d)。bidh / h_h_k_ratio 完成 GQA/MQA 的 Q-head → KV-head 映射；
-    // local_tile 的第三维保留全部 n_block，循环时再取其中一片。
+    // mK/mV: global K/V 的三维 view，逻辑形状 (actual_Lk, Hkv, d)。
+    // gK/gV: 当前 KV head 的所有 K/V tile view，逻辑形状 (kBlockN, kHeadDim, nblocksN)。
+    //         bidh / h_h_k_ratio 完成 GQA/MQA 的 Q-head → KV-head 映射；
+    //         第三维保留全部 n_block，循环时用 tKgK(_,_,_,n_block) 取其中一片。
     Tensor mK = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
                       + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
@@ -2596,26 +2605,32 @@ inline __device__ void compute_attn_1rowblock(
     Tensor gV = local_tile(mV(_, bidh / params.h_h_k_ratio, _),
                            Shape<Int<kBlockN>, Int<kHeadDim>>{}, make_coord(_, 0));
 
-    // 可选返回 P 的 global tile。row_offset_p 指向最后一个 n_block；之后每轮令 tSgS
-    // 的基址向左移动 kBlockN，因此与反向扫描顺序一致。
+    // gP: 可选返回 P 的 global tile，逻辑形状 (kBlockM, kBlockN)。
+    //     row_offset_p 指向最后一个 n_block；之后每轮令 tSgS 的基址向左移动 kBlockN，
+    //     因此与反向扫描顺序一致。
     Tensor gP = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element *>(params.p_ptr) + row_offset_p),
         Shape<Int<kBlockM>, Int<kBlockN>>{}, make_stride(params.seqlen_k_rounded, _1{}));
 
-    // 动态 shared memory 的线性切分：sQ；sK；sV。Share_Q_K_smem 时 sQ 与 sK 复用同一段，
-    // 因而稍后必须等待 Q 已读入寄存器，并在复用前后同步。
+    // sQ: shared Q tile，逻辑形状 (kBlockM, kHeadDim)，带 traits 定义的 swizzle layout。
+    // sK/sV: shared K/V tile，逻辑形状 (kBlockN, kHeadDim)。
+    // Share_Q_K_smem 时 sQ 与 sK 复用同一段，因而稍后必须等待 Q 已读入寄存器，
+    // 并在复用前后同步。
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(sQ.data() + (Kernel_traits::Share_Q_K_smem ? 0 : size(sQ)),
                             typename Kernel_traits::SmemLayoutKV{});
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
-    // sVt 与 sVtNoSwizzle 指向同一 storage，只是 PV 的 shared→register copy 使用不同逻辑布局。
+    // sVt: 同一 sV storage 的转置 view，逻辑服务于 PV 的 B operand，形状可理解为 (kHeadDim, kBlockN)。
+    // sVtNoSwizzle: 同一 storage 的 no-swizzle 转置 view，供 MMA operand fragment 解释 layout。
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(
         sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
-    // 以同一种 global-memory copy atom 切分 Q/K/V。每个 t*g* / t*s* 都是当前线程的 rank-3 分片；
-    // K/V 额外含 nblocksN 维，循环按 n_block 取其中一个 tile。
+    // 以同一种 global-memory copy atom 切分 Q/K/V。
+    // tQgQ/tQsQ: 当前线程的 Q copy 分片，形状约为 (CPY, CPY_M, CPY_K)。
+    // tKgK/tVgV: 当前线程的 K/V global 分片，形状约为 (CPY, CPY_N, CPY_K, nblocksN)。
+    // tKsK/tVsV: 当前线程的 K/V shared 分片，形状约为 (CPY, CPY_N, CPY_K)。
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
     Tensor tQgQ = gmem_thr_copy_QKV.partition_S(gQ);
@@ -2626,7 +2641,10 @@ inline __device__ void compute_attn_1rowblock(
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
 
     // 取得当前线程的 Tensor Core MMA 分片。
-    // tSrQ/tSrK 是 QK^T 的 operand；tOrVt 是 PV 的 V operand；tSgS 是 P 的 global 写回分片。
+    // tSrQ: QK^T 的 A operand 寄存器分片，覆盖 Q tile 的本线程 MMA_M × MMA_K 片段。
+    // tSrK: QK^T 的 B operand 寄存器分片，覆盖 K tile 的本线程 MMA_N × MMA_K 片段。
+    // tOrVt: PV 的 B operand 寄存器分片，覆盖 V tile 的本线程 MMA_K × MMA_N 片段。
+    // tSgS: 可选 P 写回的 C 分片，形状与 acc_s 的 per-thread accumulator 对齐。
     typename Kernel_traits::TiledMma tiled_mma;
     auto thr_mma = tiled_mma.get_thread_slice(tidx);
     Tensor tSrQ = thr_mma.partition_fragment_A(sQ);
@@ -2634,21 +2652,25 @@ inline __device__ void compute_attn_1rowblock(
     Tensor tOrVt = thr_mma.partition_fragment_B(sVtNoSwizzle);
     Tensor tSgS = thr_mma.partition_C(gP);
 
-    // acc_o 是整个函数生命周期内的 fp32 输出分子 accumulator，逻辑形状为 kBlockM × kHeadDim。
+    // acc_o: 整个函数生命周期内的 fp32 输出分子 accumulator。
+    //        全 CTA 逻辑形状为 (kBlockM, kHeadDim)，当前线程持有其 MMA C fragment。
     Tensor acc_o = partition_fragment_C(
         tiled_mma, Shape<Int<kBlockM>, Int<kHeadDim>>{});
 
     // 为 shared→register 搬运构造与两次 GEMM operand 对齐的 tiled copy。
+    // tSsQ: 当前线程从 sQ 读出的 shared 分片，形状与 tSrQ 可通过 retile_D 对齐。
     auto smem_tiled_copy_Q = make_tiled_copy_A(
         typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
 
+    // tSsK: 当前线程从 sK 读出的 shared 分片，形状与 tSrK 对齐。
     auto smem_tiled_copy_K = make_tiled_copy_B(
         typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_K.partition_S(sK);
 
+    // tOsVt: 当前线程从 sVt 读出的 shared 分片，形状与 PV 的 V operand tOrVt 对齐。
     auto smem_tiled_copy_V = make_tiled_copy_B(
         typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma);
     auto smem_thr_copy_V = smem_tiled_copy_V.get_thread_slice(tidx);
@@ -2656,11 +2678,14 @@ inline __device__ void compute_attn_1rowblock(
 
     // cQ/cKV 将 shared-memory 的逻辑坐标 (row, d) 原样携带到每个线程 copy partition；
     // 它们不是数据，而是后面判断 M/N 尾部与 K 维 padding 的“坐标真相”。
+    // cQ: 逻辑形状 (kBlockM, kHeadDim)；tQcQ: 形状约为 (CPY, CPY_M, CPY_K)。
+    // cKV: 逻辑形状 (kBlockN, kHeadDim)；tKVcKV: 形状约为 (CPY, CPY_N, CPY_K)。
     Tensor cQ = make_identity_tensor(make_shape(size<0>(sQ), size<1>(sQ)));
     Tensor cKV = make_identity_tensor(make_shape(size<0>(sK), size<1>(sK)));
     Tensor tQcQ = gmem_thr_copy_QKV.partition_S(cQ);
     Tensor tKVcKV = gmem_thr_copy_QKV.partition_S(cKV);
 
+    // tQpQ/tKVpKV: head-dim 谓词向量，形状为 (CPY_K)。
     // 每个 K-copy 子分片只需一个按 d-shard 的谓词；copy 内部会把它应用到 dim-2 的所有元素。
     Tensor tQpQ = make_tensor<bool>(make_shape(size<2>(tQsQ)));
     Tensor tKVpKV = make_tensor<bool>(make_shape(size<2>(tKsK)));
@@ -2689,6 +2714,7 @@ inline __device__ void compute_attn_1rowblock(
         // 此后才允许 sK 覆盖这块 shared memory。
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
+        // tSrQ_copy_view: tSrQ 的 copy 目的视图，形状与 tSsQ 在 copy 维度上对齐。
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
@@ -2706,6 +2732,7 @@ inline __device__ void compute_attn_1rowblock(
         // Q 没与 K 复用 smem 时可以延迟到 K 已发起预取后再等待 Q，形成一次搬运重叠。
         FLASH_NAMESPACE::cp_async_wait<1>();
         __syncthreads();
+        // tSrQ_copy_view: tSrQ 的 copy 目的视图，形状与 tSsQ 在 copy 维度上对齐。
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
@@ -2738,7 +2765,9 @@ inline __device__ void compute_attn_1rowblock(
     #pragma unroll
     for (int masking_step = 0; masking_step < n_masking_steps;
          ++masking_step, --n_block) {
-        // 当前 score tile 的 fp32 accumulator；每轮重新从零开始计算一个 QK^T。
+        // acc_s: 当前 score tile 的 fp32 accumulator。
+        //        全 CTA 逻辑形状为 (kBlockM, kBlockN)，当前线程持有 MMA C fragment；
+        //        每轮重新从零开始计算一个 QK^T。
         Tensor acc_s = partition_fragment_C(
             tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
@@ -2799,6 +2828,8 @@ inline __device__ void compute_attn_1rowblock(
                                                   /*Check_inf=*/Is_causal || Is_local>(
                   acc_s, acc_o, params.scale_softmax_log2);
 
+        // rP: acc_s 的低精度副本。全 CTA 逻辑形状仍为 (kBlockM, kBlockN)，
+        //     但每个线程持有的是与 acc_s 同 layout 的 per-thread fragment。
         // 此时 acc_s 已由 raw score 原地变为 E；转为 fp16/bf16，作为第二次 MMA 的 P operand。
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
@@ -2807,6 +2838,7 @@ inline __device__ void compute_attn_1rowblock(
         if (Return_softmax) {
             // 返回 P 的接口要保存“带 dropout、并将 drop 编到符号位”的版本；
             // 先复制一份，因此真正用于 PV 的 rP 不会被这条调试/兼容写回路径修改。
+            // rP_drop: 与 rP 同形状的临时 fragment，用于写 params.p_ptr。
             Tensor rP_drop = make_fragment_like(rP);
             cute::copy(rP, rP_drop);
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
@@ -2820,7 +2852,8 @@ inline __device__ void compute_attn_1rowblock(
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
-        // 重解释 rP 的 layout，使它成为 PV GEMM 的 A operand；只改 CuTe view，不搬运数据。
+        // tOrP: rP 重新解释后的 PV A operand fragment。
+        //       全 CTA 逻辑形状为 (kBlockM, kBlockN)，但 layout 改成 gemm_rs 期望的 Aregs 形态。
         Tensor tOrP = make_tensor(
             rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<
                 typename Kernel_traits::TiledMma>(rP.layout()));
@@ -2840,6 +2873,8 @@ inline __device__ void compute_attn_1rowblock(
     // 剩余 tile 位于序列内部且不跨 causal/window 边界；仍调用 apply_mask<false>，
     // 但它只保留可能存在的 ALiBi 加法，不再逐元素进行 causal/N 尾部判断。
     for (; n_block >= n_block_min; --n_block) {
+        // acc_s: 当前完整 K tile 的 fp32 score accumulator。
+        //        全 CTA 逻辑形状为 (kBlockM, kBlockN)，当前线程持有 MMA C fragment。
         Tensor acc_s = partition_fragment_C(
             tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
         clear(acc_s);
@@ -2878,10 +2913,12 @@ inline __device__ void compute_attn_1rowblock(
                                               /*Check_inf=*/Is_local>(
             acc_s, acc_o, params.scale_softmax_log2);
 
+        // rP: 当前完整 tile 的低精度 P/E fragment，形状与 acc_s 相同。
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
         int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
         int block_col_idx = n_block * (kBlockN / 32);
         if (Return_softmax) {
+            // rP_drop: 与 rP 同形状的临时 fragment，用于可选写回 P。
             Tensor rP_drop = make_fragment_like(rP);
             cute::copy(rP, rP_drop);
             dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
@@ -2893,6 +2930,7 @@ inline __device__ void compute_attn_1rowblock(
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
+        // tOrP: rP 的 PV A operand view，形状语义仍是 (kBlockM, kBlockN)。
         Tensor tOrP = make_tensor(
             rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<
                 typename Kernel_traits::TiledMma>(rP.layout()));
@@ -2902,17 +2940,22 @@ inline __device__ void compute_attn_1rowblock(
 
     // ------------------------------ Epilogue ------------------------------
 
-    // 将所有 K tile 累积的 (u, ell, m) 收尾：acc_o 从 u 变为 O=u/ell；
-    // lse 为每个 query row 的 m + log(ell)，供 backward 重建 softmax。
+    // 将所有 K tile 累积的 (u, ell, m) 收尾：acc_o 从 u 变为 O=u/ell。
+    // lse: 当前线程持有的 LSE 标量 fragment；全 CTA 逻辑形状为 (kBlockM)，
+    //      每个 query row 最终只写一个 LSE，值为 m + log(ell)。
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(
         acc_o, params.scale_softmax, params.rp_dropout);
 
-    // O 仍是 fp32 accumulator；先转回输出元素类型，然后临时借用 sQ 那块 shared memory 做 staged store。
+    // rO: acc_o 的低精度输出 fragment。全 CTA 逻辑形状为 (kBlockM, kHeadDim)，
+    //     当前线程持有与 acc_o 同 layout 的 per-thread fragment。
+    // sO: shared O tile，逻辑形状 (kBlockM, kHeadDim)，临时借用 sQ 的 storage 做 staged store。
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});
     auto smem_tiled_copy_O = make_tiled_copy_C(
         typename Kernel_traits::SmemCopyAtomO{}, tiled_mma);
     auto smem_thr_copy_O = smem_tiled_copy_O.get_thread_slice(tidx);
+    // taccOrO: rO 按 shared-store copy atom retile 后的寄存器源分片。
+    // taccOsO: 当前线程写入 sO 的 shared 目的分片，形状与 taccOrO 对齐。
     Tensor taccOrO = smem_thr_copy_O.retile_S(rO);
     Tensor taccOsO = smem_thr_copy_O.partition_D(sO);
 
@@ -2921,6 +2964,7 @@ inline __device__ void compute_attn_1rowblock(
     cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
 
     // 重新构造当前 Q tile 的 global O 与 LSE 视图；这与早退路径使用同一逻辑坐标。
+    // mO: (actual_Lq, Hq, d)；gO: 当前 CTA 写回的 (kBlockM, kHeadDim)。
     Tensor mO = make_tensor(
         make_gmem_ptr(reinterpret_cast<Element*>(params.o_ptr)
                       + binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)),
@@ -2931,7 +2975,9 @@ inline __device__ void compute_attn_1rowblock(
     Tensor gLSE = get_lse_tile<ElementAccum, Params, kBlockM, Is_even_MN>(
         params, bidb, bidh, m_block, binfo);
 
-    // 先将 shared O 按 global-copy atom 切分。tOsO 是 shared 源，tOgO 是 global 目的。
+    // 先将 shared O 按 global-copy atom 切分。
+    // tOsO: 当前线程从 sO 读取的 shared 分片，约为 (CPY, CPY_M, CPY_K)。
+    // tOgO: 当前线程写到 gO 的 global 分片，约为 (CPY, CPY_M, CPY_K)。
     typename Kernel_traits::GmemTiledCopyO gmem_tiled_copy_O;
     auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(tidx);
     Tensor tOsO = gmem_thr_copy_O.partition_S(sO);
@@ -2939,13 +2985,17 @@ inline __device__ void compute_attn_1rowblock(
 
     // 保证所有线程都已完成 rO→sO，才允许任一线程从 sO 读走写 global O。
     __syncthreads();
+    // tOrO: 与 tOgO 同形状的寄存器中转分片，用于 shared→register→global 的两段式写回。
     Tensor tOrO = make_tensor<Element>(shape(tOgO));
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
-    // 对 O 的 identity layout 重做 MMA partition，取得“哪个 accumulator 元素属于哪一逻辑 Q 行”。
+    // caccO: O accumulator 的 identity 坐标张量，逻辑形状 (kBlockM, kHeadDim)。
+    // taccOcO: 当前线程的 MMA C 坐标 fragment，形状与 acc_o/rO 对齐。
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
     Tensor taccOcO = thr_mma.partition_C(caccO);
     static_assert(decltype(size<0>(taccOcO))::value == 4);
+    // taccOcO_row: 从 C fragment 中抽出的“每个 LSE 对应哪一条 Q 行”的坐标向量，
+    //               形状与 lse 对齐。
     // 一个线程的 C fragment 第一维含四个元素；按 2 分块并选坐标 0 后，每个 mi 对应一条 Q 行。
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));
@@ -2961,6 +3011,9 @@ inline __device__ void compute_attn_1rowblock(
     }
 
     // 为 O 的 global 写回创建逻辑坐标和 K/d 维谓词，屏蔽 head-dim padding。
+    // cO: shared O 的 identity 坐标张量，逻辑形状 (kBlockM, kHeadDim)。
+    // tOcO: 当前线程的 O 坐标分片，形状约为 (CPY, CPY_M, CPY_K)。
+    // tOpO: head-dim 谓词向量，形状为 (CPY_K)。
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));
     Tensor tOcO = gmem_thr_copy_O.partition_D(cO);
     Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgO)));

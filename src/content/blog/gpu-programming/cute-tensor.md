@@ -1,3 +1,10 @@
+---
+title: CuTe Tensor 笔记
+date: 2026-08-18
+tags: [CUDA, CuTe, CUTLASS]
+summary: 整理 CuTe Tensor 的核心设计和使用。
+---
+
 # CuTe Tensor：把 Layout 贴到真实数据上
 
 上一篇 `Layout` 文章里，我们一直在讨论“坐标如何映射到线性偏移”。但真正写算子时，只有偏移还不够：我们还需要知道这个偏移要加到哪根指针上、读出来的是什么类型、这块数据在 gmem、smem 还是寄存器里。
