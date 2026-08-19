@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" role="img" aria-labelledby="title desc">
+  <title id="title">Roofline 模型的两条屋顶与屋脊点</title>
+  <desc id="desc">横轴为算术强度，纵轴为性能。蓝色对角线是带宽屋顶，绿色水平线是计算屋顶，两者交点是屋脊点。</desc>
+  <defs>
+    <linearGradient id="memory-zone" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#dbeafe"/>
+      <stop offset="100%" stop-color="#eff6ff"/>
+    </linearGradient>
+    <linearGradient id="compute-zone" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%" stop-color="#dcfce7"/>
+      <stop offset="100%" stop-color="#f0fdf4"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#0f172a" flood-opacity="0.13"/>
+    </filter>
+    <style>
+      .title { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 38px; font-weight: 700; fill: #0f172a; }
+      .subtitle { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 20px; fill: #475569; }
+      .axis { stroke: #334155; stroke-width: 2.5; }
+      .grid { stroke: #cbd5e1; stroke-width: 1.2; stroke-dasharray: 5 8; }
+      .tick { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 18px; fill: #475569; }
+      .label { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 23px; font-weight: 650; fill: #1e293b; }
+      .small { font-family: "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; font-size: 18px; fill: #475569; }
+      .formula { font-family: "DejaVu Sans", "Noto Sans CJK SC", sans-serif; font-size: 23px; font-weight: 700; fill: #0f172a; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1000" fill="#ffffff"/>
+  <text x="110" y="76" class="title">Roofline：两条线怎样给出性能上界</text>
+  <text x="110" y="112" class="subtitle">示例设备：匹配的计算路径峰值为 60 TFLOP/s，DRAM 峰值为 1.5 TB/s；坐标轴均为对数刻度。</text>
+
+  <rect x="190" y="160" width="1160" height="600" rx="16" fill="#f8fafc" stroke="#cbd5e1" stroke-width="2"/>
+  <path d="M190 760 L886 220 L886 760 Z" fill="url(#memory-zone)" opacity="0.9"/>
+  <path d="M886 760 L1350 760 L1350 220 L886 220 Z" fill="url(#compute-zone)" opacity="0.9"/>
+
+  <g class="grid">
+    <line x1="190" y1="160" x2="190" y2="760"/>
+    <line x1="383" y1="160" x2="383" y2="760"/>
+    <line x1="577" y1="160" x2="577" y2="760"/>
+    <line x1="770" y1="160" x2="770" y2="760"/>
+    <line x1="963" y1="160" x2="963" y2="760"/>
+    <line x1="1157" y1="160" x2="1157" y2="760"/>
+    <line x1="1350" y1="160" x2="1350" y2="760"/>
+    <line x1="190" y1="760" x2="1350" y2="760"/>
+    <line x1="190" y1="617" x2="1350" y2="617"/>
+    <line x1="190" y1="474" x2="1350" y2="474"/>
+    <line x1="190" y1="331" x2="1350" y2="331"/>
+    <line x1="190" y1="189" x2="1350" y2="189"/>
+  </g>
+
+  <line x1="190" y1="760" x2="1365" y2="760" class="axis"/>
+  <line x1="190" y1="775" x2="190" y2="145" class="axis"/>
+
+  <g class="tick" text-anchor="middle">
+    <text x="190" y="796">0.01</text>
+    <text x="383" y="796">0.1</text>
+    <text x="577" y="796">1</text>
+    <text x="770" y="796">10</text>
+    <text x="963" y="796">100</text>
+    <text x="1157" y="796">1k</text>
+    <text x="1350" y="796">10k</text>
+  </g>
+  <g class="tick" text-anchor="end">
+    <text x="174" y="766">0.01</text>
+    <text x="174" y="623">0.1</text>
+    <text x="174" y="480">1</text>
+    <text x="174" y="337">10</text>
+    <text x="174" y="195">100</text>
+  </g>
+
+  <text x="770" y="850" class="label" text-anchor="middle">算术强度 AI（FLOP / Byte，log）</text>
+  <text x="64" y="460" class="label" text-anchor="middle" transform="rotate(-90 64 460)">实际性能 P（TFLOP/s，log）</text>
+
+  <path d="M190 735 L886 220" fill="none" stroke="#2563eb" stroke-width="9" stroke-linecap="round"/>
+  <path d="M886 220 L1350 220" fill="none" stroke="#16a34a" stroke-width="9" stroke-linecap="round"/>
+
+  <g filter="url(#shadow)">
+    <rect x="286" y="342" width="340" height="84" rx="12" fill="#ffffff" stroke="#93c5fd" stroke-width="2"/>
+    <text x="312" y="375" class="formula" fill="#1d4ed8">带宽屋顶：P = AI × Bpeak</text>
+    <text x="312" y="405" class="small">斜率由 DRAM 1.5 TB/s 决定</text>
+  </g>
+  <line x1="505" y1="426" x2="571" y2="465" stroke="#2563eb" stroke-width="3" stroke-linecap="round"/>
+
+  <g filter="url(#shadow)">
+    <rect x="1030" y="255" width="280" height="84" rx="12" fill="#ffffff" stroke="#86efac" stroke-width="2"/>
+    <text x="1055" y="288" class="formula" fill="#15803d">计算屋顶：P = Ppeak</text>
+    <text x="1055" y="318" class="small">此例为 60 TFLOP/s</text>
+  </g>
+  <line x1="1100" y1="255" x2="1080" y2="224" stroke="#16a34a" stroke-width="3" stroke-linecap="round"/>
+
+  <line x1="886" y1="220" x2="886" y2="760" stroke="#ef4444" stroke-width="2.5" stroke-dasharray="8 7"/>
+  <circle cx="886" cy="220" r="12" fill="#ef4444" stroke="#ffffff" stroke-width="5"/>
+  <g filter="url(#shadow)">
+    <rect x="700" y="92" width="372" height="88" rx="12" fill="#fff7ed" stroke="#fdba74" stroke-width="2"/>
+    <text x="725" y="126" class="label" fill="#9a3412">屋脊点：AI = Ppeak / Bpeak</text>
+    <text x="725" y="156" class="small">60 / 1.5 = 40 FLOP/B</text>
+  </g>
+  <line x1="886" y1="180" x2="886" y2="207" stroke="#ef4444" stroke-width="3"/>
+  <text x="886" y="731" class="tick" text-anchor="middle" fill="#b91c1c">40</text>
+
+  <g filter="url(#shadow)">
+    <rect x="252" y="627" width="356" height="74" rx="12" fill="#ffffff" fill-opacity="0.92"/>
+    <text x="278" y="658" class="label" fill="#1d4ed8">带宽候选区</text>
+    <text x="278" y="684" class="small">左侧先撞到斜线</text>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="1030" y="627" width="282" height="74" rx="12" fill="#ffffff" fill-opacity="0.92"/>
+    <text x="1056" y="658" class="label" fill="#15803d">计算候选区</text>
+    <text x="1056" y="684" class="small">右侧先撞到平线</text>
+  </g>
+
+  <text x="190" y="914" class="small">读图关键：某个点左或右只说明哪条理想屋顶更低；点是否贴近这条线，才决定它是不是当前主瓶颈。</text>
+  <text x="190" y="946" class="small">斜线以下或平线以下的空隙，可能来自访存延迟、访问效率、同步、指令依赖、CTA 数量不足等，必须再用 profiler 取证。</text>
+</svg>

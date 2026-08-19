@@ -873,7 +873,38 @@ def _init_executor(self) -> None:
     self.scheduler_output: SchedulerOutput | None = None
 ```
 
-传统 `RayDistributedExecutor` 的正常 generation 则有一个容易漏掉的分段：当它需要 sampler 时，`execute_model()` 不立即启动 Ray DAG，而先缓存计划，等 grammar bitmask 准备好后由 `sample_tokens()` 一起提交。
+
+这里先建立一个对 Ray 不熟悉也能用的心智模型：传统 Ray executor 里有两条通道。
+
+- **数据面**：`self.forward_dag: ray.dag.CompiledDAG`。它是高频模型执行通道，负责把一次 `(scheduler_output, grammar_output)` 送进一张已经编译好的 Ray DAG，DAG 节点最终调用每个 actor 上的 `execute_model_ray()`。
+- **控制面**：`collective_rpc()`。它把“调用某个普通方法”的控制消息发给所有 `RayWorkerWrapper` actor，例如初始化 worker、设置环境变量、加载模型、重配分布式状态等。它很重要，但不是每轮 forward/sample 的热路径。
+
+换句话说，`forward_dag` 不是“真正的执行者”，而是把执行者串起来的图。真正执行模型的是每个 Ray actor 里的 `RayWorkerWrapper.worker.model_runner`。
+
+```mermaid
+sequenceDiagram
+    participant E as EngineCore
+    participant X as RayDistributedExecutor
+    participant D as forward_dag<br/>CompiledDAG
+    participant A as RayWorkerWrapper actor
+    participant R as worker.model_runner
+
+    E->>X: execute_model(scheduler_output, non_block=True)
+    X-->>E: 已完成的 None Future<br/>常规生成不跑 DAG
+    E->>E: scheduler.get_grammar_bitmask(...)
+    E->>X: sample_tokens(grammar_output)
+    X->>D: forward_dag.execute((scheduler_output, grammar_output))
+    D->>A: execute_model_ray(...)
+    A->>R: execute_model(...)
+    alt runner 返回 None
+        A->>R: sample_tokens(grammar_output)
+    end
+    A-->>D: ModelRunnerOutput
+    D-->>X: Ray ObjectRef / refs
+    X-->>E: FutureWrapper 或同步结果
+```
+
+所以从 `EngineCore.step()` 的角度看，名字仍然是 `execute_model()` 与 `sample_tokens()` 两段；但从传统 Ray 的实际提交点看，常规 generation 的 DAG 执行发生在 `sample_tokens()` 内部。
 
 ```python
 def execute_model(
@@ -921,7 +952,132 @@ def sample_tokens(
     return self._execute_dag(scheduler_output, grammar_output, non_block)
 ```
 
-`RayDistributedExecutor.collective_rpc()` 没有 MessageQueue：它将同一控制方法直接发给每个 Ray actor，阻塞时用 `ray.get`，非阻塞时用 Ray ObjectRef 的 `FutureWrapper`。
+真正提交 Ray compiled DAG 的入口是 `_execute_dag()`。这里的 `refs` 是 Ray DAG 返回的对象引用；同步路径会立刻 `get()`，非阻塞路径则包装成 `FutureWrapper`，让上层保持统一的 `.result()` 调用方式。
+
+```python
+def _execute_dag(
+    self,
+    scheduler_output: SchedulerOutput,  # 本轮调度器产出的执行计划。
+    grammar_output: GrammarOutput | None,  # 本轮 grammar bitmask，可为空。
+    non_block: bool = False,  # 是否返回 FutureWrapper。
+) -> ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+    # 第一次真正执行时才编译 Ray DAG；后续轮次复用同一张图。
+    if self.forward_dag is None:
+        self.forward_dag = self._compiled_ray_dag(enable_asyncio=False)
+
+    # 这是传统 Ray 后端的真正模型执行提交点。
+    refs = self.forward_dag.execute((scheduler_output, grammar_output))
+
+    # 没有 KV connector 时，只需要 output rank 的 ModelRunnerOutput。
+    if not self.has_connector:
+        if not non_block:
+            # 同步等待第一个输出引用，取回模型结果。
+            output = refs[0].get()
+
+            # Ray SHM channel 可能返回零拷贝 NumPy view；这里解除共享内存引用。
+            detach_zero_copy_from_model_runner_output(output)
+            return output
+
+        # 非阻塞路径把 Ray ObjectRef 包成 concurrent.futures.Future 风格。
+        return FutureWrapper(refs[0])
+
+    # 有 KV connector 时，每个 worker 都可能带回 KV transfer 输出，需要聚合。
+    assert self.kv_output_aggregator is not None
+    if not non_block:
+        outputs = ray.get(refs)
+        for output in outputs:
+            detach_zero_copy_from_model_runner_output(output)
+        return self.kv_output_aggregator.aggregate(outputs)
+
+    # 非阻塞聚合：调用方 future.result() 时再 ray.get 并 aggregate。
+    return FutureWrapper(refs, self.kv_output_aggregator)
+```
+
+`_compiled_ray_dag()` 则决定这张图长什么样。它把 pipeline parallel 的每一层 PP stage 串起来；每个 PP stage 内部的 TP rank 以 SPMD 方式并行调用各自 actor 的 `execute_model_ray()`。
+
+```python
+def _compiled_ray_dag(self, enable_asyncio: bool):
+    assert self.parallel_config.use_ray
+    self._check_ray_cgraph_installation()
+
+    # Ray Compiled Graph 的 get 超时；必须在 import ray.dag 前设置。
+    os.environ.setdefault("RAY_CGRAPH_get_timeout", "300")
+    from ray.dag import InputNode, MultiOutputNode
+
+    with InputNode() as input_data:
+        # 第一组 TP worker 都接收同一个输入：
+        # (SchedulerOutput, GrammarOutput)
+        outputs = [input_data for _ in self.pp_tp_workers[0]]
+
+        # 外层按 PP stage 串行推进，内层按 TP group 并行绑定 actor 方法。
+        for pp_rank, tp_group in enumerate(self.pp_tp_workers):
+            outputs = [
+                worker.execute_model_ray.bind(outputs[i])
+                for i, worker in enumerate(tp_group)
+            ]
+
+            last_pp_rank = len(self.pp_tp_workers) - 1
+            if (
+                pp_rank < last_pp_rank
+                and envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE != "shm"
+            ):
+                # 非最后 PP stage 的中间张量需要指定跨 actor 的 tensor transport。
+                transport = envs.VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE
+                outputs = [
+                    output.with_tensor_transport(transport=transport)
+                    for output in outputs
+                ]
+
+        # 最终从最后一组 PP/TP worker 收集多个输出节点。
+        forward_dag = MultiOutputNode(outputs)
+
+    # experimental_compile 后得到 self.forward_dag。
+    return forward_dag.experimental_compile(
+        enable_asyncio=enable_asyncio,
+        _overlap_gpu_communication=envs.VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM,
+    )
+```
+
+DAG 节点绑定的 `execute_model_ray()` 位于 `RayWorkerWrapper`。这一层才真正进入 `model_runner`。下面为了突出主调用点，省略了多模态特征清理、`AsyncModelRunnerOutput` 转换、以及非最后 PP rank 的空输出兜底分支：
+
+```python
+def execute_model_ray(
+    self,
+    execute_model_input: tuple[SchedulerOutput, GrammarOutput]
+    | tuple[SchedulerOutput, GrammarOutput, IntermediateTensors],
+) -> ModelRunnerOutput | tuple[SchedulerOutput, GrammarOutput, IntermediateTensors]:
+    # Ray Compiled Graph 可能在后台线程执行，需要确保该线程已设置 CUDA device。
+    self.setup_device_if_necessary()
+    assert self.worker is not None, "Worker is not initialized"
+
+    # PP 的后续 stage 会额外收到上一 stage 的 intermediate_tensors。
+    if len(execute_model_input) == 3:
+        scheduler_output, grammar_output, intermediate_tensors = execute_model_input
+    else:
+        scheduler_output, grammar_output = execute_model_input
+        intermediate_tensors = None
+
+    # 真正执行模型 forward 的地方。
+    assert self.worker.model_runner is not None
+    output = self.worker.model_runner.execute_model(
+        scheduler_output,
+        intermediate_tensors,
+    )
+
+    # 非最后 PP stage 返回中间张量，继续交给下一 PP stage。
+    if self._is_intermediate_tensors(output):
+        return scheduler_output, grammar_output, output
+
+    # 最后 PP stage 若 execute_model 返回 None，说明 logits 已暂存，需要立刻采样。
+    if output is None:
+        output = self.worker.model_runner.sample_tokens(grammar_output)
+
+    return output
+```
+
+这也解释了为什么传统 Ray 的 `execute_model()` 看起来“没执行”：对常规生成来说，它只是为了配合 `EngineCore` 的两阶段接口，先把计划收下；真正的模型执行被合并到 `sample_tokens()` 里，并通过 `forward_dag.execute(...)` 送给 Ray actor。
+
+`RayDistributedExecutor.collective_rpc()` 没有 MessageQueue：它将同一控制方法直接发给每个 Ray actor，阻塞时用 `ray.get`，非阻塞时用 Ray ObjectRef 的 `FutureWrapper`。这条路径不是每轮模型执行热路径，而是 executor 生命周期和少量控制操作的 RPC 通道。
 
 ```python
 def collective_rpc(

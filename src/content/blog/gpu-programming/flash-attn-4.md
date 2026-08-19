@@ -1104,6 +1104,9 @@ __device__ __forceinline__ void thread_reduce_(
         Tensor<Engine0, Layout0> const &tensor,
         Tensor<Engine1, Layout1> &summary,
         Operator &op) {
+    // tensor: row/col 视角的 score tile，完整形状 (kNRows, kNColsPerThread)。
+    // summary: 每个 query row 一个标量，完整形状 (kNRows)。
+    // 因此只要求第 0 维对齐：size<0>(summary) == size<0>(tensor) == kNRows。
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(summary) == size<0>(tensor));
@@ -1141,6 +1144,8 @@ __device__ __forceinline__ void quad_allreduce_(
         Tensor<Engine0, Layout0> &dst,
         Tensor<Engine1, Layout1> &src,
         Operator &op) {
+    // dst/src 都是一维 fragment，完整形状都是 (num_values)；
+    // Allreduce 逐元素规约，所以两个 fragment 的元素总数必须完全一致。
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
 
     #pragma unroll
@@ -1210,6 +1215,9 @@ __forceinline__ __device__ void scale_apply_exp2(
         Tensor<Engine0, Layout0> &tensor,
         Tensor<Engine1, Layout1> const &max,
         const float scale) {
+    // tensor: row/col 视角的 score tile，完整形状 (kNRows, kNColsPerThread)。
+    // max: 每个 query row 一个 row_max，完整形状 (kNRows)。
+    // scale_apply_exp2 要按行读取 max(mi)，因此对齐的是第 0 维。
     static_assert(Layout0::rank == 2, "Only support 2D Tensor");
     static_assert(Layout1::rank == 1, "Only support 1D Tensor");
     CUTE_STATIC_ASSERT_V(size<0>(max) == size<0>(tensor));
@@ -1375,6 +1383,9 @@ __forceinline__ __device__ void softmax_rescale_o(
     Tensor scores = make_tensor(
         acc_s.data(),
         FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
+    // scores: 当前 score tile 的 row/col 视角，完整形状 (kNRows, kNColsPerThread)。
+    // row_max/row_sum: Softmax 内部状态，完整形状 (kNRows)。
+    // 因而 scores 的第 0 维必须正好等于 Softmax 模板参数 kNRows。
     static_assert(decltype(size<0>(scores))::value == kNRows);
 
     if (Is_first) {
@@ -1403,6 +1414,8 @@ __forceinline__ __device__ void softmax_rescale_o(
         Tensor acc_o_rowcol = make_tensor(
             acc_o.data(),
             FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+        // acc_o_rowcol: 输出分子 u 的 row/col 视角，完整形状 (kNRows, kHeadDimFragment)。
+        // softmax 每次按同一个 query row 缩放整行 u，因此第 0 维必须与 row_max 对齐。
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
 
         #pragma unroll
@@ -1491,6 +1504,9 @@ __forceinline__ __device__ TensorT normalize_softmax_lse(
     Tensor acc_o_rowcol = make_tensor(
         acc_o.data(),
         FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
+    // acc_o_rowcol: normalize 时的输出分子 view，完整形状 (kNRows, kHeadDimFragment)。
+    // row_sum/lse: 每个 query row 一个标量，完整形状 (kNRows)。
+    // 所以 acc_o_rowcol 的第 0 维必须等于 kNRows，后续才能用同一个 mi 同时访问二者。
     static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
 
     #pragma unroll
@@ -1728,7 +1744,9 @@ __forceinline__ __device__ void apply_mask(
     // 一次调用不能同时走 causal 和 local；二者的可见区间定义不同。
     static_assert(!(Causal_mask && Is_local), "Cannot be both causal and local");
 
-    // 入口 acc_s 仍是 MMA fragment layout。
+    // tensor_: 入口 acc_s 仍是 MMA fragment layout，完整形状是 (MMA=4, MMA_M, MMA_N)。
+    // 第 0 维固定为 4，是因为 SM80 16x8x16 MMA 的每线程 C fragment 在这个 layout
+    // 下第一维含 4 个标量；后续三层循环会把这 4 个标量映射成每个线程持有的列位置。
     static_assert(Layout::rank == 3, "Only support 3D Tensor");
     static_assert(decltype(size<0>(tensor_))::value == 4,
                   "First dimension must be 4");
@@ -2026,18 +2044,25 @@ __forceinline__ __device__ void copy(
 ) {
     // S 必须是三维 fragment。源码注释里第一维写作 MMA；
     // 在 copy 场景里，它对应 tiled-copy 的 CPY 向量维。
+    // 完整形状可写作 (CPY, CPY_MN, CPY_K)，例如：
+    // - Q copy: tQgQ / tQsQ 约为 (CPY, CPY_M, CPY_K)；
+    // - K/V copy: tKgK(_,_,_,n_block) / tKsK 约为 (CPY, CPY_N, CPY_K)。
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
 
-    // D 也必须是三维 fragment，才能与 S 使用同一套 (_, m, k) 坐标访问。
+    // D 也必须是三维 fragment，完整形状同样是 (CPY, CPY_MN, CPY_K)，
+    // 这样才能与 S 使用同一套 (_, m, k) 坐标访问。
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
 
-    // 第 0 维一致：固定 (m, k) 后，一次 cute::copy 看到的向量长度相同。
+    // S/D 完整形状分别是 (CPY, CPY_MN, CPY_K) 与 (CPY, CPY_MN, CPY_K)。
+    // 第 0 维一致：固定 (m, k) 后，一次 cute::copy 看到的 CPY 向量长度相同。
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));  // MMA / CPY
 
     // 第 1 维一致：源和目标拥有相同数量的 MN 分片。
+    // Q 时它是 CPY_M，K/V 时它是 CPY_N；无论叫什么，源和目的必须逐行对应。
     CUTE_STATIC_ASSERT_V(size<1>(S) == size<1>(D));  // MMA_M / CPY_MN
 
-    // 第 2 维一致：源和目标拥有相同数量的 head-dim 分片。
+    // 第 2 维一致：源和目标拥有相同数量的 head-dim 分片，也就是 CPY_K 对齐。
+    // predicate_K 的完整形状是 (CPY_K)，后面正是按这个维度判断 d 是否越界。
     CUTE_STATIC_ASSERT_V(size<2>(S) == size<2>(D));  // MMA_K / CPY_K
 
     // 源码约束：不存在“MN 越界要清零，但 K 越界不清零”的合法场景。
@@ -2716,6 +2741,9 @@ inline __device__ void compute_attn_1rowblock(
         __syncthreads();
         // tSrQ_copy_view: tSrQ 的 copy 目的视图，形状与 tSsQ 在 copy 维度上对齐。
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        // tSsQ: shared 源分片，完整形状可理解为 (CPY, CPY_M, CPY_K)。
+        // tSrQ_copy_view: register 目的分片，完整形状可理解为 (CPY, CPY_M, CPY_K)。
+        // 这里特别断言第 1 维 CPY_M 对齐：每个 shared Q 行分片都能落到对应的 register 行分片。
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
         __syncthreads();
@@ -2734,11 +2762,16 @@ inline __device__ void compute_attn_1rowblock(
         __syncthreads();
         // tSrQ_copy_view: tSrQ 的 copy 目的视图，形状与 tSsQ 在 copy 维度上对齐。
         Tensor tSrQ_copy_view = smem_thr_copy_Q.retile_D(tSrQ);
+        // tSsQ: shared 源分片，完整形状可理解为 (CPY, CPY_M, CPY_K)。
+        // tSrQ_copy_view: register 目的分片，完整形状可理解为 (CPY, CPY_M, CPY_K)。
+        // 这里特别断言第 1 维 CPY_M 对齐：每个 shared Q 行分片都能落到对应的 register 行分片。
         CUTE_STATIC_ASSERT_V(size<1>(tSsQ) == size<1>(tSrQ_copy_view));
         cute::copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     }
 
-    // u 初值为零。Softmax 对象同时为当前 CTA 的所有局部 query row 维护 row_max 与 row_sum。
+    // u 初值为零。acc_o 的 row/col 视角形状是 (2 * size<1>(acc_o), kHeadDimFragment)，
+    // 所以 Softmax<2 * size<1>(acc_o)> 正好为当前线程涉及的每个 query row
+    // 维护一个 row_max / row_sum 标量。
     clear(acc_o);
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
@@ -2990,14 +3023,20 @@ inline __device__ void compute_attn_1rowblock(
     cute::copy(gmem_tiled_copy_O, tOsO, tOrO);
 
     // caccO: O accumulator 的 identity 坐标张量，逻辑形状 (kBlockM, kHeadDim)。
-    // taccOcO: 当前线程的 MMA C 坐标 fragment，形状与 acc_o/rO 对齐。
+    // taccOcO: 当前线程的 MMA C 坐标 fragment，完整形状与 acc_o/rO 对齐，
+    //           可理解为 (MMA=4, MMA_M, MMA_N)。
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});
     Tensor taccOcO = thr_mma.partition_C(caccO);
+    // taccOcO 的第 0 维必须是 4，才能按 logical_divide(..., Shape<_2>{})
+    // 抽成两组坐标：每组覆盖同一线程持有的一条 Q 行的两个 head-dim 元素。
     static_assert(decltype(size<0>(taccOcO))::value == 4);
     // taccOcO_row: 从 C fragment 中抽出的“每个 LSE 对应哪一条 Q 行”的坐标向量，
     //               形状与 lse 对齐。
     // 一个线程的 C fragment 第一维含四个元素；按 2 分块并选坐标 0 后，每个 mi 对应一条 Q 行。
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
+    // lse: 每个 query row 一个标量，完整形状是 (kLseRows)。
+    // taccOcO_row: 每个 LSE 标量对应的 Q 行坐标，完整形状也是 (kLseRows)。
+    // 因此这里检查总元素数一致，后面的 for(mi) 才能同时访问 lse(mi) 与 taccOcO_row(mi)。
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));
     if (get<1>(taccOcO_row(0)) == 0) {
         #pragma unroll
