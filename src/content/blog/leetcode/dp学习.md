@@ -13398,3 +13398,1088 @@ holding = max(holding, -price)
 - 309：卖出后有冷冻期，需要多一个状态或多看一天。
 - 714：卖出或买入时扣手续费。
 - 123：最多两笔交易，需要增加交易次数维度。
+
+## [122. 买卖股票的最佳时机 II - 力扣（LeetCode）](https://leetcode.cn/problems/best-time-to-buy-and-sell-stock-ii/description/)
+
+给你一个整数数组 `prices`，其中 `prices[i]` 表示某支股票第 `i` 天的价格。
+
+在每一天，你可以决定是否购买和 / 或出售股票。
+
+限制是：
+
+- 任意时刻最多只能持有一股股票。
+- 可以进行任意多次交易。
+- 同一天可以买入后卖出，也可以卖出后买入，但持仓数量不能超过一股。
+
+返回能够获得的最大利润。
+
+示例 1：
+
+```text
+输入：prices = [7,1,5,3,6,4]
+输出：7
+解释：
+第 2 天价格为 1 时买入，第 3 天价格为 5 时卖出，利润为 4。
+第 4 天价格为 3 时买入，第 5 天价格为 6 时卖出，利润为 3。
+最大总利润为 4 + 3 = 7。
+```
+
+示例 2：
+
+```text
+输入：prices = [1,2,3,4,5]
+输出：4
+解释：
+可以第 1 天买入，第 5 天卖出，利润为 4。
+```
+
+示例 3：
+
+```text
+输入：prices = [7,6,4,3,1]
+输出：0
+解释：
+交易无法获得正利润，所以不参与交易。
+```
+
+提示：
+
+- `1 <= prices.length <= 3 * 10^4`
+- `0 <= prices[i] <= 10^4`
+
+### 题目如何和 121 区分？
+
+122 和 121 的状态还是一样的：
+
+```text
+每天结束时：
+1. 不持有股票
+2. 持有股票
+```
+
+区别在交易次数限制。
+
+121 是：
+
+> 最多只能完成一笔交易。
+
+所以 121 买入时，买入前收益只能是 0：
+
+```text
+holding = max(holding, -price)
+```
+
+122 是：
+
+> 可以完成任意多笔交易。
+
+所以 122 买入时，可以用之前已经卖出赚到的钱继续买入：
+
+```text
+holding = max(holding, not_holding - price)
+```
+
+这就是 122 相比 121 最关键的一处变化。
+
+### 递归切入（允许反复买卖的状态机）
+
+定义 `dfs(day, holding)` 表示：
+
+> 处理完 `prices[0..day]` 后，处于 `holding` 状态时，能够得到的最大收益。
+
+其中：
+
+- `holding == 0`：第 `day` 天结束时不持有股票。
+- `holding == 1`：第 `day` 天结束时持有股票。
+
+**今天结束时不持有股票**：
+
+来源仍然是两种：
+
+- 昨天不持有，今天不操作。
+- 昨天持有，今天卖出。
+
+$$
+dfs(day, 0) =
+\max(
+dfs(day - 1, 0),\
+dfs(day - 1, 1) + prices[day]
+)
+$$
+
+**今天结束时持有股票**：
+
+来源也是两种：
+
+- 昨天持有，今天不操作。
+- 昨天不持有，今天买入。
+
+因为 122 可以进行多次交易，所以“昨天不持有”的状态里可能已经有之前交易赚到的钱。
+
+$$
+dfs(day, 1) =
+\max(
+dfs(day - 1, 1),\
+dfs(day - 1, 0) - prices[day]
+)
+$$
+
+递归边界：
+
+- 如果 `day < 0` 且不持有股票，收益是 0。
+- 如果 `day < 0` 且持有股票，这是不合法状态，返回无效小值。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求无限次交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 在任意时刻最多持有一股股票时，能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        const int day_count = static_cast<int>(prices.size());
+        vector<array<int, kStateCount>> memo(
+            day_count,
+            {kUnknown, kUnknown});
+        return dfs(prices, memo, day_count - 1, kNotHolding);
+    }
+
+private:
+    static constexpr int kStateCount = 2;
+    static constexpr int kNotHolding = 0;
+    static constexpr int kHolding = 1;
+    static constexpr int kInvalid = INT_MIN / 4;
+    static constexpr int kUnknown = INT_MAX;
+
+    int dfs(
+        const vector<int>& prices,
+        vector<array<int, kStateCount>>& memo,
+        int day,
+        int holding) {
+        if (day < 0) {
+            return holding == kNotHolding ? 0 : kInvalid;
+        }
+
+        int& cached = memo[day][holding];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (holding == kNotHolding) {
+            // 今天结束时不持有：昨天不持有，或者今天卖出。
+            cached = max(
+                dfs(prices, memo, day - 1, kNotHolding),
+                dfs(prices, memo, day - 1, kHolding) + prices[day]);
+        } else {
+            // 122 允许多次交易，所以今天买入可以来自昨天不持有的收益。
+            cached = max(
+                dfs(prices, memo, day - 1, kHolding),
+                dfs(prices, memo, day - 1, kNotHolding) - prices[day]);
+        }
+
+        return cached;
+    }
+};
+```
+
+递归形式很适合对比 121，但实际提交仍然更推荐迭代 DP。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[day + 1][state]` 表示：
+
+> 处理完 `prices[0..day]` 后，处于 `state` 状态时，能够得到的最大收益。
+
+其中：
+
+- `state == 0`：不持有股票。
+- `state == 1`：持有股票。
+
+最终答案是：
+
+$$
+dp[prices.size()][0]
+$$
+
+因为最后持有股票只是账面状态，必须卖出后利润才算落袋。
+
+### 状态转移
+
+处理真实天数 `day`。
+
+**不持有股票**：
+
+今天结束时不持有，可能是昨天不持有，也可能是今天卖出。
+
+$$
+dp[day + 1][0] =
+\max(
+dp[day][0],\
+dp[day][1] + prices[day]
+)
+$$
+
+**持有股票**：
+
+今天结束时持有，可能是昨天持有，也可能是今天买入。
+
+因为可以多次交易，所以买入时可以来自昨天不持有状态的收益：
+
+$$
+dp[day + 1][1] =
+\max(
+dp[day][1],\
+dp[day][0] - prices[day]
+)
+$$
+
+这就是 122 和 121 的核心差别：
+
+```text
+121：dp[day + 1][1] = max(dp[day][1], -prices[day])
+122：dp[day + 1][1] = max(dp[day][1], dp[day][0] - prices[day])
+```
+
+### 初始化
+
+安全垫第 0 行表示还没有处理任何一天：
+
+- `dp[0][0] = 0`：还没开始时，不持有股票，收益是 0。
+- `dp[0][1] = kInvalid`：还没开始时，不可能已经持有股票。
+
+### 遍历顺序
+
+每一天只依赖前一天的两个状态，所以从前往后遍历。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用二维状态机 DP 求无限次交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 在任意时刻最多持有一股股票时，能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        constexpr int kNotHolding = 0;
+        constexpr int kHolding = 1;
+        constexpr int kStateCount = 2;
+        constexpr int kInvalid = INT_MIN / 4;
+        const int day_count = static_cast<int>(prices.size());
+        vector<array<int, kStateCount>> dp(day_count + 1);
+
+        dp[0][kNotHolding] = 0;
+        dp[0][kHolding] = kInvalid;
+
+        for (int day = 0; day < day_count; day++) {
+            // 第 day 天结束时不持有：保持不持有，或者今天卖出。
+            dp[day + 1][kNotHolding] = max(
+                dp[day][kNotHolding],
+                dp[day][kHolding] + prices[day]);
+
+            // 第 day 天结束时持有：保持持有，或者今天买入。
+            dp[day + 1][kHolding] = max(
+                dp[day][kHolding],
+                dp[day][kNotHolding] - prices[day]);
+        }
+
+        return dp[day_count][kNotHolding];
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(prices.size())$。
+- 空间复杂度：$O(prices.size())$。
+
+### 空间优化
+
+二维 DP 只依赖前一天，所以压成两个变量：
+
+- `not_holding`：当前天结束时不持有股票的最大收益。
+- `holding`：当前天结束时持有股票的最大收益。
+
+转移是：
+
+```text
+new_not_holding = max(not_holding, holding + price)
+new_holding = max(holding, not_holding - price)
+```
+
+这里写 `new_not_holding` 和 `new_holding`，是为了强调它们都来自**前一天**的状态。
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用空间优化状态机 DP 求无限次交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 在任意时刻最多持有一股股票时，能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        int not_holding = 0;
+        int holding = INT_MIN / 4;
+
+        for (const int price : prices) {
+            const int previous_not_holding = not_holding;
+            const int previous_holding = holding;
+
+            // 今天卖出可以让收益落袋；也可以继续保持不持有。
+            not_holding = max(previous_not_holding, previous_holding + price);
+
+            // 122 允许多次交易，所以今天买入可以使用之前卖出得到的收益。
+            holding = max(previous_holding, previous_not_holding - price);
+        }
+
+        return not_holding;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(prices.size())$。
+- 空间复杂度：$O(1)$。
+
+### 贪心写法
+
+122 还有一个非常经典的贪心写法：
+
+> 只要今天价格比昨天高，就把这段上涨收益吃掉。
+
+也就是把所有正收益累加起来：
+
+$$
+\sum_{day = 1}^{n - 1}
+\max(0,\ prices[day] - prices[day - 1])
+$$
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用贪心累加所有上涨段收益。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 在无限次交易限制下能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        int answer = 0;
+
+        for (int day = 1; day < static_cast<int>(prices.size()); day++) {
+            answer += max(0, prices[day] - prices[day - 1]);
+        }
+
+        return answer;
+    }
+};
+```
+
+为什么这样是对的？
+
+假设有一段连续上涨：
+
+```text
+1 -> 2 -> 3 -> 4 -> 5
+```
+
+直接第 1 天买、第 5 天卖，收益是：
+
+```text
+5 - 1 = 4
+```
+
+拆成每天买卖，收益是：
+
+```text
+(2 - 1) + (3 - 2) + (4 - 3) + (5 - 4) = 4
+```
+
+两者相等。
+
+所以只要允许无限次交易，就可以把每一段上涨都切开吃掉。
+
+但要注意：
+
+- 贪心是 122 的特殊简化。
+- 状态机 DP 才是后续股票题的通用框架。
+
+如果后面加上冷冻期、手续费、最多两笔交易，贪心就不能直接套了，但状态机只需要增加约束或维度。
+
+### 这题的核心手感
+
+122 的状态和 121 一样：
+
+```text
+not_holding = 今天结束时不持有股票的最大收益
+holding = 今天结束时持有股票的最大收益
+```
+
+真正变化只有买入来源。
+
+121 最多一笔交易：
+
+```text
+holding = max(holding, -price)
+```
+
+122 无限次交易：
+
+```text
+holding = max(holding, not_holding - price)
+```
+
+这句话的含义是：
+
+> 我可以先卖出赚到钱，然后未来再拿这些收益继续买入。
+
+贪心写法可以作为结果上的理解：
+
+```text
+无限次交易 = 把所有上涨段的正收益全部加起来
+```
+
+但从 DP 训练角度，最该记住的是状态机转移：
+
+```text
+new_not_holding = max(previous_not_holding, previous_holding + price)
+new_holding = max(previous_holding, previous_not_holding - price)
+```
+
+## [123. 买卖股票的最佳时机 III - 力扣（LeetCode）](https://leetcode.cn/problems/best-time-to-buy-and-sell-stock-iii/description/)
+
+给定一个数组 `prices`，它的第 `i` 个元素表示一支股票在第 `i` 天的价格。
+
+最多可以完成**两笔交易**，计算能够获得的最大利润。
+
+注意：
+
+> 不能同时参与多笔交易。必须先卖掉手里的股票，才能再次买入。
+
+示例 1：
+
+```text
+输入：prices = [3,3,5,0,0,3,1,4]
+输出：6
+解释：
+第 4 天价格为 0 时买入，第 6 天价格为 3 时卖出，利润为 3。
+第 7 天价格为 1 时买入，第 8 天价格为 4 时卖出，利润为 3。
+最大利润为 3 + 3 = 6。
+```
+
+示例 2：
+
+```text
+输入：prices = [1,2,3,4,5]
+输出：4
+解释：
+第 1 天买入，第 5 天卖出，利润为 4。
+```
+
+示例 3：
+
+```text
+输入：prices = [7,6,4,3,1]
+输出：0
+解释：
+没有交易完成，所以最大利润为 0。
+```
+
+示例 4：
+
+```text
+输入：prices = [1]
+输出：0
+```
+
+提示：
+
+- `1 <= prices.length <= 10^5`
+- `0 <= prices[i] <= 10^5`
+
+### 题目如何和 121 / 122 区分？
+
+前三道股票题可以这样看：
+
+| 题目 | 交易次数限制 | 状态里需要什么 |
+| --- | --- | --- |
+| 121 | 最多 1 笔 | 持有 / 不持有 |
+| 122 | 无限笔 | 持有 / 不持有 |
+| 123 | 最多 2 笔 | 持有 / 不持有 + 已完成交易次数 |
+
+121 和 122 只需要知道当天结束时是否持有股票。
+
+但 123 不行，因为题目限制最多两笔交易。
+
+如果只写：
+
+```text
+not_holding = max(not_holding, holding + price)
+holding = max(holding, not_holding - price)
+```
+
+那就是 122 的无限次交易模型，会把所有上涨段都吃掉。
+
+123 必须知道：
+
+> 我已经完成了几次卖出？
+
+因为一次完整交易是：
+
+```text
+买入 -> 卖出
+```
+
+交易次数是在**卖出**时增加的。
+
+### 递归切入（持仓状态 + 已完成交易次数）
+
+定义 `dfs(day, completed, holding)` 表示：
+
+> 处理完 `prices[0..day]` 后，已经完成 `completed` 笔交易，并且处于 `holding` 状态时，能够得到的最大收益。
+
+其中：
+
+- `completed` 表示已经完成了几次卖出，范围是 `0..2`。
+- `holding == 0` 表示第 `day` 天结束时不持有股票。
+- `holding == 1` 表示第 `day` 天结束时持有股票。
+
+**今天结束时不持有股票**：
+
+有两种来源：
+
+- 昨天也不持有，今天不操作。
+- 昨天持有，今天卖出。卖出会让完成交易次数加 1。
+
+所以如果今天结束后已经完成 `completed` 笔交易，那么今天卖出前只完成了 `completed - 1` 笔交易：
+
+$$
+dfs(day, completed, 0) =
+\max(
+dfs(day - 1, completed, 0),\
+dfs(day - 1, completed - 1, 1) + prices[day]
+)
+$$
+
+**今天结束时持有股票**：
+
+也有两种来源：
+
+- 昨天也持有，今天不操作。
+- 昨天不持有，今天买入。买入不会增加完成交易次数。
+
+$$
+dfs(day, completed, 1) =
+\max(
+dfs(day - 1, completed, 1),\
+dfs(day - 1, completed, 0) - prices[day]
+)
+$$
+
+但如果 `completed == 2`，就不能再买入了。因为买入之后未来还需要卖出，这会变成第 3 笔交易。
+
+递归边界：
+
+- 如果 `day < 0`，只有 `completed == 0` 且不持有股票是合法状态，收益为 0。
+- 其它越界状态都返回无效小值。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化搜索求最多两笔交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 最多完成两笔交易时能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        const int day_count = static_cast<int>(prices.size());
+        vector<vector<array<int, kStateCount>>> memo(
+            day_count,
+            vector<array<int, kStateCount>>(
+                kMaxTransactions + 1,
+                {kUnknown, kUnknown}));
+
+        int answer = 0;
+        for (int completed = 0; completed <= kMaxTransactions; completed++) {
+            answer = max(
+                answer,
+                dfs(prices, memo, day_count - 1, completed, kNotHolding));
+        }
+        return answer;
+    }
+
+private:
+    static constexpr int kMaxTransactions = 2;
+    static constexpr int kStateCount = 2;
+    static constexpr int kNotHolding = 0;
+    static constexpr int kHolding = 1;
+    static constexpr int kInvalid = INT_MIN / 4;
+    static constexpr int kUnknown = INT_MAX;
+
+    int dfs(
+        const vector<int>& prices,
+        vector<vector<array<int, kStateCount>>>& memo,
+        int day,
+        int completed,
+        int holding) {
+        if (completed < 0 || completed > kMaxTransactions) {
+            return kInvalid;
+        }
+        if (day < 0) {
+            return completed == 0 && holding == kNotHolding ? 0 : kInvalid;
+        }
+
+        int& cached = memo[day][completed][holding];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (holding == kNotHolding) {
+            // 今天结束时不持有：保持不持有，或者今天卖出完成一笔交易。
+            cached = dfs(prices, memo, day - 1, completed, kNotHolding);
+            const int previous_holding =
+                dfs(prices, memo, day - 1, completed - 1, kHolding);
+            if (previous_holding != kInvalid) {
+                cached = max(cached, previous_holding + prices[day]);
+            }
+        } else {
+            // 今天结束时持有：保持持有，或者今天买入。
+            cached = dfs(prices, memo, day - 1, completed, kHolding);
+            if (completed < kMaxTransactions) {
+                const int previous_not_holding =
+                    dfs(prices, memo, day - 1, completed, kNotHolding);
+                if (previous_not_holding != kInvalid) {
+                    cached = max(cached, previous_not_holding - prices[day]);
+                }
+            }
+        }
+
+        return cached;
+    }
+};
+```
+
+记忆化搜索能完整表达状态，但三维递归写起来比较重。实际提交时用迭代 DP 更清楚。
+
+### 状态定义
+
+继续使用安全垫写法：
+
+`dp[day + 1][completed][state]` 表示：
+
+> 处理完 `prices[0..day]` 后，已经完成 `completed` 笔交易，并且处于 `state` 状态时，能够得到的最大收益。
+
+其中：
+
+- `completed` 的范围是 `0..2`。
+- `state == 0`：不持有股票。
+- `state == 1`：持有股票。
+
+最终答案是：
+
+$$
+\max(
+dp[prices.size()][0][0],\
+dp[prices.size()][1][0],\
+dp[prices.size()][2][0]
+)
+$$
+
+因为题目说的是**最多**两笔交易，不是必须刚好两笔。
+
+### 状态转移
+
+处理真实天数 `day`。
+
+**不持有股票**：
+
+如果今天不卖，交易次数不变：
+
+$$
+dp[day + 1][completed][0] =
+dp[day][completed][0]
+$$
+
+如果今天卖出，完成交易次数增加 1：
+
+$$
+dp[day + 1][completed][0] =
+\max(
+dp[day + 1][completed][0],\
+dp[day][completed - 1][1] + prices[day]
+)
+$$
+
+**持有股票**：
+
+如果今天不买，交易次数不变：
+
+$$
+dp[day + 1][completed][1] =
+dp[day][completed][1]
+$$
+
+如果今天买入，完成交易次数仍然不变：
+
+$$
+dp[day + 1][completed][1] =
+\max(
+dp[day + 1][completed][1],\
+dp[day][completed][0] - prices[day]
+)
+$$
+
+注意：当 `completed == 2` 时，不能再买入，否则未来卖出会超过两笔交易。
+
+### 初始化
+
+安全垫第 0 行表示还没有处理任何一天：
+
+- `dp[0][0][0] = 0`：还没开始，不持有股票，完成 0 笔交易，收益为 0。
+- 其它状态初始化为 `kInvalid`：表示不合法状态。
+
+例如：
+
+- `dp[0][1][0]` 不合法，因为还没开始就不可能已经完成 1 笔交易。
+- `dp[0][0][1]` 不合法，因为还没开始就不可能已经持有股票。
+
+### 遍历顺序
+
+每一天只依赖前一天，所以：
+
+- 外层遍历 `day`。
+- 内层遍历 `completed`。
+- 最里层根据持有 / 不持有两个状态做转移。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用三维状态机 DP 求最多两笔交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 最多完成两笔交易时能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        constexpr int kMaxTransactions = 2;
+        constexpr int kStateCount = 2;
+        constexpr int kNotHolding = 0;
+        constexpr int kHolding = 1;
+        constexpr int kInvalid = INT_MIN / 4;
+        const int day_count = static_cast<int>(prices.size());
+        vector<vector<array<int, kStateCount>>> dp(
+            day_count + 1,
+            vector<array<int, kStateCount>>(
+                kMaxTransactions + 1,
+                {kInvalid, kInvalid}));
+
+        dp[0][0][kNotHolding] = 0;
+
+        for (int day = 0; day < day_count; day++) {
+            for (int completed = 0; completed <= kMaxTransactions; completed++) {
+                // 今天结束时不持有：昨天不持有，今天不操作。
+                dp[day + 1][completed][kNotHolding] = max(
+                    dp[day + 1][completed][kNotHolding],
+                    dp[day][completed][kNotHolding]);
+
+                // 今天结束时不持有：昨天持有，今天卖出，完成交易次数 +1。
+                if (completed > 0 &&
+                    dp[day][completed - 1][kHolding] != kInvalid) {
+                    dp[day + 1][completed][kNotHolding] = max(
+                        dp[day + 1][completed][kNotHolding],
+                        dp[day][completed - 1][kHolding] + prices[day]);
+                }
+
+                // 今天结束时持有：昨天持有，今天不操作。
+                dp[day + 1][completed][kHolding] = max(
+                    dp[day + 1][completed][kHolding],
+                    dp[day][completed][kHolding]);
+
+                // 今天结束时持有：昨天不持有，今天买入。买入不增加交易次数。
+                if (completed < kMaxTransactions &&
+                    dp[day][completed][kNotHolding] != kInvalid) {
+                    dp[day + 1][completed][kHolding] = max(
+                        dp[day + 1][completed][kHolding],
+                        dp[day][completed][kNotHolding] - prices[day]);
+                }
+            }
+        }
+
+        int answer = 0;
+        for (int completed = 0; completed <= kMaxTransactions; completed++) {
+            answer = max(answer, dp[day_count][completed][kNotHolding]);
+        }
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(2 \times prices.size())$，也就是 $O(prices.size())$。
+- 空间复杂度：$O(2 \times prices.size())$，也就是 $O(prices.size())$。
+
+### 空间优化
+
+三维 DP 中，第 `day + 1` 天只依赖第 `day` 天，所以可以去掉天数维度。
+
+保留两个数组：
+
+- `not_holding[completed]`：当前天结束时，完成 `completed` 笔交易且不持有股票的最大收益。
+- `holding[completed]`：当前天结束时，完成 `completed` 笔交易且持有股票的最大收益。
+
+每天更新时，仍然从前一天的 `previous_not_holding` 和 `previous_holding` 转移。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用空间优化状态机 DP 求最多两笔交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 最多完成两笔交易时能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        constexpr int kMaxTransactions = 2;
+        constexpr int kInvalid = INT_MIN / 4;
+        array<int, kMaxTransactions + 1> not_holding{};
+        array<int, kMaxTransactions + 1> holding{};
+        not_holding.fill(kInvalid);
+        holding.fill(kInvalid);
+        not_holding[0] = 0;
+
+        for (const int price : prices) {
+            const auto previous_not_holding = not_holding;
+            const auto previous_holding = holding;
+
+            for (int completed = 0; completed <= kMaxTransactions; completed++) {
+                // 不持有：保持不持有。
+                not_holding[completed] = previous_not_holding[completed];
+
+                // 不持有：今天卖出，完成交易次数从 completed - 1 变成 completed。
+                if (completed > 0 &&
+                    previous_holding[completed - 1] != kInvalid) {
+                    not_holding[completed] = max(
+                        not_holding[completed],
+                        previous_holding[completed - 1] + price);
+                }
+
+                // 持有：保持持有。
+                holding[completed] = previous_holding[completed];
+
+                // 持有：今天买入，完成交易次数不变。
+                if (completed < kMaxTransactions &&
+                    previous_not_holding[completed] != kInvalid) {
+                    holding[completed] = max(
+                        holding[completed],
+                        previous_not_holding[completed] - price);
+                }
+            }
+        }
+
+        int answer = 0;
+        for (const int profit : not_holding) {
+            answer = max(answer, profit);
+        }
+        return answer;
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(2 \times prices.size())$，也就是 $O(prices.size())$。
+- 空间复杂度：$O(1)$。
+
+### 四变量写法
+
+因为最多只允许两笔交易，所以状态数量很小，可以进一步写成四个变量：
+
+- `first_holding`：完成 0 笔交易后，手里持有第一支股票的最大收益。
+- `first_not_holding`：至多完成 1 笔交易后，手里不持有股票的最大收益。
+- `second_holding`：至多完成 1 笔交易后，手里持有第二支股票的最大收益。
+- `second_not_holding`：至多完成 2 笔交易后，手里不持有股票的最大收益。
+
+它们对应的是：
+
+```text
+第一次买入
+第一次卖出
+第二次买入
+第二次卖出
+```
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用四变量状态机 DP 求最多两笔交易的最大股票利润。
+     *
+     * @param prices 每一天的股票价格。
+     * @return 最多完成两笔交易时能够获得的最大利润。
+     */
+    int maxProfit(vector<int>& prices) {
+        int first_holding = INT_MIN / 4;
+        int first_not_holding = 0;
+        int second_holding = INT_MIN / 4;
+        int second_not_holding = 0;
+
+        for (const int price : prices) {
+            const int previous_first_holding = first_holding;
+            const int previous_first_not_holding = first_not_holding;
+            const int previous_second_holding = second_holding;
+            const int previous_second_not_holding = second_not_holding;
+
+            // 第一次买入：从 0 收益进入持有状态。
+            first_holding = max(previous_first_holding, -price);
+
+            // 第一次卖出：从第一次持有状态卖出。
+            first_not_holding = max(
+                previous_first_not_holding,
+                previous_first_holding + price);
+
+            // 第二次买入：用第一次卖出后的收益继续买入。
+            second_holding = max(
+                previous_second_holding,
+                previous_first_not_holding - price);
+
+            // 第二次卖出：从第二次持有状态卖出。
+            second_not_holding = max(
+                previous_second_not_holding,
+                previous_second_holding + price);
+        }
+
+        return max(first_not_holding, second_not_holding);
+    }
+};
+```
+
+四变量写法是空间优化版本的展开，本质没有变，只是把 `completed = 0, 1, 2` 这几个状态手动命名了。
+
+### 为什么不能像 122 那样贪心？
+
+122 可以累加所有上涨段：
+
+```text
+answer += max(0, prices[day] - prices[day - 1])
+```
+
+因为它允许无限次交易。
+
+123 最多只能做两笔交易，所以不能把所有上涨段都吃掉。
+
+例如：
+
+```text
+prices = [1, 3, 2, 4, 3, 5]
+```
+
+上涨段有三段：
+
+```text
+1 -> 3，收益 2
+2 -> 4，收益 2
+3 -> 5，收益 2
+```
+
+122 可以全部吃掉，总收益是 6。
+
+但 123 最多只能做两笔交易，不能直接累加所有上涨段。它需要在有限次数里选择最优组合，所以必须保留交易次数状态。
+
+### 这题的核心手感
+
+123 是股票状态机从二维走向三维的关键题。
+
+121 / 122 的状态是：
+
+```text
+dp[day + 1][holding]
+```
+
+123 的状态变成：
+
+```text
+dp[day + 1][completed][holding]
+```
+
+多出来的 `completed` 表示：
+
+> 已经完成了几次卖出。
+
+卖出时：
+
+```text
+completed += 1
+```
+
+买入时：
+
+```text
+completed 不变
+```
+
+所以这题真正要记住的是：
+
+- **交易次数在卖出时增加**。
+- **买入不会增加交易次数**。
+- **最多两笔交易，所以 `completed == 2` 后不能再买入**。
+- **最终答案取所有不持有状态的最大值，因为题目是最多两笔，不是刚好两笔**。
