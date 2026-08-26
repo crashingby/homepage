@@ -1425,6 +1425,68 @@ def execute_model(
 
 ## GPU worker：设备边界与 Pipeline Parallelism 边界
 
+### `WorkerBase.__init__()`：所有 worker 共享的基础成员
+
+GPU worker 继承自 `WorkerBase`。所以要理解 GPU worker 的成员，不能只看 `gpu_worker.py`，还要先看 `worker_base.py` 的构造函数：它保存了所有通用配置、rank 身份、设备占位和 runner 占位。
+
+```python
+class WorkerBase:
+    """不同硬件 worker 的共同接口和生命周期基类。"""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,  # 当前 engine/executor 使用的完整 vLLM 配置。
+        local_rank: int,  # 当前节点或当前可见设备集合内的设备编号。
+        rank: int,  # 当前 worker 在 distributed world 里的全局 rank。
+        distributed_init_method: str,  # torch.distributed 初始化地址。
+        is_driver_worker: bool = False,  # 这个 worker 是否承担 driver rank 责任。
+    ) -> None:
+        """
+        初始化所有 worker 共享的配置、rank 和设备占位状态。
+
+        这里不加载模型，也不分配 KV cache；真实设备初始化发生在
+        init_device()，模型加载发生在 load_model()。
+        """
+        self.vllm_config = vllm_config  # 保存完整配置，后续子模块都从这里派生。
+        self.model_config = vllm_config.model_config  # 模型结构、dtype、runner 类型等配置。
+        self.cache_config = vllm_config.cache_config  # KV cache block、显存占比等配置。
+        self.lora_config = vllm_config.lora_config  # LoRA adapter 配置，可能为 None。
+        self.load_config = vllm_config.load_config  # 权重加载格式、路径和加载策略配置。
+        self.parallel_config = vllm_config.parallel_config  # TP/PP/DP 等并行配置。
+        self.scheduler_config = vllm_config.scheduler_config  # batch/token 预算等调度配置。
+        self.device_config = vllm_config.device_config  # 目标设备类型，例如 cuda。
+        self.speculative_config = vllm_config.speculative_config  # 投机解码配置，可能为 None。
+        self.observability_config = vllm_config.observability_config  # tracing/metrics 观测配置。
+        self.kv_transfer_config = vllm_config.kv_transfer_config  # P/D 或 KV connector 配置。
+        self.compilation_config = vllm_config.compilation_config  # torch.compile/图编译相关配置。
+
+        from vllm.platforms import current_platform
+
+        self.current_platform = current_platform  # 当前硬件平台抽象，封装 CUDA/ROCm/TPU 差异。
+
+        self.parallel_config.rank = rank  # 把全局 rank 回写到并行配置，供下游分布式逻辑读取。
+        self.local_rank = local_rank  # 本 worker 使用的本地设备编号。
+        self.rank = rank  # 本 worker 的全局分布式 rank。
+        self.distributed_init_method = distributed_init_method  # 分布式进程组初始化地址。
+        self.is_driver_worker = is_driver_worker  # 是否是每个 PP/TP 组中的 driver worker。
+
+        # Device and model state
+        self.device: torch.device | None = None  # init_device() 后才会变成真实 torch.device。
+        self.model_runner: nn.Module | None = None  # load_model/init_device 后由具体 worker 创建。
+
+        # IR op priority and torch-wrap state are constant for the worker's
+        # lifetime.
+        vllm_config.kernel_config.ir_op_priority.set_default()  # 设置 IR op 默认优先级。
+        vllm.ir.set_default_torch_wrap(
+            vllm_config.compilation_config.ir_enable_torch_wrap
+        )  # 设置 IR/torch wrap 全局行为，之后整个 worker 生命周期保持一致。
+```
+
+这里最重要的是两个占位成员：
+
+- `self.device`：构造时还是 `None`，等 `init_device()` 才绑定到具体 CUDA device。
+- `self.model_runner`：构造时也还是 `None`，后面根据 `use_v2_model_runner` 创建旧 V1 或新 V2 `GPUModelRunner`。
+
 ### `WorkerBase` 规定的两阶段协议
 
 无论最终是 GPU、CPU 还是其他加速器 worker，executor 所依赖的是这两个抽象接口，而不是具体的 GPU runner：
@@ -1456,7 +1518,60 @@ def sample_tokens(
 
 ### GPU worker 的成员与 runner 选择
 
-`vllm/v1/worker/gpu_worker.py` 的具体类名为 `Worker`。为了和抽象 `WorkerBase` 区分，本节称它为 **GPU worker**。其重要成员如下：
+`vllm/v1/worker/gpu_worker.py` 的具体类名为 `Worker`。为了和抽象 `WorkerBase` 区分，本节称它为 **GPU worker**。它的构造函数先调用 `WorkerBase.__init__()` 建立通用成员，然后只补 GPU worker 自己要维护的执行状态：
+
+```python
+class Worker(WorkerBase):
+    def __init__(
+        self,
+        vllm_config: VllmConfig,  # 完整 vLLM 配置，由 WorkerWrapperBase.init_worker() 传入。
+        local_rank: int,  # 当前 worker 在本节点可见 GPU 集合里的编号。
+        rank: int,  # 当前 worker 的全局分布式 rank。
+        distributed_init_method: str,  # torch.distributed 初始化方法。
+        is_driver_worker: bool = False,  # 是否承担 driver worker 职责。
+    ):
+        super().__init__(
+            vllm_config=vllm_config,  # 让基类保存全部配置对象与派生配置。
+            local_rank=local_rank,  # 让基类记录设备选择用的本地 rank。
+            rank=rank,  # 让基类记录 TP/PP 通信用的全局 rank。
+            distributed_init_method=distributed_init_method,  # 让基类保存分布式初始化地址。
+            is_driver_worker=is_driver_worker,  # 让基类保存 driver worker 标记。
+        )
+
+        # configure float32 matmul precision according to vLLM env.
+        precision = envs.VLLM_FLOAT32_MATMUL_PRECISION  # 从环境变量读取 float32 matmul 精度策略。
+        torch.set_float32_matmul_precision(precision)  # 应用到当前 worker 进程的 torch 全局状态。
+
+        from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
+
+        self.elastic_ep_executor = ElasticEPScalingExecutor(self)  # 管理 elastic expert parallel 扩缩容执行。
+
+        # Buffers saved before sleep
+        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}  # sleep(level=2) 前保存模型 buffer 的 CPU 副本。
+
+        # Weight transfer engine is created in `load_model` once the model
+        # is available, since the engine needs a reference to the model.
+        self.weight_transfer_engine: WeightTransferEngine | None = None  # 权重热更新/迁移引擎，加载模型后创建。
+        self._weight_update_active = False  # 标记当前是否处在权重更新流程中。
+        self._is_checkpoint_format = True  # 标记权重更新输入是否仍是 checkpoint 格式。
+
+        # Torch/CUDA profiler. Enabled and configured through profiler_config.
+        # Profiler wrapper is created lazily in profile() when start is called,
+        # so we have all the information needed for proper trace naming.
+        self.profiler: Any | None = None  # torch/cuda profiler 对象，实际 start 时才懒创建。
+        self.profiler_config = vllm_config.profiler_config  # profiler 类型、输出路径等配置。
+
+        # Only validate profiler config is valid, don't instantiate yet
+        if self.profiler_config.profiler not in ("torch", "cuda", None):
+            raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
+
+        self.use_v2_model_runner = vllm_config.use_v2_model_runner  # 选择新 V2 runner 还是旧 V1 runner。
+
+        # pending non-blocking PP send work from the previous iteration
+        self._pp_send_work: list[Handle] = []  # 保存上一轮 PP 异步发送句柄，下一轮前需要等待完成。
+```
+
+把两层构造函数合起来看，GPU worker 的重要成员如下：
 
 | 成员 | 类型/来源 | 作用 |
 | --- | --- | --- |
@@ -1465,6 +1580,14 @@ def sample_tokens(
 | `_pp_send_work` | work handle 列表 | 前一个 PP stage 向下一 stage 异步发送中间激活的句柄；下轮前必须等待。 |
 | `rank` / `local_rank` | `int` | 全局 rank 与本机设备 rank，来自 worker 构造参数。 |
 | `vllm_config` | `VllmConfig` | 判断 PP、SP、编译、KV、模型等全部执行分支。 |
+| `elastic_ep_executor` | `ElasticEPScalingExecutor` | Expert Parallel 弹性扩缩容入口，绑定当前 worker。 |
+| `_sleep_saved_buffers` | `dict[str, torch.Tensor]` | sleep level 2 前暂存模型 buffer，wake up 时用于恢复。 |
+| `weight_transfer_engine` | `WeightTransferEngine` | `None` | 权重更新/迁移引擎，依赖模型对象，所以在 `load_model()` 后创建。 |
+| `_weight_update_active` | `bool` | 标记当前 worker 是否正在执行权重更新。 |
+| `_is_checkpoint_format` | `bool` | 标记权重更新来源是否仍按 checkpoint 格式处理。 |
+| `profiler` | `Any` | `None` | torch/cuda profiler 句柄，`profile()` start 时懒初始化。 |
+| `profiler_config` | profiler 配置 | 决定 profiler 类型和 trace 输出行为。 |
+| `use_v2_model_runner` | `bool` | 控制后续创建 V2 `GPUModelRunner` 还是旧 V1 runner。 |
 
 `use_v2_model_runner` 的源码选择已在开头给出。注意 PP 里的 sequence parallel（SP）分支当前注明“仅支持 V1 runner”，这也是两条 runner 路径不完全等价的实际例子。
 
