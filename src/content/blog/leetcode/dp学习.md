@@ -15463,3 +15463,350 @@ answer += max(0, prices[day] - prices[day - 1])
 - 手续费可以在买入或卖出时扣，但一笔交易只能扣一次。
 - 选择卖出时扣费后，买入转移和 122 完全一致。
 - 最终答案只能是 `not_holding`，因为手里股票还没卖出时，收益没有落袋。
+
+## [198. 打家劫舍 - 状态机 DP 视角](https://leetcode.cn/problems/house-robber/description/)
+
+前面已经从“选当前房屋 / 不选当前房屋”的角度做过这题。这里换成**状态机 DP**再做一次，重点不是得到一份不同的答案，而是看清：
+
+> “相邻房屋不能同时偷”本质上是在限制相邻两天的状态转移。
+
+处理到第 `house` 间房屋后，当前房屋只有两个互斥状态：
+
+```text
+robbed：当前房屋被偷
+not_robbed：当前房屋不偷
+```
+
+### 递归切入
+
+定义 `dfs(house, state)` 表示：
+
+> 处理完 `nums[0..house]` 后，当前房屋处于 `state` 状态时，能够得到的最大金额。
+
+其中：
+
+- `state == robbed`：第 `house` 间房屋被偷。
+- `state == not_robbed`：第 `house` 间房屋不偷。
+
+**当前房屋被偷**：
+
+上一间房屋一定不能偷，否则报警。因此只有一个来源：
+
+$$
+dfs(house, robbed) = dfs(house - 1, not\_robbed) + nums[house]
+$$
+
+**当前房屋不偷**：
+
+上一间房屋偷或不偷都合法，今天只是跳过当前房屋：
+
+$$
+dfs(house, not\_robbed) =
+\max(
+dfs(house - 1, robbed),\
+dfs(house - 1, not\_robbed)
+)
+$$
+
+递归边界：
+
+- `house < 0` 时，只有 `not_robbed` 合法，金额为 `0`。
+- 还没处理任何房屋时，不可能处于 `robbed` 状态，返回无效小值。
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用记忆化状态机 DP 求不偷相邻房屋时的最大金额。
+     *
+     * @param nums 每间房屋存放的金额。
+     * @return 不触发警报时能够偷到的最大金额。
+     */
+    int rob(vector<int>& nums) {
+        const int house_count = static_cast<int>(nums.size());
+        vector<array<int, kStateCount>> memo(
+            house_count,
+            {kUnknown, kUnknown});
+
+        return max(
+            dfs(nums, memo, house_count - 1, kRobbed),
+            dfs(nums, memo, house_count - 1, kNotRobbed));
+    }
+
+private:
+    static constexpr int kRobbed = 0;
+    static constexpr int kNotRobbed = 1;
+    static constexpr int kStateCount = 2;
+    static constexpr int kInvalid = INT_MIN / 4;
+    static constexpr int kUnknown = INT_MAX;
+
+    int dfs(
+        const vector<int>& nums,
+        vector<array<int, kStateCount>>& memo,
+        int house,
+        int state) {
+        if (house < 0) {
+            return state == kNotRobbed ? 0 : kInvalid;
+        }
+
+        int& cached = memo[house][state];
+        if (cached != kUnknown) {
+            return cached;
+        }
+
+        if (state == kRobbed) {
+            // 偷当前房屋时，上一间房屋必须不偷。
+            cached = dfs(nums, memo, house - 1, kNotRobbed) + nums[house];
+        } else {
+            // 不偷当前房屋时，上一间房屋可以偷，也可以不偷。
+            cached = max(
+                dfs(nums, memo, house - 1, kRobbed),
+                dfs(nums, memo, house - 1, kNotRobbed));
+        }
+
+        return cached;
+    }
+};
+```
+
+最后一间房屋可以偷，也可以不偷，所以答案是：
+
+$$
+\max(dfs(n - 1, robbed), dfs(n - 1, not\_robbed))
+$$
+
+### 状态定义
+
+继续使用下标 `+1` 的安全垫：
+
+`dp[house + 1][state]` 表示：
+
+> 处理完 `nums[0..house]` 后，当前房屋处于 `state` 状态时，能够偷到的最大金额。
+
+| 状态 | 含义 |
+| --- | --- |
+| `0`，`robbed` | 第 `house` 间房屋被偷。 |
+| `1`，`not_robbed` | 第 `house` 间房屋不偷。 |
+
+安全垫第 `0` 行表示还没处理任何房屋：
+
+```cpp
+dp[0][kRobbed] = kInvalid;
+dp[0][kNotRobbed] = 0;
+```
+
+### 状态转移
+
+处理真实下标为 `house` 的房屋。
+
+**偷当前房屋**：
+
+$$
+dp[house + 1][robbed] =
+dp[house][not\_robbed] + nums[house]
+$$
+
+偷了当前房屋，前一间必须不偷。这是报警约束在状态机里的直接表达。
+
+**不偷当前房屋**：
+
+$$
+dp[house + 1][not\_robbed] =
+\max(
+dp[house][robbed],\
+dp[house][not\_robbed]
+)
+$$
+
+今天不偷，就不会和前一间冲突；因此前一间的两种状态都可以转移过来。
+
+### 遍历顺序
+
+每一间房屋只依赖前一间房屋的状态，所以从左到右处理：
+
+```cpp
+#include <algorithm>
+#include <array>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用带安全垫的状态机 DP 求不偷相邻房屋时的最大金额。
+     *
+     * @param nums 每间房屋存放的金额。
+     * @return 不触发警报时能够偷到的最大金额。
+     */
+    int rob(vector<int>& nums) {
+        constexpr int kRobbed = 0;
+        constexpr int kNotRobbed = 1;
+        constexpr int kStateCount = 2;
+        constexpr int kInvalid = INT_MIN / 4;
+        const int house_count = static_cast<int>(nums.size());
+        vector<array<int, kStateCount>> dp(
+            house_count + 1,
+            {kInvalid, kInvalid});
+
+        dp[0][kNotRobbed] = 0;
+
+        for (int house = 0; house < house_count; house++) {
+            // 偷当前房屋：上一间房屋必须不偷。
+            dp[house + 1][kRobbed] =
+                dp[house][kNotRobbed] + nums[house];
+
+            // 不偷当前房屋：上一间房屋偷或不偷都可以。
+            dp[house + 1][kNotRobbed] = max(
+                dp[house][kRobbed],
+                dp[house][kNotRobbed]);
+        }
+
+        return max(
+            dp[house_count][kRobbed],
+            dp[house_count][kNotRobbed]);
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums.size())$。
+- 空间复杂度：$O(nums.size())$。
+
+### 空间优化
+
+第 `house + 1` 间房屋的状态只依赖第 `house` 间房屋，所以可以压成两个变量：
+
+- `robbed`：当前房屋被偷时的最大金额。
+- `not_robbed`：当前房屋不偷时的最大金额。
+
+```cpp
+#include <algorithm>
+#include <climits>
+#include <vector>
+
+using namespace std;
+
+class Solution {
+public:
+    /**
+     * @brief 使用空间优化状态机 DP 求不偷相邻房屋时的最大金额。
+     *
+     * @param nums 每间房屋存放的金额。
+     * @return 不触发警报时能够偷到的最大金额。
+     */
+    int rob(vector<int>& nums) {
+        constexpr int kInvalid = INT_MIN / 4;
+        int robbed = kInvalid;
+        int not_robbed = 0;
+
+        for (const int amount : nums) {
+            const int previous_robbed = robbed;
+            const int previous_not_robbed = not_robbed;
+
+            // 偷当前房屋只能从前一间房屋不偷的状态转移而来。
+            robbed = previous_not_robbed + amount;
+
+            // 不偷当前房屋可以继承前一间房屋的任意合法状态。
+            not_robbed = max(previous_robbed, previous_not_robbed);
+        }
+
+        return max(robbed, not_robbed);
+    }
+};
+```
+
+复杂度：
+
+- 时间复杂度：$O(nums.size())$。
+- 空间复杂度：$O(1)$。
+
+### 和前面普通 DP 的区别
+
+前面的写法定义：
+
+```text
+f[house + 2]：处理完 nums[0..house] 后，能够偷到的最大金额。
+```
+
+转移是：
+
+$$
+f[house + 2] =
+\max(
+f[house + 1],\
+f[house] + nums[house]
+)
+$$
+
+它只保存“处理到当前位置时的最大金额”，不记录当前房屋到底偷没偷。
+
+状态机 DP 则把这个最大金额按当前房屋是否被偷拆开：
+
+| 视角 | 记录的信息 | 偷当前房屋时的来源 |
+| --- | --- | --- |
+| 前面普通 DP | 前缀的全局最大金额 `f` | 直接跳到 `f[house]`，自动避开前一间房屋。 |
+| 状态机 DP | `robbed` / `not_robbed` 两种结尾状态 | 必须从 `not_robbed` 转移。 |
+
+两者并不是两种不同算法，而是**同一件事的两种状态定义**。
+
+对于同一个 `house`，有：
+
+$$
+f[house + 2] =
+\max(
+dp[house + 1][robbed],\
+dp[house + 1][not\_robbed]
+)
+$$
+
+再看“偷当前房屋”的状态机转移：
+
+$$
+dp[house + 1][robbed] = dp[house][not\_robbed] + nums[house]
+$$
+
+而前面普通 DP 的 `f[house]` 恰好就是处理完 `nums[0..house - 2]` 后的全局最优值。由于第 `house - 1` 间房屋还没处理，它天然对应“可以偷当前房屋”的前缀最优值，于是被写成：
+
+$$
+f[house] + nums[house]
+$$
+
+普通 DP 把“上一间房屋不偷”这个条件藏进了“直接跳过一间房”的下标里；状态机 DP 则把它放在 `not_robbed` 状态里显式表达。
+
+### 什么时候用哪一种？
+
+- 当前题只有“不能偷相邻房屋”这一条规则时，前面的 `f[i]` 写法更短，提交时很舒服。
+- 想训练状态机思维，或题目要求明确当前元素是否被选中时，`robbed / not_robbed` 更直观。
+- 约束开始依赖更多历史状态时，状态机更容易扩展。例如 309 的冷冻期要把“不持有”拆成 `ready / cooldown`；打家劫舍 II 的首尾相邻约束则需要额外记录第一间房屋的选择。
+
+### 这题的核心手感
+
+打家劫舍和股票状态机的结构非常像：
+
+```text
+股票：holding / not_holding
+打家劫舍：robbed / not_robbed
+```
+
+差别只在状态转移的限制：
+
+```text
+股票可以：not_holding -> holding
+打家劫舍禁止：robbed -> robbed
+```
+
+所以以后看到“相邻元素不能同时选”时，可以自然地问：
+
+> 处理完当前位置后，当前位置是选了，还是没选？
+
+这两个状态一旦写出来，转移通常就已经出来了。

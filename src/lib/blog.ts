@@ -66,6 +66,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: 'GPU通信系统',
         description: '有关GPU通信的理论和实践知识',
     },
+    'interview-guide': {
+        label: '计算机招聘八股',
+        description: '相关领域的八股知识',
+    },
 }
 
 const fallbackTopic: BlogTopic = {
