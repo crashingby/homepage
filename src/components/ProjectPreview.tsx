@@ -1,6 +1,6 @@
 const projects = [
     {
-        title: 'GEMM 迭代优化（进行中）',
+        title: 'GEMM 迭代优化（已完成）',
         desc: '逐版本迭代GEMM。使用主流的优化路径：共享内存，异步拷贝，Tensor Core。',
         href: 'https://gitee.com/hxy21211319/gemm-reseach',
     },
