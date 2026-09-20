@@ -70,6 +70,10 @@ const topicConfig: Record<string, Omit<BlogTopic, 'slug'>> = {
         label: '计算机招聘八股',
         description: '相关领域的八股知识',
     },
+    'system-software-design': {
+        label: '系统软件设计',
+        description: '学习如何设计一个合理的系统',
+    },
 }
 
 const fallbackTopic: BlogTopic = {
