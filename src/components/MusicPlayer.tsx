@@ -1,156 +1,272 @@
 import { useEffect, useRef, useState } from 'react'
 import { musicTracks } from '../data/music'
+import { Icon } from './Icon'
+
+function formatTime(seconds: number) {
+    if (!Number.isFinite(seconds)) return '0:00'
+    return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`
+}
 
 export function MusicPlayer() {
     const audioRef = useRef<HTMLAudioElement>(null)
-    const trackMenuRef = useRef<HTMLDivElement>(null)
+    const containerRef = useRef<HTMLDivElement>(null)
+    const triggerRef = useRef<HTMLButtonElement>(null)
+    const wantsPlayback = useRef(false)
     const [trackIndex, setTrackIndex] = useState(0)
     const [isPlaying, setIsPlaying] = useState(false)
-    const [isTrackMenuOpen, setIsTrackMenuOpen] = useState(false)
+    const [isOpen, setIsOpen] = useState(false)
     const [volume, setVolume] = useState(0.72)
-
+    const [currentTime, setCurrentTime] = useState(0)
+    const [duration, setDuration] = useState(0)
+    const [error, setError] = useState('')
     const currentTrack = musicTracks[trackIndex]
 
     useEffect(() => {
         const audio = audioRef.current
-
-        if (!audio || !currentTrack) {
-            return
-        }
-
+        if (!audio || !currentTrack) return
+        let cancelled = false
         audio.load()
-
-        if (isPlaying) {
-            void audio.play().catch(() => setIsPlaying(false))
+        if (wantsPlayback.current)
+            void audio.play().catch((reason: unknown) => {
+                if (
+                    !cancelled &&
+                    !(
+                        reason instanceof DOMException &&
+                        reason.name === 'AbortError'
+                    )
+                ) {
+                    wantsPlayback.current = false
+                    setError('暂时无法播放，请检查网络后重试。')
+                }
+            })
+        return () => {
+            cancelled = true
         }
-    }, [currentTrack, isPlaying])
+    }, [currentTrack])
 
     useEffect(() => {
-        const audio = audioRef.current
-
-        if (audio) {
-            audio.volume = volume
-        }
+        if (audioRef.current) audioRef.current.volume = volume
     }, [volume])
-
     useEffect(() => {
-        const closeTrackMenu = (event: MouseEvent) => {
-            if (!trackMenuRef.current?.contains(event.target as Node)) {
-                setIsTrackMenuOpen(false)
+        if (!isOpen) return
+        const close = (event: MouseEvent) => {
+            if (!containerRef.current?.contains(event.target as Node))
+                setIsOpen(false)
+        }
+        const escape = (event: KeyboardEvent) => {
+            if (event.key === 'Escape') {
+                setIsOpen(false)
+                triggerRef.current?.focus()
             }
         }
-
-        document.addEventListener('mousedown', closeTrackMenu)
-
+        document.addEventListener('mousedown', close)
+        document.addEventListener('keydown', escape)
         return () => {
-            document.removeEventListener('mousedown', closeTrackMenu)
+            document.removeEventListener('mousedown', close)
+            document.removeEventListener('keydown', escape)
         }
-    }, [])
+    }, [isOpen])
 
-    if (musicTracks.length === 0 || !currentTrack) {
-        return null
+    if (!currentTrack) return null
+    const goToTrack = (index: number) => {
+        setError('')
+        setCurrentTime(0)
+        setDuration(0)
+        setTrackIndex((index + musicTracks.length) % musicTracks.length)
     }
-
-    const goToTrack = (nextIndex: number) => {
-        const normalizedIndex = (nextIndex + musicTracks.length) % musicTracks.length
-        setTrackIndex(normalizedIndex)
-    }
-
     const togglePlayback = async () => {
         const audio = audioRef.current
-
-        if (!audio) {
-            return
-        }
-
-        if (isPlaying) {
+        if (!audio) return
+        setError('')
+        if (!audio.paused) {
+            wantsPlayback.current = false
             audio.pause()
-            setIsPlaying(false)
             return
         }
-
+        wantsPlayback.current = true
         try {
             await audio.play()
-            setIsPlaying(true)
         } catch {
+            wantsPlayback.current = false
             setIsPlaying(false)
+            setError('暂时无法播放，请检查网络后重试。')
         }
     }
 
     return (
-        <section className="music-player" aria-label="Homepage music player">
-            <div className="music-player__meta">
-                <span className="music-player__label">Music</span>
-                <strong>{currentTrack.title}</strong>
-                {currentTrack.artist ? <span>{currentTrack.artist}</span> : null}
-            </div>
-
-            <div className="music-player__controls">
-                <button type="button" onClick={() => goToTrack(trackIndex - 1)}>
-                    上一首
-                </button>
-                <button type="button" className="music-player__primary" onClick={togglePlayback}>
-                    {isPlaying ? '暂停' : '播放'}
-                </button>
-                <button type="button" onClick={() => goToTrack(trackIndex + 1)}>
-                    下一首
-                </button>
-            </div>
-
-            <div className="music-player__track-picker" ref={trackMenuRef}>
-                <span>曲目</span>
-                <button
-                    type="button"
-                    className="music-player__track-trigger"
-                    aria-haspopup="listbox"
-                    aria-expanded={isTrackMenuOpen}
-                    onClick={() => setIsTrackMenuOpen((isOpen) => !isOpen)}
+        <div className="music-widget" ref={containerRef}>
+            <section
+                className="music-panel"
+                id="music-panel"
+                aria-label="音乐播放器"
+                hidden={!isOpen}
+            >
+                <div className="music-panel-heading">
+                    <span className="eyebrow">A LITTLE BACKGROUND MUSIC</span>
+                    <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="收起播放器"
+                        onClick={() => {
+                            setIsOpen(false)
+                            triggerRef.current?.focus()
+                        }}
+                    >
+                        <Icon name="close" size={17} />
+                    </button>
+                </div>
+                <div
+                    className={`record-art${isPlaying ? ' is-playing' : ''}`}
+                    aria-hidden="true"
                 >
-                    <span>{currentTrack.title}</span>
-                </button>
-
-                {isTrackMenuOpen ? (
-                    <div className="music-player__track-menu" role="listbox" aria-label="选择歌曲">
-                        {musicTracks.map((track, index) => (
-                            <button
-                                key={track.src}
-                                type="button"
-                                className={index === trackIndex ? 'is-active' : undefined}
-                                role="option"
-                                aria-selected={index === trackIndex}
-                                onClick={() => {
-                                    setTrackIndex(index)
-                                    setIsTrackMenuOpen(false)
-                                }}
-                            >
-                                <strong>{track.title}</strong>
-                                {track.artist ? <span>{track.artist}</span> : null}
-                            </button>
-                        ))}
+                    <div className="record-disc">
+                        <span>cb.</span>
                     </div>
-                ) : null}
-            </div>
-
-            <label className="music-player__volume">
-                <span>音量 {Math.round(volume * 100)}%</span>
-                <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.01"
-                    value={volume}
-                    onChange={(event) => setVolume(Number(event.target.value))}
-                    aria-label="调节音乐音量"
-                />
-            </label>
-
+                    <span className="record-caption">
+                        SOUNDTRACK
+                        <br />
+                        FOR A QUIET MOMENT
+                    </span>
+                </div>
+                <div className="music-meta">
+                    <strong>{currentTrack.title}</strong>
+                    <span>{currentTrack.artist}</span>
+                </div>
+                <div className="music-seek">
+                    <input
+                        type="range"
+                        min="0"
+                        max={duration || 1}
+                        step="1"
+                        value={Math.min(currentTime, duration || 1)}
+                        disabled={!duration}
+                        aria-label="播放进度"
+                        onChange={(event) => {
+                            const time = Number(event.target.value)
+                            if (audioRef.current)
+                                audioRef.current.currentTime = time
+                            setCurrentTime(time)
+                        }}
+                    />
+                    <div>
+                        <span>{formatTime(currentTime)}</span>
+                        <span>{formatTime(duration)}</span>
+                    </div>
+                </div>
+                <div className="music-controls">
+                    <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="上一首"
+                        onClick={() => goToTrack(trackIndex - 1)}
+                    >
+                        <Icon name="previous" size={19} />
+                    </button>
+                    <button
+                        type="button"
+                        className="music-play"
+                        aria-label={isPlaying ? '暂停音乐' : '播放音乐'}
+                        onClick={() => void togglePlayback()}
+                    >
+                        <Icon name={isPlaying ? 'pause' : 'play'} size={21} />
+                    </button>
+                    <button
+                        type="button"
+                        className="icon-button"
+                        aria-label="下一首"
+                        onClick={() => goToTrack(trackIndex + 1)}
+                    >
+                        <Icon name="next" size={19} />
+                    </button>
+                </div>
+                {error && (
+                    <p className="music-error" role="status">
+                        {error}
+                    </p>
+                )}
+                <div className="music-options">
+                    <label>
+                        曲目
+                        <select
+                            value={trackIndex}
+                            onChange={(event) =>
+                                goToTrack(Number(event.target.value))
+                            }
+                        >
+                            {musicTracks.map((track, index) => (
+                                <option value={index} key={track.src}>
+                                    {track.title}
+                                </option>
+                            ))}
+                        </select>
+                    </label>
+                    <label className="music-volume">
+                        音量
+                        <input
+                            type="range"
+                            min="0"
+                            max="1"
+                            step="0.01"
+                            value={volume}
+                            onChange={(event) =>
+                                setVolume(Number(event.target.value))
+                            }
+                            aria-label="音乐音量"
+                        />
+                    </label>
+                </div>
+            </section>
+            <button
+                ref={triggerRef}
+                type="button"
+                className={`music-trigger${isPlaying ? ' is-playing' : ''}`}
+                aria-expanded={isOpen}
+                aria-controls="music-panel"
+                onClick={() => setIsOpen(!isOpen)}
+            >
+                <span className="music-trigger-icon">
+                    <Icon name="music" size={17} />
+                </span>
+                <span>{isPlaying ? currentTrack.title : '来点音乐'}</span>
+                {isPlaying ? (
+                    <span className="equalizer" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
+                    </span>
+                ) : (
+                    <span className="music-trigger-hint">放松一下</span>
+                )}
+            </button>
             <audio
                 ref={audioRef}
                 src={currentTrack.src}
-                onEnded={() => goToTrack(trackIndex + 1)}
+                preload="none"
+                onEnded={() => {
+                    wantsPlayback.current = true
+                    goToTrack(trackIndex + 1)
+                }}
                 onPause={() => setIsPlaying(false)}
-                onPlay={() => setIsPlaying(true)}
+                onPlay={() => {
+                    setIsPlaying(true)
+                    setError('')
+                }}
+                onTimeUpdate={(event) =>
+                    setCurrentTime(event.currentTarget.currentTime)
+                }
+                onDurationChange={(event) =>
+                    setDuration(
+                        Number.isFinite(event.currentTarget.duration)
+                            ? event.currentTarget.duration
+                            : 0,
+                    )
+                }
+                onError={() => {
+                    setIsPlaying(false)
+                    wantsPlayback.current = false
+                    setError('音乐暂时无法加载，请稍后重试。')
+                }}
             />
-        </section>
+        </div>
     )
 }

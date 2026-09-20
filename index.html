@@ -1,10 +1,18 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>homepage</title>
+    <meta name="description" content="Huang Xinying 的个人笔记：GPU 编程、C++、高性能计算与 LLM 系统。" />
+    <meta name="theme-color" content="#f8f7f4" />
+    <script>
+      try {
+        const saved = localStorage.getItem('site-theme');
+        document.documentElement.dataset.theme = saved === 'dark' || (!saved && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+      } catch { document.documentElement.dataset.theme = 'light'; }
+    </script>
+    <title>Crashing By — 技术与日常</title>
   </head>
   <body>
     <div id="root"></div>

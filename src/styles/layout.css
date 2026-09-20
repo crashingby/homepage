@@ -1,77 +1,148 @@
 .site-header {
     position: sticky;
     top: 0;
-    z-index: 20;
+    z-index: 40;
     border-bottom: 1px solid var(--border);
-    background: rgba(255, 255, 255, 0.78);
-    backdrop-filter: blur(18px);
+    background: var(--page-bg);
 }
-
 .site-nav {
-    width: min(1080px, calc(100% - 48px));
-    min-height: 64px;
-    margin: 0 auto;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 24px;
+    width: min(1200px, calc(100% - 80px));
+    min-height: 80px;
+    margin: auto;
+}
+.site-mark {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 24px;
+    gap: 12px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.3px;
 }
-
-.site-mark {
-    color: var(--text-main);
-    font-weight: 800;
+.site-monogram {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    color: var(--accent);
+    font: bold 23px var(--serif);
 }
-
+.site-mark-caption {
+    display: block;
+    margin-top: 3px;
+    color: var(--text-soft);
+    font-size: 10px;
+    font-weight: 400;
+    letter-spacing: 0.5px;
+}
 .nav-links {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 26px;
 }
-
-.nav-links a {
-    padding: 8px 10px;
-    border-radius: 8px;
+.nav-links > a {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 8px 0;
+    font-size: 13px;
     color: var(--text-muted);
-    font-size: 0.94rem;
-    font-weight: 700;
 }
-
-.nav-links a:hover,
-.nav-links a.active {
-    color: var(--accent-blue);
-    background:
-        linear-gradient(90deg, rgba(219, 234, 254, 0.92), rgba(252, 231, 243, 0.72));
+.nav-links > a.active,
+.nav-links > a:hover {
+    color: var(--accent);
 }
-
+.nav-links > a.active {
+    box-shadow: 0 1px var(--accent);
+}
+.nav-divider {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+}
 .app {
-    position: relative;
-    z-index: 1;
-    width: min(1440px, calc(100% - 48px));
+    width: min(1120px, calc(100% - 80px));
     margin: 0 auto;
-    padding: 56px 0 72px;
+    min-height: calc(100svh - 220px);
+    outline: none;
 }
-
-@media (max-width: 720px) {
+.site-footer {
+    width: min(1120px, calc(100% - 80px));
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 24px;
+    margin: 30px auto 0;
+    padding: 32px 0 96px;
+    border-top: 1px solid var(--border);
+    color: var(--text-soft);
+    font-size: 10px;
+    letter-spacing: 1px;
+}
+.site-footer > a {
+    color: var(--text-main);
+    font-family: var(--serif);
+    font-size: 17px;
+}
+.site-footer > a span {
+    display: inline-block;
+    margin-left: 18px;
+    color: var(--text-soft);
+    font: 11px/1.8 sans-serif;
+    letter-spacing: 0;
+}
+.site-footer > span {
+    font-family: var(--mono);
+}
+@media (min-width: 1400px) {
+    .app:has(.is-wide) {
+        width: min(1360px, calc(100% - 80px));
+    }
+}
+@media (max-width: 700px) {
     .site-nav {
-        width: min(100% - 32px, 1080px);
-        min-height: 58px;
+        width: calc(100% - 36px);
+        min-height: 68px;
+        gap: 12px;
     }
-
     .site-mark {
-        font-size: 0.95rem;
+        font-size: 13px;
+        gap: 8px;
     }
-
+    .site-monogram {
+        width: 32px;
+        height: 32px;
+        font-size: 21px;
+    }
     .nav-links {
-        gap: 4px;
+        gap: 18px;
     }
-
-    .nav-links a {
-        padding: 7px 8px;
-        font-size: 0.88rem;
+    .nav-links > a {
+        font-size: 12px;
     }
-
-    .app {
-        width: min(100% - 32px, 1080px);
-        padding: 48px 0;
+    .nav-github,
+    .nav-divider {
+        display: none !important;
+    }
+    .app,
+    .site-footer {
+        width: calc(100% - 40px);
+    }
+    .site-footer {
+        align-items: flex-start;
+    }
+    .site-footer > a span {
+        display: block;
+        margin: 8px 0 0;
+    }
+    .site-footer > span {
+        max-width: 75px;
+        line-height: 1.8;
+        text-align: right;
     }
 }
