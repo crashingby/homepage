@@ -548,7 +548,7 @@ cublasLtMatmul(handle, operation_desc,
 
 理解这条链时，顺序必须固定为：**数学 GEMM → shared-memory 地址 → CuTe view → LDSM → rmem fragment → MMA**。`_TN`、LDSM 的 N/T、`.row/.col` 分别处在不同层，不能互相替代。
 
-> **`.row.col` 的一句话总结：目标始终是逻辑 $A[M,K]\times B[K,N]$。A 的目标 rmem fragment 是 row 方向，B 的目标 rmem fragment 是 col 方向；SMEM 的微块方向已匹配就直接 LDSM，不匹配就先在写入 SMEM 时改好，或在 LDSM 时转置。最终进入 `.row.col` 的始终是正确的逻辑 A、B 元素。**
+> **`.row.col` 的一句话总结：它固定的是 `(lane, register 内标量) →` 逻辑 A/B 坐标的合同，不是一个线性寄存器 buffer 的存储顺序。该合同中，A 的局部 FP16 pair 固定 $m$、沿 K 相邻（row direction）；B 的局部 FP16 pair 固定 $n$、沿 K 相邻（column direction）。LDSM 的职责是把 shared memory 中的元素放入这些固定 slot。**
 
 以一个 warp 的指令为例：
 
@@ -609,20 +609,79 @@ $$
 
 **数学 row-major 的 $B[K,N]$，在 CuTe `(N,K)` view 中是 `LayoutLeft`。** 不先确定坐标轴，谈 B 的行/列优先没有意义。
 
-### LDSM 的 N/T：只描述 load 时是否转置 shared 8x8 子块
+### `.row.col` 先定义 rmem slot，不定义线性寄存器 buffer
 
-`ldmatrix`（CuTe 中常简称 LDSM）从 shared memory 读取 half microtile：N 不转置这个 8x8 子块，T 在 load 时转置它。这里的 N/T 不是 cuBLAS 的 `OP_N/T`，不是 Atom 名 `_TN`，也不是 MMA 的 `.row/.col`。
+对 `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`，PTX 规定了每一个 `(lane, register 内标量)` 对应 A/B 哪个逻辑元素。官方的 fragment 图正是在画这张映射，而不是把 32 个线程的寄存器拼成一段普通的 row-major 或 column-major 数组。
 
-对 `.row.col`，先把它翻译为目标 rmem 方向：A 要 **row** 方向的 fragment，B 要 **col** 方向的 fragment。然后只问一件事：SMEM 微块的连续方向是否已经等于目标方向？相同则用 N；不同则要在写入 SMEM 时预先换布局，或由 T 在 S2R 时换方向。忽略 swizzle、对齐和每 lane 向量宽度后，方向关系是：
+令：
 
-| 数学 operand | SMEM 连续方向 | 数学布局 | 相对 `.row.col` 的目标 rmem | 方向上的处理 |
-| --- | --- | --- | --- | --- |
-| $A[M,K]$ | K 连续 | row-major | A 需要 row | 直接 LDSM N |
-| $A[M,K]$ | M 连续 | column-major | A 需要 row | 写入 SMEM 时改为 K 连续，或 LDSM T |
-| $B[K,N]$ | K 连续 | column-major | B 需要 col | 直接 LDSM N |
-| $B[K,N]$ | N 连续 | row-major | B 需要 col | 写入 SMEM 时改为 K 连续，或 LDSM T |
+```text
+g = lane_id >> 2       // 0 ... 7
+t = lane_id & 3        // 0 ... 3
+```
 
-这里的“直接”只指**方向不需要转置**；实际应选 `x1/x2/x4`、具体 Copy Atom 以及是否能直接发射 LDSM，仍由 microtile 形状、swizzle、对齐和 CuTe 的 layout 共同决定。核心不变：**先确定数学 A/B 的哪一维连续，再让 load 生成 MMA 所需的 rmem 方向。**
+FP16 A operand 有 4 个 `.f16x2`，即标量 `a0 ... a7`；B operand 有 2 个 `.f16x2`，即标量 `b0 ... b3`。其坐标关系可归纳为：
+
+| operand | 标量的逻辑坐标 | 一个 FP16 pair 的方向 |
+| --- | --- | --- |
+| A | $a_i$ 的 $m$ 是 $g$ 或 $g+8$；$k=2t+(i\mathbin{\&}1)$，后半组再加 8 | `a0,a1`、`a2,a3` 等固定 $m$，沿 K 相邻 |
+| B | $b_i$ 的 $k=2t+(i\mathbin{\&}1)$，后半组再加 8；$n=g$ | `b0,b1`、`b2,b3` 固定 $n$，沿 K 相邻 |
+
+例如 lane 0 的前几个标量为：
+
+| lane 0 的 slot | 对应逻辑元素 |
+| --- | --- |
+| `a0, a1` | $A(0,0), A(0,1)$ |
+| `a2, a3` | $A(8,0), A(8,1)$ |
+| `b0, b1` | $B(0,0), B(1,0)$ |
+| `b2, b3` | $B(8,0), B(9,0)$ |
+
+所以 `.row.col` 的 `row/col` 可以从**局部 FP16 pair 的逻辑方向**理解：
+
+- A 的 pair 固定 $m$、K 变化；对 $A[M,K]$ 来说这是 row direction。
+- B 的 pair 固定 $n$、K 变化；对 $B[K,N]$ 来说这是 column direction。
+
+但这不等于“先按 `T0,T1,...,T31`，再按 register 编号把标量串起来，就是一个普通 row-major / column-major buffer”。跨 lane 的顺序由上述非平凡映射决定；正确的判断标准永远是图或坐标公式。PTX 的完整 fragment 图与公式见 [`mma.m16n8k16` floating-point fragment](https://docs.nvidia.com/cuda/parallel-thread-execution/#warp-level-matrix-instructions-mma-16816-float)。
+
+### LDSM 的 N/T：改变 shared-to-register 的协作映射
+
+`ldmatrix`（CuTe 中常简称 LDSM）由整个 warp 从 shared memory 协作装入一个或多个 $8\times8$ half tile。官方称 `.trans` 为“以 column-major format 加载”；从数据流角度，它改变的是：**一个 shared 元素最终进入哪个 lane 的哪个 register slot。** 它不是在 shared memory 中生成一份转置后的 buffer。
+
+先忽略 swizzle、padding 和 `x1/x2/x4`，把一个物理 $8\times8$ source tile 记为 $S(r,c)$，把 load 后应送给消费者的逻辑坐标网格记为 $F$：
+
+$$
+\text{LDSM N}:\quad F(r,c)=S(r,c),
+$$
+
+$$
+\text{LDSM T}:\quad F(c,r)=S(r,c).
+$$
+
+第二式就是“转置读取”的精确含义：source 中的 $S(r,c)$ 没有移动，但它被送往 destination 的 $(c,r)$ slot。实际硬件还要求 warp 中特定线程提供各行的起始地址；因此不能只把 PTX 指令的 N 改成 T、却保持原来的 source layout 和地址映射不变。CuTe 的 source view 加上 `Copy_Atom` 正是同时构造这两部分映射。
+
+对 B，这两条等价路径特别直观。令最终 B fragment 的坐标 view 为：
+
+$$
+F(n,k)=B(k,n).
+$$
+
+| 数学 B 的 SMEM 布局 | source tile 的坐标解释 | LDSM 后的 F | 为什么正确 |
+| --- | --- | --- | --- |
+| column-major，K 连续 | $S(n,k)=B(k,n)$ | N：$F(n,k)=S(n,k)$ | source 已按 B fragment 所需的 K 方向排列 |
+| row-major，N 连续 | $S(k,n)=B(k,n)$ | T：$F(n,k)=S(k,n)$ | T 把 source 的 $(k,n)$ 送到 B slot 的 $(n,k)$ |
+
+两行最终都满足 $F(n,k)=B(k,n)$，所以进入 MMA 的是同一套 B rmem slot，指令仍计算 $A(m,k)B(k,n)$，而不是 $A\times B^T$。
+
+把这件事与 A/B 的 local pair 合在一起，方向上的选择为：
+
+| 数学 operand | SMEM 连续方向 | MMA 固定要求的局部 pair | 方向上的处理 |
+| --- | --- | --- | --- |
+| $A[M,K]$ | K 连续 | 固定 $m$，K 相邻 | 直接 LDSM N |
+| $A[M,K]$ | M 连续 | 固定 $m$，K 相邻 | 写入 SMEM 时改为 K 连续，或 LDSM T |
+| $B[K,N]$ | K 连续 | 固定 $n$，K 相邻 | 直接 LDSM N |
+| $B[K,N]$ | N 连续 | 固定 $n$，K 相邻 | 写入 SMEM 时改为 K 连续，或 LDSM T |
+
+这里的“直接”只指**局部 pair 的方向不需要交换**；实际应选 `x1/x2/x4`、具体 Copy Atom 以及是否能直接发射 LDSM，仍由 microtile 形状、swizzle、对齐和 CuTe layout 共同决定。
 
 本节固定的 row-major A/B 恰好落在表的第一、四行：
 
@@ -631,9 +690,9 @@ $$
 | $A[M,K]$，K 连续 | `(M,K)` `LayoutRight` | `SM75_U32x4_LDSM_N` | `ldmatrix.x4` |
 | $B[K,N]$，N 连续 | `(N,K)` `LayoutLeft` | `SM75_U16x4_LDSM_T` | `ldmatrix.x2.trans` |
 
-A 每 lane 有 4 个 32-bit register，所以使用 `x4`。B 每 lane 有 2 个 32-bit register；`SM75_U16x4_LDSM_T` 实际发射 `ldmatrix.x2.trans`，产生这两个 B register。
+A 每 lane 有 4 个 32-bit register，所以使用 `x4`。B 每 lane 有 2 个 32-bit register；`SM75_U16x4_LDSM_T` 实际发射 `ldmatrix.x2.trans`，产生这两个 B register。B 的 $K=16,N=8$ tile 沿 K 切成两个 $8\times8$ 子块，因此是 `x2`。
 
-> **`.row.col` 不规定 shared memory 必须采用哪种线性布局。它规定的是最终 rmem：A 为 row、B 为 col。数学 row-major B 的 N 连续路径可用 LDSM T；数学 column-major B 的 K 连续路径可用 LDSM N；两者都能生成同一种 `.col` B fragment。**
+> **`.row.col` 不规定 shared memory 必须采用哪种线性布局；它固定 A/B 的 rmem slot。数学 row-major B 的 N 连续路径可用 LDSM T，数学 column-major B 的 K 连续路径可用 LDSM N；两条路径最终填入相同的 $F(n,k)=B(k,n)$ slot。**
 
 ### `thread_mma` 只划分 fragment；LDSM 才读取 SMEM
 
