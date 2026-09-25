@@ -7,9 +7,7 @@ summary: 从传统 cuBLAS 的 column-major 契约出发，逐项解释 GEMM 的 
 
 # GPU 矩阵布局
 
-本文的第一个目标不是优化 GEMM，而是把一个常见困惑彻底拆开：**明明 C/C++ 数组通常按行优先（row-major）组织，为什么 cuBLAS 的 `cublasSgemm` 却以列优先（column-major）解释数据？**
-
-这里讨论的是传统 cuBLAS GEMM API。它继承 BLAS 的 Fortran 约定：矩阵默认为 column-major；调用方传入的是一维 device pointer，库根据 `M/N/K`、leading dimension（领先维度）和转置选项来解释这段内存。[cuBLAS 官方文档](https://docs.nvidia.com/cuda/cublas/index.html#data-layout) 也明确说明其采用 column-major 存储。
+本文的目标不是优化 GEMM，而是把常见的困惑拆开：逻辑矩阵和实际存储计算需求的内存布局到底要如何对应？
 
 ## cuBLAS GEMM 的固定数学语义
 
