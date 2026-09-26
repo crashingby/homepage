@@ -1,5 +1,5 @@
 ---
-title: GPU 矩阵布局：cuBLAS 的列优先 GEMM
+title: GPU 矩阵布局：如何理解逻辑矩阵和内存优先的关系
 date: 2026-09-21
 tags: [CUDA, cuBLAS, GEMM, Matrix Layout, GPU 编程]
 summary: 从传统 cuBLAS 的 column-major 契约出发，逐项解释 GEMM 的 M/N/K、leading dimension、转置选项与 row-major 参数映射。
