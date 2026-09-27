@@ -13,13 +13,13 @@ export function Hero() {
                     Crashing By<span>.</span>
                 </h1>
                 <p className="hero-heading">
-                    在代码与系统之间，
+                    个人笔记，希望能给自己快速回顾
                     <br />
-                    留下一些思考。
+                    AI主导，尽量能留下自己的思考。
                 </p>
                 <p className="hero-subtitle">
-                    我是 Huang Xinying，硕士在读。
-                    <br />写 C++，研究 CUDA 与 GPU，也记录一路上的发现。
+                    我是 Crashing By，硕士在读。
+                    <br />目前主要学习C++，cuda，GPU相关知识。
                 </p>
                 <div className="hero-actions">
                     <Link to="/blog" className="primary-button">

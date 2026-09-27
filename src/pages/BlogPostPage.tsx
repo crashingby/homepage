@@ -94,7 +94,6 @@ function Article({ post }: { post: BlogPost }) {
                                     ' 分钟阅读',
                                 )}
                             </span>
-                            <span>Huang Xinying</span>
                         </div>
                         <div className="article-header-bottom">
                             <div className="tag-list" aria-label="文章标签">
