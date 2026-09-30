@@ -17,6 +17,9 @@ MMA 指令是架构相关的：Volta、Ampere、Hopper、Blackwell 都有不同�
 - 源码：`include/cute/arch/mma_sm70.hpp`
 - 源码：`include/cute/arch/mma_sm80.hpp`
 - 源码：`include/cute/arch/mma_sm89.hpp`
+- 源码：`include/cute/arch/mma_sm90.hpp`
+- 源码：`include/cute/arch/mma_sm90_gmma.hpp`
+- 源码：`include/cute/arch/mma_sm90_gmma_sparse.hpp`
 - 源码：`include/cute/atom/mma_traits_sm70.hpp`
 - 源码：`include/cute/atom/mma_traits_sm80.hpp`
 - 源码：`include/cute/atom/mma_traits_sm89.hpp`
@@ -55,93 +58,225 @@ flowchart TD
 
 **用途**
 
-Operation 结构体封装一条具体的 PTX MMA 指令。它尽量不依赖 CuTe 的 `Tensor`、`Layout` 或复杂数值类型，只描述这条指令的**物理寄存器接口**。
+Operation 结构体封装底层 MMA 操作，主要描述**操作数的物理接口**和 `fma` 调用，不负责 CuTe 的 `Tensor` 分块与线程映射。普通 MMA 的 A/B 是寄存器 fragment；Hopper GMMA 的输入还可以是 shared memory descriptor。复数 Operation 则由多次实数 MMA 组合实现。
 
 **源码位置**
 
 ```text
 include/cute/arch/mma_sm70.hpp
 include/cute/arch/mma_sm80.hpp
+include/cute/arch/mma_sm90.hpp
 include/cute/arch/mma_sm90_gmma.hpp
 ```
 
 ### 命名方式
 
-以 `SM70_8x8x4_F32F16F16F32_NT` 为例：
+先看 `SM80_16x8x16_F32F16F16F32_TN`，它封装的指令是：
+
+```ptx
+mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+```
+
+这条指令完成 $D = AB + C$，名字各部分与 PTX 的对应关系如下：
 
 | 片段 | 含义 |
 | --- | --- |
-| `SM70` | 最早支持该指令的 GPU 架构，这里是 Volta。 |
-| `8x8x4` | 单条 MMA 的逻辑形状，表示 $M=8, N=8, K=4$。 |
-| `F32F16F16F32` | 可以按 `D/A/B/C` 理解：输出 D 是 `float`，A/B 是 `half`，输入累加器 C 是 `float`。 |
-| `NT` | CuTe Operation 后缀，描述这条 PTX MMA 指令要求的 A/B fragment 布局。对这个 Operation，PTX 指令里是 `.col.row`。 |
+| `SM80` | 最早支持该指令的架构，这里是 Ampere。 |
+| `16x8x16` | MMA 的逻辑形状 $M=16, N=8, K=16$，对应 `.m16n8k16`。 |
+| `F32F16F16F32` | 按 **D/A/B/C** 排列：D、C 是 F32，A、B 是 F16，对应 `.f32.f16.f16.f32`。 |
+| `TN` | 沿用 BLAS 的 A/B 转置命名，对应指令的 `.row.col`；此时 A、B 都是 K-major，即 K 方向连续。 |
 
-### `T/N` 后缀怎么理解
+### `TN`：BLAS 命名与 K 方向连续
 
-这里的 `T/N` 确实来自比较传统的 BLAS / GEMM 命名习惯，但要注意：**BLAS 默认按 column-major（列主序）理解矩阵**。所以 `N` 和 `T` 不是直接等价于 PTX 里的 `.row/.col`，中间还隔着一层 column-major 语境。
+`T` 表示 transpose，`N` 表示 no transpose。这里采用传统 BLAS 的 **column-major（列主序）** 语境：`TN` 对应 `transA = T`、`transB = N`。列主序的 A 转置后具有 row-major 视角，B 不转置仍具有 column-major 视角。转置参数的定义可参考 [BLAS DGEMM 文档](https://www.netlib.org/lapack/explore-html/d7/d2b/dgemm_8f.html)。
 
-先看 BLAS 语义：
+例如 BLAS 中存储的 $A_0$ 是列主序 $(K,M)$ 矩阵，$B_0$ 是列主序 $(K,N)$ 矩阵。TN 计算 $D=A_0^T B_0+C$，参与乘法的逻辑 A 就是 $A_0^T$，形状为 $(M,K)$。
 
-| 标志 | BLAS 语义 | 在 column-major 基础上的直观效果 | PTX fragment 视角 |
+理解 `.row.col` 时，先明确数学矩阵的维度：A 是 $(M,K)$，B 是 $(K,N)$。
+
+| 操作数 | BLAS 标志 | PTX 布局 | 坐标变化 | 连续方向 |
+| --- | --- | --- | --- | --- |
+| A：$(M,K)$ | `T` | `.row` | 固定行 $m$，沿列 $k$ 变化。 | **K 连续**。 |
+| B：$(K,N)$ | `N` | `.col` | 固定列 $n$，沿行 $k$ 变化。 | **K 连续**。 |
+
+因此，**A 的 `.row` 和 B 的 `.col` 都表示 K 方向连续**。两者使用不同的 row/col 名字，是因为 K 在 A 中是列维度，在 B 中是行维度。用普通二维存储的元素偏移来说明就是：
+
+$$
+\operatorname{offset}_A(m,k) = m \cdot \mathrm{ld}_A + k,
+\qquad
+\operatorname{offset}_B(k,n) = n \cdot \mathrm{ld}_B + k
+$$
+
+这里的 $\mathrm{ld}_A$、$\mathrm{ld}_B$ 是 leading dimension，偏移以元素为单位，两式中 $k$ 的系数都是 1。对于寄存器 MMA，这两式解释的是 operand 的 row/col 语义；具体哪个 lane 的哪个寄存器持有某个元素，要继续看 `MMA_Traits`。
+
+CuTe 为了统一收缩维度，把 A 写成 $(M,K)$，把 B 写成 **$(N,K)$**，即 `B(n,k)` 对应数学矩阵的 `B(k,n)`。所以在 CuTe 的坐标顺序下，TN 的 A、B 都是第二维 K 连续，普通未 swizzle 的 layout 都可以写成 `Stride<ld, _1>`。B 的坐标顺序改变后，不能再把 PTX 的 `.col` 直接套成 CuTe $(N,K)$ 的 column-major；[CuTe 官方文档](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/0t_mma_atom.html#traits) 也将 `BLayout` 定义为到 $(N,K)$ 的映射。
+
+Volta 支持四种布局后缀，对应关系如下：
+
+| 后缀 | PTX 布局（A/B） | A 的连续维度 | B 的连续维度 |
 | --- | --- | --- | --- |
-| `N` | No transpose，不转置使用原矩阵。 | 原矩阵仍按列主序解释。 | 更接近 `.col`。 |
-| `T` | Transpose，转置后再参与 GEMM。 | 列主序矩阵转置以后，逻辑上变成按行方向连续的视角。 | 更接近 `.row`。 |
+| `TN` | `.row.col` | K | K |
+| `NT` | `.col.row` | M | N |
+| `NN` | `.col.col` | M | K |
+| `TT` | `.row.row` | K | N |
 
-因此在 SM80 这类 Operation 名字里：
+Operation 的后缀描述底层指令要求的 operand 形式。用户矩阵的全局内存布局还要通过 `Tensor/Layout/Copy` 整理为对应的 fragment；名字里的 `T` 本身不会执行一次数据转置。
 
-```text
-_TN  ->  A 使用 T 视角，B 使用 N 视角
-     ->  A 对应 row，B 对应 col
-     ->  PTX 写成 .row.col
-```
+### SM70、SM80、SM90 的 Operation 列表
 
-这就是为什么 `SM80_16x8x16_F32F16F16F32_TN` 的源码里是：
+下面对照本地 `cutlass` 的源码列出 Operation。表格按类型族合并重复项：`{...}` 表示逐项替换的候选值，`<形状>`、`<类型>` 和 `N` 表示表中给出的具体取值；这些写法用于列举，不是实际 C++ 类型名。
 
-```cpp
-"mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 ..."
-```
+#### SM70：Volta
 
-它不是说 `N` 本身等于 row 或者 `T` 本身等于 col，恰好相反：**在 BLAS 的列主序前提下，`N` 对应 column-major 视角，`T` 对应 row-major 视角**。
+`mma_sm70.hpp` 中共 8 个 Operation，均为 `8x8x4`，A/B 都是 F16：
 
-所以更稳妥的理解是：
-
-- **Operation 名字里的 `T/N` 保留了 BLAS 风格的 transA/transB 命名**，默认站在 column-major 矩阵的语境里。
-- **PTX 里的 `.row/.col` 是底层指令真正看到的 fragment 布局**，例如 `_TN` 最终落到 `.row.col`。
-- **它不是现代 C++ 代码里用户输入矩阵的唯一全局布局**。用户可能用 row-major Tensor，也可能用 column-major Tensor；CuTe 会通过上层 `Tensor/Layout/Copy` 把数据整理成 Operation 需要的 fragment。
-- 真正可靠的对应关系要看 Operation 里的 PTX 字符串，以及 `MMA_Traits` 里给出的 `ALayout/BLayout`。
-
-以源码里能直接看到的两个例子为准：
-
-| Operation | PTX layout 修饰符 | 指令级含义 |
+| Operation | C/D 类型 | A/B 布局 |
 | --- | --- | --- |
-| `SM70_8x8x4_F32F16F16F32_NT` | `.col.row` | A fragment 按 column 形式解释，B fragment 按 row 形式解释。 |
-| `SM80_16x8x16_F32F16F16F32_TN` | `.row.col` | A fragment 按 row 形式解释，B fragment 按 column 形式解释。 |
+| `SM70_8x8x4_F16F16F16F16_TN` | F16 | K-major / K-major |
+| `SM70_8x8x4_F16F16F16F16_NT` | F16 | M-major / N-major |
+| `SM70_8x8x4_F16F16F16F16_NN` | F16 | M-major / K-major |
+| `SM70_8x8x4_F16F16F16F16_TT` | F16 | K-major / N-major |
+| `SM70_8x8x4_F32F16F16F32_TN` | F32 | K-major / K-major |
+| `SM70_8x8x4_F32F16F16F32_NT` | F32 | M-major / N-major |
+| `SM70_8x8x4_F32F16F16F32_NN` | F32 | M-major / K-major |
+| `SM70_8x8x4_F32F16F16F32_TT` | F32 | K-major / N-major |
 
-所以可以把 `_TN` 翻译成“BLAS column-major 语境下的 A 转置、B 不转置”，但不要进一步误读成“用户传进来的 A 一定是转置矩阵、B 一定是列主序矩阵”。在 CuTe 里，用户矩阵从全局内存到共享内存、再到寄存器 fragment，中间会经过 `Tensor`、`Layout`、`Copy_Atom`、`TiledCopy` 和 `TiledMMA` 的组织。到了 Operation 这一层，名字最终要落到的是：**这条底层 MMA 指令希望收到什么样的 A/B fragment**。
+#### SM80：Ampere
 
-### `SM70_8x8x4_F32F16F16F32_NT`
+`mma_sm80.hpp` 中共 65 个 Operation，其中浮点与复数 Operation 如下，布局后缀都是 `TN`：
+
+| Operation 类型族 | 说明 |
+| --- | --- |
+| `SM80_16x8x{8,16}_F16F16F16F16_TN` | F16 输入，F16 累加。 |
+| `SM80_16x8x{8,16}_F32F16F16F32_TN` | F16 输入，F32 累加。 |
+| `SM80_16x8x{8,16}_F32BF16BF16F32_TN` | BF16 输入，F32 累加。 |
+| `SM80_16x8x{4,8}_F32TF32TF32F32_TN` | TF32 输入，F32 累加。 |
+| `SM80_8x8x4_F64F64F64F64_TN` | FP64 MMA。 |
+| `SM80_8x8x4_C64C64C64C64_TN` | 双精度复数，通过 4 次 FP64 MMA 实现。 |
+| `SM80_8x8x4_GC64C64C64GC64_TN` | Gaussian 复数形式，通过 3 次 FP64 MMA 保存中间累加结果。 |
+
+整数 Operation 的 C/D 都是 S32。下面每个类型组合都支持表中列出的全部形状，并且都有普通版本和追加 `_SATURATE` 的版本：
+
+| D/A/B/C 类型片段 | 形状 | Operation 命名 |
+| --- | --- | --- |
+| `S32S8S8S32` | `8x8x16`、`16x8x16`、`16x8x32` | `SM80_<形状>_S32S8S8S32_TN` |
+| `S32S8U8S32` | 同上 | `SM80_<形状>_S32S8U8S32_TN` |
+| `S32U8S8S32` | 同上 | `SM80_<形状>_S32U8S8S32_TN` |
+| `S32U8U8S32` | 同上 | `SM80_<形状>_S32U8U8S32_TN` |
+| `S32S4S4S32` | `8x8x32`、`16x8x32`、`16x8x64` | `SM80_<形状>_S32S4S4S32_TN` |
+| `S32S4U4S32` | 同上 | `SM80_<形状>_S32S4U4S32_TN` |
+| `S32U4S4S32` | 同上 | `SM80_<形状>_S32U4S4S32_TN` |
+| `S32U4U4S32` | 同上 | `SM80_<形状>_S32U4U4S32_TN` |
+
+`S`/`U` 分别表示有符号 / 无符号整数。`_SATURATE` 对应 PTX 的 `.satfinite`，使溢出的整数累加结果饱和到 S32 的边界。
+
+1-bit Operation 还有以下两组，每组各 3 个形状：
+
+| Operation 类型族 | 形状 | 运算 |
+| --- | --- | --- |
+| `SM80_<形状>_S32U1U1S32_TN_ANDPOPC` | `8x8x128`、`16x8x128`、`16x8x256` | 按位 AND 后做 population count，再累加。 |
+| `SM80_<形状>_S32U1U1S32_TN_XORPOPC` | 同上 | 按位 XOR 后做 population count，再累加。 |
+
+#### SM90：Hopper
+
+Hopper 的 Operation 分为 warp 级同步 MMA 和 warpgroup 级异步 GMMA。
+
+`mma_sm90.hpp` 中的类型位于 `cute::SM90` 命名空间，共 6 个：
+
+| Operation 类型族 | 说明 |
+| --- | --- |
+| `SM90::MMA_16x8x{4,8,16}_F64F64F64F64_TN` | 3 种 FP64 同步 MMA，PTX 为 `mma.sync.aligned`。 |
+| `SM90::MMA_16x8x{4,8,16}_C64C64C64C64_TN` | 3 种双精度复数封装，每次调用组合 4 次对应的 FP64 MMA。 |
+
+`mma_sm90_gmma.hpp` 中的类型位于 `cute::SM90::GMMA` 命名空间，封装 `wgmma.mma_async.sync.aligned`，由 128 个线程协作。其名字使用 **C/A/B** 三个类型片段，C 原地更新为结果，不再单列 D 的类型。
+
+| 后缀 | A 输入 | B 输入 |
+| --- | --- | --- |
+| `SS` | shared memory descriptor | shared memory descriptor |
+| `RS` | 寄存器 fragment | shared memory descriptor |
+
+下面每个类型族都有 `SS` 和 `RS` 两种形式：
+
+| Operation 类型族（省略 `SM90::GMMA::`） | 输入类型 / 累加类型 | 布局形式 |
+| --- | --- | --- |
+| `MMA_64xNx16_F16F16F16_{SS,RS}` | F16 / F16 | 由 `tnspA`、`tnspB` 模板参数指定。 |
+| `MMA_64xNx16_F32F16F16_{SS,RS}` | F16 / F32 | 同上。 |
+| `MMA_64xNx16_F32BF16BF16_{SS,RS}` | BF16 / F32 | 同上。 |
+| `MMA_64xNx8_F32TF32TF32_{SS,RS}_TN` | TF32 / F32 | A/B 都是 K-major。 |
+| `MMA_64xNx32_F16E4M3E4M3_{SS,RS}_TN` | E4M3 × E4M3 / F16 | A/B 都是 K-major。 |
+| `MMA_64xNx32_F16E4M3E5M2_{SS,RS}_TN` | E4M3 × E5M2 / F16 | 同上。 |
+| `MMA_64xNx32_F16E5M2E4M3_{SS,RS}_TN` | E5M2 × E4M3 / F16 | 同上。 |
+| `MMA_64xNx32_F16E5M2E5M2_{SS,RS}_TN` | E5M2 × E5M2 / F16 | 同上。 |
+| `MMA_64xNx32_F32E4M3E4M3_{SS,RS}_TN` | E4M3 × E4M3 / F32 | 同上。 |
+| `MMA_64xNx32_F32E4M3E5M2_{SS,RS}_TN` | E4M3 × E5M2 / F32 | 同上。 |
+| `MMA_64xNx32_F32E5M2E4M3_{SS,RS}_TN` | E5M2 × E4M3 / F32 | 同上。 |
+| `MMA_64xNx32_F32E5M2E5M2_{SS,RS}_TN` | E5M2 × E5M2 / F32 | 同上。 |
+| `MMA_64xNx32_S32S8S8_{SS,RS}_TN` | S8 × S8 / S32 | A/B 都是 K-major；另有 `_SATURATE` 版本。 |
+| `MMA_64xNx32_S32S8U8_{SS,RS}_TN` | S8 × U8 / S32 | 同上。 |
+| `MMA_64xNx32_S32U8S8_{SS,RS}_TN` | U8 × S8 / S32 | 同上。 |
+| `MMA_64xNx32_S32U8U8_{SS,RS}_TN` | U8 × U8 / S32 | 同上。 |
+
+每个类型族在主头文件中的 N 均取 `8, 16, 32, 64, 96, 128, 192, 256`。定义 `CUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED` 后，还会包含 `mma_sm90_gmma_ext.hpp`，扩展范围按输入类型区分：
+
+| 输入类型 | 扩展头文件补充的 N | 启用扩展后的完整范围 |
+| --- | --- | --- |
+| F16、BF16、TF32、FP8 | 主头文件之外其余 8 的倍数。 | `8, 16, 24, ..., 256`。 |
+| S8/U8 | `24, 48, 80, 112, 144, 160, 176, 208, 224, 240`。 | `8, 16, 24, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 256`。 |
+
+F16/BF16 的布局参数使用 `GMMA::Major::K` 或 `GMMA::Major::MN`：前者表示 K-major，后者对 A 表示 M-major、对 B 表示 N-major。`SS` 可以分别指定 A/B 的 major；`RS` 的寄存器 A 固定要求 `tnspA == GMMA::Major::K`。`SS/RS` 描述输入位置，`TN` 描述输入布局，两者含义不同。
+
+Hopper 还提供 `mma_sm90_gmma_sparse.hpp` 中的结构化稀疏 Operation，位于 `SM90::GMMA::SPARSE`，名字以 `GMMA_` 开头，调用 `wgmma.mma_async.sp.sync.aligned`。它们覆盖上面相同的数据类型与 `SS/RS` 组合，但逻辑 K 加倍，并增加稀疏元数据 E：
+
+| 稀疏 Operation 类型族（省略 `SM90::GMMA::SPARSE::`） | 类型片段的候选值 |
+| --- | --- |
+| `GMMA_64xNx32_<类型>_{SS,RS}` | `F16F16F16`、`F32F16F16`、`F32BF16BF16` |
+| `GMMA_64xNx16_F32TF32TF32_{SS,RS}_TN` | `F32TF32TF32` |
+| `GMMA_64xNx64_<类型>_{SS,RS}_TN` | `F16E4M3E4M3`、`F16E4M3E5M2`、`F16E5M2E4M3`、`F16E5M2E5M2` |
+| `GMMA_64xNx64_<类型>_{SS,RS}_TN` | `F32E4M3E4M3`、`F32E4M3E5M2`、`F32E5M2E4M3`、`F32E5M2E5M2` |
+| `GMMA_64xNx64_<类型>_{SS,RS}_TN`，另有 `_SATURATE` 版本 | `S32S8S8`、`S32S8U8`、`S32U8S8`、`S32U8U8` |
+
+稀疏版本的 N 候选值与稠密版本相同；扩展形状来自 `mma_sm90_gmma_sparse_ext.hpp`，由同一个宏控制。GMMA 指令在源码中受 `CUTE_ARCH_MMA_SM90A_ENABLED` 保护，编译时需要启用 `sm_90a` 对应的架构特性。
+
+### `SM80_16x8x16_F16F16F16F16_TN`
 
 **用途**
 
-封装 Volta HMMA 指令 `mma.sync.aligned.m8n8k4.col.row.f32.f16.f16.f32`。
+封装 Ampere 指令 `mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16`。一个 warp 的 32 个线程协作完成 $16 \times 8 \times 16$ 的 MMA，A/B 输入和 C/D 累加器都是 F16，A/B 都是 K-major。
 
-**源码摘录**
+**完整源码**
+
+以下直接复制自 `include/cute/arch/mma_sm80.hpp`，保留寄存器接口、内联 PTX 和架构保护分支：
 
 ```cpp
-struct SM70_8x8x4_F32F16F16F32_NT
+// MMA 16x8x16 TN
+struct SM80_16x8x16_F16F16F16F16_TN
 {
-  using DRegisters = float[8];
-  using ARegisters = uint32_t[2];
+  using DRegisters = uint32_t[2];
+  using ARegisters = uint32_t[4];
   using BRegisters = uint32_t[2];
-  using CRegisters = float[8];
+  using CRegisters = uint32_t[2];
 
   CUTE_HOST_DEVICE static void
-  fma(float& d0, float& d1, float& d2, float& d3,
-      float& d4, float& d5, float& d6, float& d7,
-      uint32_t const& a0, uint32_t const& a1,
+  fma(uint32_t      & d0, uint32_t      & d1,
+      uint32_t const& a0, uint32_t const& a1, uint32_t const& a2, uint32_t const& a3,
       uint32_t const& b0, uint32_t const& b1,
-      float const& c0, float const& c1, float const& c2, float const& c3,
-      float const& c4, float const& c5, float const& c6, float const& c7);
+      uint32_t const& c0, uint32_t const& c1)
+  {
+#if defined(CUTE_ARCH_MMA_SM80_ENABLED)
+    asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+      "{%0,  %1},"
+      "{%2,  %3,  %4,  %5},"
+      "{%6,  %7},"
+      "{%8,  %9};\n"
+      : "=r"(d0), "=r"(d1)
+      :  "r"(a0),  "r"(a1),  "r"(a2),  "r"(a3),
+         "r"(b0),  "r"(b1),
+         "r"(c0),  "r"(c1));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM80_16x8x16_F16F16F16F16_TN without CUTE_ARCH_MMA_SM80_ENABLED");
+#endif
+  }
 };
 ```
 
@@ -149,10 +284,12 @@ struct SM70_8x8x4_F32F16F16F32_NT
 
 | 成员 | 类型 | 含义 |
 | --- | --- | --- |
-| `DRegisters` | `float[8]` | 每个参与线程输出 8 个 `float` 累加结果。 |
-| `ARegisters` | `uint32_t[2]` | 每个参与线程向指令传入 2 个 32-bit A 寄存器；每个寄存器可打包两个 F16。 |
-| `BRegisters` | `uint32_t[2]` | 每个参与线程向指令传入 2 个 32-bit B 寄存器。 |
-| `CRegisters` | `float[8]` | 每个参与线程传入 8 个 `float` 累加器初值。 |
+| `DRegisters` | `uint32_t[2]` | 每个 lane 输出 2 个 32-bit 寄存器，共 4 个 F16 结果。 |
+| `ARegisters` | `uint32_t[4]` | 每个 lane 传入 4 个 32-bit 寄存器，共 8 个 F16 A 元素。 |
+| `BRegisters` | `uint32_t[2]` | 每个 lane 传入 2 个 32-bit 寄存器，共 4 个 F16 B 元素。 |
+| `CRegisters` | `uint32_t[2]` | 每个 lane 传入 2 个 32-bit 寄存器，共 4 个 F16 累加器初值。 |
+
+这里的 `uint32_t` 表示传给 PTX 的寄存器位模式，每个寄存器打包两个 F16；矩阵元素的逻辑类型仍是 F16。内联 PTX 用 `"r"` 传入 32-bit 寄存器，用 `"=r"` 写出结果。
 
 **重要接口**
 
@@ -163,319 +300,175 @@ struct SM70_8x8x4_F32F16F16F32_NT
 **副作用 / 约束**
 
 - `fma` 是底层寄存器级接口，调用者必须已经准备好正确的寄存器值。
-- 源码中用 `CUTE_ARCH_MMA_SM70_ENABLED` 宏保护 PTX 指令。如果当前编译目标不支持该指令，会进入 `CUTE_INVALID_CONTROL_PATH`。
+- `fma` 必须由整个 warp 的 32 个线程一致执行，并按照该指令的 fragment 映射准备输入。
+- 源码中用 `CUTE_ARCH_MMA_SM80_ENABLED` 宏保护 PTX 指令。如果当前编译目标不支持该指令，会进入 `CUTE_INVALID_CONTROL_PATH`。
 - Operation 本身不说明 `(thread, value)` 到矩阵坐标的映射，这部分由 `MMA_Traits` 提供。
+
+### `MMA_64x8x16_F16F16F16_SS`
+
+**用途**
+
+这个 Operation 位于 `cute::SM90::GMMA`，封装 Hopper 的 `wgmma.mma_async.sync.aligned.m64n8k16.f16.f16.f16`。一个 warpgroup 的 128 个线程协作完成 $64 \times 8 \times 16$ 的 MMA，A/B 输入与累加器都是 F16。
+
+`SS` 表示 A、B 都来自 shared memory（共享内存）。调用时传入两个 **64-bit descriptor（描述符）**，由硬件根据 descriptor 读取矩阵；每个线程传入的 A/B 寄存器保存的是 descriptor，而累加器仍保存在各线程的寄存器中。
+
+**完整源码**
+
+以下直接复制自 `include/cute/arch/mma_sm90_gmma.hpp`：
+
+```cpp
+// GMMA 64x8x16 F16+=F16*F16
+template <
+  GMMA::Major tnspA,
+  GMMA::Major tnspB,
+  GMMA::ScaleIn  scaleA = GMMA::ScaleIn::One,
+  GMMA::ScaleIn  scaleB = GMMA::ScaleIn::One
+>
+struct MMA_64x8x16_F16F16F16_SS
+{
+  using DRegisters = void;
+  using ARegisters = uint64_t[1];
+  using BRegisters = uint64_t[1];
+  using CRegisters = uint32_t[2];
+
+  CUTE_HOST_DEVICE static void
+  fma(uint64_t const& desc_a,
+      uint64_t const& desc_b,
+      uint32_t      & d0, uint32_t      & d1,
+      GMMA::ScaleOut const scale_D = GMMA::ScaleOut::One)
+  {
+#if defined(CUTE_ARCH_MMA_SM90A_ENABLED)
+    cutlass::arch::synclog_emit_wgmma_smem_smem(__LINE__, desc_a, desc_b);
+    asm volatile(
+    "{\n"
+      ".reg .pred p;\n"
+      "setp.ne.b32 p, %4, 0;\n"
+      "wgmma.mma_async.sync.aligned.m64n8k16.f16.f16.f16 "
+      "{%0, %1},"
+      " %2,"
+      " %3,"
+      " p,  %5, %6, %7, %8;\n"
+    "}\n"
+      : "+r"(d0), "+r"(d1)
+      :  "l"(desc_a),
+         "l"(desc_b),
+         "r"(int32_t(scale_D)), "n"(int32_t(scaleA)), "n"(int32_t(scaleB)), "n"(int32_t(tnspA)), "n"(int32_t(tnspB)));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use MMA_64x8x16_F16F16F16_SS without CUTE_ARCH_MMA_SM90A_ENABLED");
+#endif
+  }
+};
+```
+
+**寄存器接口**
+
+| 成员 | 类型 | 含义 |
+| --- | --- | --- |
+| `DRegisters` | `void` | 不提供独立的 D 寄存器数组，结果原地更新累加器。 |
+| `ARegisters` | `uint64_t[1]` | 一个 64-bit A descriptor，描述共享内存中的 A tile。 |
+| `BRegisters` | `uint64_t[1]` | 一个 64-bit B descriptor，描述共享内存中的 B tile。 |
+| `CRegisters` | `uint32_t[2]` | 每线程 2 个 32-bit 累加器寄存器，打包 4 个 F16 元素，也是输出结果。 |
+
+`fma` 中的 `d0/d1` 同时作为输入累加器和输出，内联 PTX 用 `"+r"` 表示读写同一寄存器。descriptor 使用 `"l"` 传入 64-bit 寄存器；模板参数使用 `"n"` 传入编译期立即数。
+
+#### 布局模板参数：K-major 与 MN-major
+
+`tnspA`、`tnspB` 分别指定 A、B 的 major，都是**编译期参数，没有默认值**。对应枚举的源码是：
+
+```cpp
+enum class Major {
+  K  = 0,
+  MN = 1
+};
+```
+
+这里可以理解为 **K 方向优先**和 **M/N 方向优先**。仍按 CuTe 的 A(M,K)、B(N,K) 坐标来读，先看未 swizzle 的逻辑连续方向：
+
+| 参数值 | A 的主方向 | B 的主方向 | 传入 PTX 的转置立即数 |
+| --- | --- | --- | --- |
+| `GMMA::Major::K` | K-major，K 方向连续。 | K-major，K 方向连续。 | `0`。 |
+| `GMMA::Major::MN` | M-major，M 方向连续。 | N-major，N 方向连续。 | `1`。 |
+
+**`MN` 对 A 表示 M，对 B 表示 N**，二者可以独立指定。major 描述的是输入矩阵的布局方向，矩阵乘法的收缩维度仍然是 K。
+
+与 SM80 的 `mma.sync...row.col...` 相比，这条 WGMMA 的指令名字没有 `.row/.col` 修饰符。F16/BF16 的 shared memory 输入通过末尾的 **`imm-trans-a`、`imm-trans-b`** 选择布局，源码中对应 `tnspA`、`tnspB`，即 `%7`、`%8`。其基准形式是数学上的 A row-major、B column-major，也就是前文的 TN；所以 **`Major::K, Major::K` 传入 `0,0`，对应 A/B 都 K-major**。这里 PTX 的转置立即数与 BLAS 的 `T/N` 使用不同的基准，不能按字母直接对应。具体语法见 [PTX WGMMA 指令文档](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#asynchronous-warpgroup-level-matrix-instructions-wgmma-mma)。
+
+descriptor 描述共享内存起始地址、字节偏移和 swizzle 模式；`tnspA/tnspB` 作为独立的指令参数指定 major。**major、descriptor 和实际共享内存布局必须匹配**，更改模板参数不会重排已经存好的数据。实际布局还要满足 GMMA 的规范布局要求；启用 swizzle 后，物理地址的连续性也要结合 swizzle 理解。CuTe 通常使用对应的 `Layout_K_*_Atom`、`Layout_MN_*_Atom` 构造共享内存布局，再用 `make_gmma_desc<MajorMode>` 生成 descriptor。
+
+例如，下面两个类型分别选择 K/K 和 M/N 主方向，输入缩放都使用默认值：
+
+```cpp
+namespace gmma = cute::SM90::GMMA;
+
+// A、B 都是 K-major，对应前文的 TN。
+using KMajorMma = gmma::MMA_64x8x16_F16F16F16_SS<
+    gmma::Major::K, gmma::Major::K>;
+
+// A 是 M-major，B 是 N-major，对应前文的 NT。
+using MnMajorMma = gmma::MMA_64x8x16_F16F16F16_SS<
+    gmma::Major::MN, gmma::Major::MN>;
+```
+
+#### 缩放参数：输入取负与累加控制
+
+这里有两类 scale 参数：`scaleA/scaleB` 是模板参数，`scale_D` 是 `fma` 的运行时参数。对应枚举的源码是：
+
+```cpp
+enum class ScaleIn {
+  Neg = -1,
+  One =  1
+};
+
+enum class ScaleOut {
+  Zero = 0,
+  One  = 1
+};
+```
+
+| 参数 | 取值与默认值 | 作用 |
+| --- | --- | --- |
+| `scaleA` | `ScaleIn::One`（默认）或 `ScaleIn::Neg`。 | 编译期选择 A 保持原值或取负。 |
+| `scaleB` | `ScaleIn::One`（默认）或 `ScaleIn::Neg`。 | 编译期选择 B 保持原值或取负。 |
+| `scale_D` | `ScaleOut::One`（默认）或 `ScaleOut::Zero`。 | 运行时选择保留旧累加器或忽略旧累加器。 |
+
+用 $C_{\mathrm{old}}$ 表示调用前的累加器，$C_{\mathrm{new}}$ 表示写回同一组寄存器的结果，运算语义可以写成：
+
+$$
+C_{\mathrm{new}} = (s_A A)(s_B B) + s_D C_{\mathrm{old}},
+\qquad
+s_A,s_B \in \{-1,1\},\quad s_D \in \{0,1\}
+$$
+
+**输入 scale 只提供符号选择，输出 scale 只提供累加开关**，不能把它们当作任意浮点数的 GEMM `alpha/beta`。`scaleA`、`scaleB` 都为 `One` 时，`scale_D = One` 得到 $AB+C_{\mathrm{old}}$，`scale_D = Zero` 得到 $AB$；若只有一个输入设为 `Neg`，乘积项变成 $-AB$，两个输入都为 `Neg` 则仍是 $AB$。
+
+源码中的 `setp.ne.b32 p, %4, 0` 把 `scale_D` 转成 PTX 的谓词 `p`：为真时累加旧值，为假时忽略旧值。K 循环中，首个 tile 可以用 `Zero` 开始新的累加，后续 tile 再用 `One` 继续累加。在 CuTe 的 `MMA_Traits` 层，这个参数由 `accumulate_` 成员传给 Operation。
+
+**副作用 / 约束**
+
+- 需要 `sm_90a` 架构特性，源码用 `CUTE_ARCH_MMA_SM90A_ENABLED` 保护指令。
+- warpgroup 的 128 个线程必须一致执行该指令，A/B descriptor 在 warpgroup 内必须一致。
+- WGMMA 是异步操作，`fma` 返回时结果未必完成。发射前用 `warpgroup_arrive()` 对先前的寄存器访问建立顺序；发射后用 `warpgroup_commit_batch()` 提交，再用 `warpgroup_wait<0>()` 等待所有已提交的组完成，之后才能读取结果。共享内存输入也必须按相应同步协议准备好。
 
 ## `MMA_Traits`
 
-**用途**
+Operation 给出指令的寄存器或 descriptor 接口；`MMA_Traits<Operation>` 补上**逻辑矩阵、协作线程和数据坐标之间的对应关系**。从 `MMA_Traits` 读到的类型和布局，会继续被 `MMA_Atom` 用来构造 fragment、划分 tile 和调用 Operation。
 
-`MMA_Traits<Operation>` 是 Operation 的逻辑说明书。它告诉 CuTe：
-
-- 这条 MMA 的 D/A/B/C 逻辑数据类型是什么。
-- 单条 MMA 的逻辑形状 `Shape_MNK` 是什么。
-- 单条 MMA 内部的逻辑线程如何映射到物理线程。
-- 每个线程持有的 value 如何映射到 A、B、C 矩阵坐标。
-
-**源码位置**
-
-```text
-include/cute/atom/mma_traits_sm70.hpp
-include/cute/atom/mma_traits_sm80.hpp
-include/cute/atom/mma_traits_sm89.hpp
-include/cute/atom/mma_traits_sm90_gmma.hpp
-```
-
-### Volta 公共布局别名
-
-`mma_traits_sm70.hpp` 里先定义了一组布局别名。下面这些是真实源码中的核心形态：
-
-```cpp
-using SM70_QuadPair = Layout<Shape <_4, _2>,
-                             Stride<_1,_16>>;
-
-using SM70_8x4_Row  = Layout<Shape <_8,_4>,
-                             Stride<_1,_8>>;
-
-using SM70_8x4_Col  = Layout<Shape <Shape <_4,_2>,_4>,
-                             Stride<Stride<_8,_4>,_1>>;
-
-using SM70_8x8_16b  = Layout<Shape <_8,_8>,
-                             Stride<_1,_8>>;
-
-using SM70_8x8_32b  = Layout<Shape <Shape <_2, _2,_2>,Shape <_2,_2, _2>>,
-                             Stride<Stride<_1,_16,_4>,Stride<_8,_2,_32>>>;
-```
-
-**布局含义**
-
-| 别名 | 含义 |
+| 成员 | 提供的信息 |
 | --- | --- |
-| `SM70_QuadPair` | 把 8 个逻辑线程映射到 warp 内的 quadpair 线程：`0,1,2,3,16,17,18,19`。 |
-| `SM70_8x4_Row` | `(T8,V4) -> (M8,K4)`，常用于 row 风格的 A/B 输入映射。 |
-| `SM70_8x4_Col` | `(T8,V4) -> (M8,K4)`，常用于 col 风格的 A/B 输入映射。 |
-| `SM70_8x8_16b` | `(T8,V8) -> (M8,N8)`，用于 F16 累加器。 |
-| `SM70_8x8_32b` | `(T8,V8) -> (M8,N8)`，用于 F32 累加器。 |
+| `ValTypeD/A/B/C` | D、A、B、C 的**逻辑元素类型**；与 PTX 接口使用的 `uint32_t` 等寄存器类型分开。 |
+| `Shape_MNK` | 一次 Operation 覆盖的 $(M,N,K)$ 逻辑形状。 |
+| `ThrID` | 一次 Operation 的逻辑线程 ID 到参与线程的映射。Volta 的 quadpair 是 8 个线程；这里选的 SM80 MMA 是 32 个线程，SM90 GMMA 是 128 个线程。 |
+| `ALayout/BLayout/CLayout` | `(thread, value)` 到 $A(M,K)$、$B(N,K)$、$C(M,N)$ **逻辑坐标**的映射；C 的映射也用于 D。它们不是全局或共享内存的物理存储布局。 |
+| `FrgTypeA/B` | 某些 Operation 额外指定的 A/B fragment 形式。GMMA 的 `SS` 形式在这里指定共享内存 descriptor 视图，而非逐线程 A/B 数值寄存器。 |
+| `accumulate_` | GMMA traits 额外保存的 `ScaleOut` 状态，决定本次乘积是否累加旧 C，默认 `One`。 |
 
-这里的 `(T,V)` 不是矩阵坐标，而是 **逻辑线程 ID** 和 **线程内 value ID**。CuTe layout 返回的是线性 index，文档和源码通常用列优先编码把 `(m,n)` 压成 `m + n * M`。
+SM70、SM80 和 SM90 的同步 `mma.sync` 都主要依靠逻辑类型、`Shape_MNK`、`ThrID`、A/B/C 布局描述寄存器级 MMA。下面的 SM90 GMMA 除了这些信息，还需要 descriptor fragment 类型和 `accumulate_`。`scaleA/scaleB` 则是 **Operation 的模板参数**，不是 traits 的运行时成员。
 
-### `MMA_Traits<SM70_8x8x4_F32F16F16F32_NT>`
+以下两个特化分别定义在 `include/cute/atom/mma_traits_sm80.hpp` 和 `include/cute/atom/mma_traits_sm90_gmma.hpp`。阅读 layout 前先约定：`T` 表示逻辑线程坐标，`V` 表示线程内的逻辑 value 坐标。layout 返回的整数按第一维连续编码，例如 A 的 $(m,k)$ 编码为 $m+M k$，B 的 $(n,k)$ 编码为 $n+N k$，C 的 $(m,n)$ 编码为 $m+M n$。
 
-**用途**
+### SM80：`MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>`
 
-描述 `SM70_8x8x4_F32F16F16F32_NT` 这条 Volta HMMA 指令的逻辑类型、形状和线程 / value 映射。
-
-**源码摘录**
-
-```cpp
-template <>
-struct MMA_Traits<SM70_8x8x4_F32F16F16F32_NT>
-{
-  using ValTypeD = float;
-  using ValTypeA = half_t;
-  using ValTypeB = half_t;
-  using ValTypeC = float;
-
-  using Shape_MNK = Shape<_8,_8,_4>;
-  using ThrID   = SM70_QuadPair;
-  using ALayout = SM70_8x4_Col;
-  using BLayout = SM70_8x4_Col;
-  using CLayout = SM70_8x8_32b;
-};
-```
-
-**构造参数 / 成员变量**
-
-这是 traits 特化，没有运行时构造参数，主要通过类型别名表达信息。
-
-| 成员 | 类型 | 含义 |
-| --- | --- | --- |
-| `ValTypeD` | `float` | D 矩阵逻辑输出类型。 |
-| `ValTypeA` | `half_t` | A 矩阵逻辑输入类型。 |
-| `ValTypeB` | `half_t` | B 矩阵逻辑输入类型。 |
-| `ValTypeC` | `float` | C 矩阵逻辑累加器类型。 |
-| `Shape_MNK` | `Shape<_8,_8,_4>` | 单条 MMA 的逻辑形状。 |
-| `ThrID` | `SM70_QuadPair` | 8 个逻辑线程到 warp 内物理线程的映射。 |
-| `ALayout` | `SM70_8x4_Col` | `(thread,value)` 到 A 矩阵 `(M,K)` 的映射。 |
-| `BLayout` | `SM70_8x4_Col` | `(thread,value)` 到 B 矩阵 `(N,K)` 的映射。 |
-| `CLayout` | `SM70_8x8_32b` | `(thread,value)` 到 C/D 矩阵 `(M,N)` 的映射。 |
-
-## Volta HMMA：从图到 Layout
-
-Volta 的 HMMA 以 **quadpair（QP）** 为基本协作单元。一个 QP 有 8 个线程，执行一个 $8 \times 8 \times 4$ 的 MMA。一个 warp 有 32 个线程，因此可以看成 4 个 QP。
-
-预留图：
-
-![Volta HMMA NT 线程数据布局](/blog-assets/gpu-programming/cute-mma-atom/hmma-8x8x4-nt.png)
-
-### `ThrID`
-
-官方文档说明，第 0 个 QP 对应 warp 内线程集合：
-
-$$
-\{0,1,2,3\} \cup \{16,17,18,19\}
-$$
-
-源码中的布局正是：
-
-```cpp
-using SM70_QuadPair = Layout<Shape <_4, _2>,
-                             Stride<_1,_16>>;
-```
-
-这个 layout 把逻辑线程 `0..7` 映射到物理线程：
-
-| 逻辑线程 | 物理线程 |
-| --- | --- |
-| `0,1,2,3` | `0,1,2,3` |
-| `4,5,6,7` | `16,17,18,19` |
-
-所以 `ThrID` 的职责不是“告诉你 warp 有多少线程”，而是告诉 CuTe：**这一条 MMA 内部的逻辑线程 ID 对应 warp 里的哪些 lane**。
-
-### `CLayout`
-
-F32 累加器使用：
-
-```cpp
-using SM70_8x8_32b =
-  Layout<Shape <Shape <_2, _2,_2>,Shape <_2,_2, _2>>,
-         Stride<Stride<_1,_16,_4>,Stride<_8,_2,_32>>>;
-```
-
-它表达的是：
-
-```cpp
-// (T8,V8) -> (M8,N8)
-```
-
-可以分成两部分看：
-
-- `Shape<Shape<_2,_2,_2>, ...>`：把 8 个逻辑线程拆成三个二元子模式。
-- `Stride<Stride<_1,_16,_4>, ...>`：描述逻辑线程变化时，映射到 `(m,n)` 编码后的线性 index 如何变化。
-
-文档里对前几个点的解释是：
-
-| 坐标 | 逻辑矩阵坐标 | 列优先编码 |
-| --- | --- | --- |
-| `(T0,V0)` | `(m,n)=(0,0)` | `0` |
-| `(T1,V0)` | `(m,n)=(1,0)` | `1` |
-| `(T2,V0)` | `(m,n)=(0,2)` | `16` |
-| `(T3,V0)` | `(m,n)=(1,2)` | `17` |
-| `(T4,V0)` | `(m,n)=(4,0)` | `4` |
-
-因此，`CLayout` 不是“C 矩阵的内存布局”，而是 **单条 MMA 指令内部，线程和值如何覆盖 C 矩阵逻辑坐标**。
-
-### A / B 输入布局
-
-Volta 的 A/B layout 会随 `TN / NT / NN / TT` 变化。源码里对 F32 累加器的四个变体是：
-
-| Operation | `ALayout` | `BLayout` | `CLayout` |
-| --- | --- | --- | --- |
-| `SM70_8x8x4_F32F16F16F32_TN` | `SM70_8x4_Row` | `SM70_8x4_Row` | `SM70_8x8_32b` |
-| `SM70_8x8x4_F32F16F16F32_NT` | `SM70_8x4_Col` | `SM70_8x4_Col` | `SM70_8x8_32b` |
-| `SM70_8x8x4_F32F16F16F32_NN` | `SM70_8x4_Col` | `SM70_8x4_Row` | `SM70_8x8_32b` |
-| `SM70_8x8x4_F32F16F16F32_TT` | `SM70_8x4_Row` | `SM70_8x4_Col` | `SM70_8x8_32b` |
-
-预留图：
-
-![Volta HMMA A/B 输入布局](/blog-assets/gpu-programming/cute-mma-atom/hmma-8x8x4-ab-layout.png)
-
-这里最容易混淆的是：`NT` 不是简单地说“源码里的 ALayout 一定叫 Row 或 Col”。真正可靠的是看 `MMA_Traits` 特化：Operation 名字和 `ALayout/BLayout` 的对应关系以源码为准。
-
-## Ampere MMA
-
-Ampere 的常见 Tensor Core MMA 已经进入 **warp 级别**：一条 `mma.sync.aligned.m16n8k*` 指令由 32 个线程协作完成。和 Volta 的 QP 相比，最直观的变化是：
-
-- Volta 示例里 `ThrID = SM70_QuadPair`，只描述 8 个逻辑线程到 warp 内部分 lane 的映射。
-- Ampere 示例里 `ThrID = Layout<_32>`，表示单条 MMA 的逻辑线程就是连续的 32 个 warp lane。
-
-预留图：
-
-![Ampere SM80 MMA layout](/blog-assets/gpu-programming/cute-mma-atom/sm80-mma-layout.png)
-
-### `SM80_16x8x16_F32F16F16F32_TN`
-
-**用途**
-
-封装 Ampere 上的 `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` 指令。它计算 $16 \times 8 \times 16$ 的 MMA，A/B 是 F16，C/D 是 F32。
-
-**源码摘录**
-
-```cpp
-struct SM80_16x8x16_F32F16F16F32_TN
-{
-  using DRegisters = float[4];
-  using ARegisters = uint32_t[4];
-  using BRegisters = uint32_t[2];
-  using CRegisters = float[4];
-
-  CUTE_HOST_DEVICE static void
-  fma(float& d0, float& d1, float& d2, float& d3,
-      uint32_t const& a0, uint32_t const& a1,
-      uint32_t const& a2, uint32_t const& a3,
-      uint32_t const& b0, uint32_t const& b1,
-      float const& c0, float const& c1,
-      float const& c2, float const& c3);
-};
-```
-
-这里的 `_TN` 对应源码里的 `.row.col`：
-
-```cpp
-asm volatile(
-  "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
-  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
-  : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-  : "r"(a0), "r"(a1), "r"(a2), "r"(a3),
-    "r"(b0), "r"(b1),
-    "f"(c0), "f"(c1), "f"(c2), "f"(c3));
-```
-
-这段源码说明了两件事：
-
-- `ARegisters = uint32_t[4]`，所以每个 lane 给 A operand 提供 4 个 32-bit 寄存器。
-- `BRegisters = uint32_t[2]`，所以每个 lane 给 B operand 提供 2 个 32-bit 寄存器。
-- PTX 后缀是 `.row.col`，也就是这条 SM80 MMA 指令按 row 形式解释 A fragment，按 column 形式解释 B fragment。
-
-### 为什么 SM80 源码里几乎都是 `_TN`
-
-阅读 `include/cute/arch/mma_sm80.hpp` 会发现，常见的 F16、BF16、TF32、INT8、INT4、B1 MMA Operation 基本都命名成 `_TN`，并且对应 PTX 字符串也基本都是 `.row.col`：
-
-```cpp
-SM80_16x8x16_F16F16F16F16_TN   -> mma.sync.aligned.m16n8k16.row.col...
-SM80_16x8x16_F32F16F16F32_TN   -> mma.sync.aligned.m16n8k16.row.col...
-SM80_16x8x8_F32TF32TF32F32_TN  -> mma.sync.aligned.m16n8k8.row.col...
-SM80_16x8x32_S32S8S8S32_TN     -> mma.sync.aligned.m16n8k32.row.col...
-```
-
-原因不是说 Ampere 只能计算一种用户矩阵布局，而是 **Ampere 的 `mma.sync.aligned.m16n8k*` Operation 层使用了比较统一的指令级 operand 约定**：A 用 row 形式，B 用 column 形式。按前面 BLAS column-major 的命名方式，这正好记作 `_TN`：
-
-```text
-A: T -> column-major 矩阵转置后使用 -> row 视角
-B: N -> column-major 矩阵不转置使用 -> col 视角
-```
-
-至于用户侧想做普通 GEMM、转置 GEMM，或者全局内存里 A/B 是 row-major / column-major，都不应该在 Operation 结构体这一层解决。
-
-CuTe 通常把这些差异放在更上层处理：
-
-- **全局内存 Tensor 的 layout** 决定用户矩阵坐标如何映射到全局地址。
-- **共享内存 layout / swizzle** 决定 tile 在 shared memory 里怎么排，避免 bank conflict，同时适配后续 `ldmatrix`。
-- **`Copy_Atom` / `TiledCopy`** 决定从 shared memory 到寄存器 fragment 的搬运方式，比如是否使用 `ldmatrix.trans`。
-- **`MMA_Traits` / `TiledMMA`** 决定每个 lane 拿到的 fragment 如何对应到 MMA 的 A/B/C 坐标。
-
-也就是说，SM80 这里的 `_TN` 更像一个底层“标准插座”：Tensor Core 指令希望 A/B fragment 以 `.row.col` 方式插进来。不同 GEMM 变体要做的是在前面的布局和搬运阶段把数据整理成这个插座需要的形状，而不是在 `mma_sm80.hpp` 里为每种用户矩阵转置形式都写一套 Operation。
-
-**类型别名**
-
-| 成员 | 类型 | 含义 |
-| --- | --- | --- |
-| `DRegisters` | `float[4]` | 每个线程输出 4 个 F32 累加结果。 |
-| `ARegisters` | `uint32_t[4]` | 每个线程传入 4 个 32-bit A 寄存器。 |
-| `BRegisters` | `uint32_t[2]` | 每个线程传入 2 个 32-bit B 寄存器。 |
-| `CRegisters` | `float[4]` | 每个线程传入 4 个 F32 累加器。 |
-
-### SM80 公共布局
-
-`mma_traits_sm80.hpp` 中为常见 SM80 MMA 定义了几个 `(thread,value)` 到矩阵坐标的 layout：
-
-```cpp
-// (T32,V1) -> (M8,N8)
-using SM80_8x4      = Layout<Shape <Shape < _4,_8>,_1>,
-                             Stride<Stride< _8,_1>,_0>>;
-
-// (T32,V2) -> (M8,N8)
-using SM80_8x8_Row  = Layout<Shape <Shape < _4,_8>,_2>,
-                             Stride<Stride<_16,_1>,_8>>;
-
-// (T32,V4) -> (M8,N16)
-using SM80_8x16_Row = Layout<Shape <Shape < _4,_8>,_4>,
-                             Stride<Stride<_32,_1>,_8>>;
-
-// (T32,V4) -> (M16,N8)
-using SM80_16x8_Row = Layout<Shape <Shape < _4,_8>,Shape < _2,_2>>,
-                             Stride<Stride<_32,_1>,Stride<_16,_8>>>;
-```
-
-这些名字里的 `8x8`、`16x8` 指的是映射覆盖的逻辑矩阵区域。注释里的 `(T32,V4)` 表示 32 个逻辑线程、每线程 4 个 value。
-
-### `MMA_Traits<SM80_16x8x16_F32F16F16F32_TN>`
-
-SM80 的 F32 累加版本直接继承 F16 traits，然后覆盖逻辑 value type：
-
-```cpp
-template <>
-struct MMA_Traits<SM80_16x8x16_F32F16F16F32_TN>
-     : MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>
-{
-  using ValTypeD = float;
-  using ValTypeA = half_t;
-  using ValTypeB = half_t;
-  using ValTypeC = float;
-};
-```
-
-被继承的 F16 traits 给出了真正的 shape 和 layout：
+**源码特化**
 
 ```cpp
 template <>
@@ -496,55 +489,38 @@ struct MMA_Traits<SM80_16x8x16_F16F16F16F16_TN>
 };
 ```
 
-**构造参数 / 成员变量**
+`Shape_MNK` 与 Operation 名字中的 `16x8x16` 一致。`ThrID = Layout<_32>` 把逻辑线程 `0..31` 映射到一个 warp 的 32 个 lane；它只说明**谁参与**。A/B/C 布局进一步说明**各 lane 的哪个 value 对应哪个矩阵元素**。
 
-| 成员 | 类型 | 含义 |
-| --- | --- | --- |
-| `Shape_MNK` | `Shape<_16,_8,_16>` | 单条 SM80 MMA 的逻辑形状。 |
-| `ThrID` | `Layout<_32>` | 单条 MMA 使用一个完整 warp 的 32 个连续 lane。 |
-| `ALayout` | `Layout<...>` | `(T32,V*) -> (M16,K16)` 的 A 输入映射。 |
-| `BLayout` | `Layout<...>` | `(T32,V*) -> (N8,K16)` 的 B 输入映射。 |
-| `CLayout` | `SM80_16x8_Row` | `(T32,V4) -> (M16,N8)` 的累加器映射。 |
-
-### SM89：Ada FP8 MMA
-
-SM89 可以看成 Ampere warp-level MMA 模型上的扩展之一。`mma_traits_sm89.hpp` 中给出了 FP8 相关 traits，例如：
+这里 `ALayout` 和 `BLayout` 已直接写在特化中。`CLayout` 需要向上追踪 `SM80_16x8_Row` 别名：
 
 ```cpp
-template <>
-struct MMA_Traits<SM89_16x8x32_F32E4M3E4M3F32_TN> {
-  using ValTypeD = float;
-  using ValTypeA = float_e4m3_t;
-  using ValTypeB = float_e4m3_t;
-  using ValTypeC = float;
-
-  using Shape_MNK = Shape<_16,_8,_32>;
-  using ThrID   = Layout<_32>;
-  using ALayout = Layout<Shape <Shape < _4,_8>,Shape < _4,_2,  _2>>,
-                         Stride<Stride<_64,_1>,Stride<_16,_8,_256>>>;
-  using BLayout = Layout<Shape <Shape < _4,_8>,Shape <_4,  _2>>,
-                         Stride<Stride<_32,_1>,Stride<_8,_128>>>;
-  using CLayout = SM80_16x8_Row;
-};
+using SM80_16x8_Row = Layout<Shape <Shape < _4,_8>,Shape < _2,_2>>,
+                             Stride<Stride<_32,_1>,Stride<_16,_8>>>;
 ```
 
-这里值得注意的是：
+把三个布局的 `Shape` 拆成 `(T,V)`，可直接核对线程数、每线程逻辑值数与矩阵大小：
 
-- `ThrID` 仍然是 `Layout<_32>`，也就是 warp-level。
-- `Shape_MNK` 变成 `Shape<_16,_8,_32>`，K 维更长。
-- `ValTypeA/B` 可以是 `float_e4m3_t` 或 `float_e5m2_t`，不同 FP8 组合通过继承同一个基础 traits 改类型。
+| 布局 | `(T,V)` | 覆盖的逻辑矩阵 | 每线程的值数 |
+| --- | --- | --- | --- |
+| `ALayout` | `(4×8, 2×2×2) = (32,8)` | $A(16,16)$，共 256 个 F16。 | 8 个 A 元素，对应 Operation 的 `ARegisters = uint32_t[4]`。 |
+| `BLayout` | `(4×8, 2×2) = (32,4)` | $B(8,16)$，共 128 个 F16。 | 4 个 B 元素，对应 `BRegisters = uint32_t[2]`。 |
+| `CLayout` | `(4×8, 2×2) = (32,4)` | $C(16,8)$，共 128 个 F16。 | 4 个 C/D 元素，对应两个打包 F16 的 32-bit 累加器寄存器。 |
 
-## Hopper GMMA
+再把 `Stride` 展开成坐标。令线程坐标为 $(t_0,t_1)$，其中 $0\le t_0<4$、$0\le t_1<8$；各布局的 value 坐标用 $v_0,v_1,v_2$ 表示，只取对应 `Shape` 中存在的维度：
 
-Hopper 引入的 GMMA 在更大的粒度上工作。文档里把它描述为 **warpgroup** 级别，也就是 128 个线程协作。
+| 布局 | `(thread, value)` 映射到的矩阵坐标 |
+| --- | --- |
+| `ALayout` | $m=t_1+8v_1,\quad k=2t_0+v_0+8v_2$。 |
+| `BLayout` | $n=t_1,\quad k=2t_0+v_0+8v_1$。 |
+| `CLayout` | $m=t_1+8v_1,\quad n=2t_0+v_0$。 |
 
-预留图：
+例如 A 的线程子模式 $t_0$ 每加 1，线性编码增加 32，也就是 K 坐标增加 2；线程子模式 $t_1$ 每加 1，M 坐标增加 1。由此可以读出一个 warp 如何覆盖完整的 A、B、C tile。这些公式描述的是**寄存器 fragment 的线程 / 元素映射**，不推断用户矩阵在 global memory 或 shared memory 中的 stride。
 
-![Hopper GMMA accumulator layout](/blog-assets/gpu-programming/cute-mma-atom/gmma-accumulator-layout.png)
+### SM90 GMMA：`MMA_Traits<SM90_64x16x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>>`
 
-### `SM90_64x128x16_F16F16F16_SS`
+**源码别名与特化**
 
-源码中，`SM90_64x128x16_F16F16F16_SS` 是一个别名，指向 SM90 GMMA Operation：
+`SM90_64x16x16_F16F16F16_SS` 是 `cute` 命名空间中的别名，指向 `cute::SM90::GMMA::MMA_64x16x16_F16F16F16_SS`：
 
 ```cpp
 template <
@@ -553,15 +529,10 @@ template <
   GMMA::ScaleIn  scaleA = GMMA::ScaleIn::One,
   GMMA::ScaleIn  scaleB = GMMA::ScaleIn::One
 >
-using SM90_64x128x16_F16F16F16_SS =
-  SM90::GMMA::MMA_64x128x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>;
-```
+using SM90_64x16x16_F16F16F16_SS = SM90::GMMA::MMA_64x16x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>;
 
-对应的 traits 特化是：
-
-```cpp
 template <GMMA::Major tnspA, GMMA::Major tnspB, GMMA::ScaleIn scaleA, GMMA::ScaleIn scaleB>
-struct MMA_Traits<SM90_64x128x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>>
+struct MMA_Traits<SM90_64x16x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>>
 {
   using ValTypeD = half_t;
   using ValTypeA = half_t;
@@ -571,33 +542,81 @@ struct MMA_Traits<SM90_64x128x16_F16F16F16_SS<tnspA, tnspB, scaleA, scaleB>>
   using FrgTypeA = GMMA::smem_desc<tnspA>;
   using FrgTypeB = GMMA::smem_desc<tnspB>;
 
-  using Shape_MNK = Shape<_64,_128,_16>;
+  using Shape_MNK = Shape<_64,_16,_16>;
   using ThrID   = Layout<_128>;
   using ALayout = GMMA::ABLayout< 64, 16>;
-  using BLayout = GMMA::ABLayout<128, 16>;
-  using CLayout = GMMA::CLayout_64x128;
+  using BLayout = GMMA::ABLayout< 16, 16>;
+  using CLayout = GMMA::CLayout_64x16;
 
   GMMA::ScaleOut accumulate_ = GMMA::ScaleOut::One;
 };
 ```
 
-**构造参数 / 成员变量**
+这次 `Shape_MNK = (64,16,16)`，`ThrID = Layout<_128>` 对应一个 warpgroup 的 128 个参与线程。`FrgTypeA/B`、A/B/C 布局和 `accumulate_` 需要分别向上追踪，不能按 SM80 的寄存器 fragment 直接理解。
 
-| 成员 | 类型 | 含义 |
-| --- | --- | --- |
-| `ValTypeD/A/B/C` | `half_t` | 逻辑 D/A/B/C 数据类型。 |
-| `FrgTypeA` | `GMMA::smem_desc<tnspA>` | A 操作数不是普通寄存器 fragment，而是 shared memory descriptor。 |
-| `FrgTypeB` | `GMMA::smem_desc<tnspB>` | B 操作数也是 shared memory descriptor。 |
-| `Shape_MNK` | `Shape<_64,_128,_16>` | 单条 GMMA 的逻辑形状。 |
-| `ThrID` | `Layout<_128>` | 128 个逻辑线程连续参与，即一个 warpgroup。 |
-| `ALayout` | `GMMA::ABLayout<64,16>` | A 的 shared memory tile 逻辑布局。 |
-| `BLayout` | `GMMA::ABLayout<128,16>` | B 的 shared memory tile 逻辑布局。 |
-| `CLayout` | `GMMA::CLayout_64x128` | 累加器 `(thread,value)` 到 `(M,N)` 的映射。 |
-| `accumulate_` | `GMMA::ScaleOut` | 控制 GMMA 输出累加行为，默认是 `One`。 |
+#### `FrgTypeA/B`：从共享内存 Tensor 到 descriptor
 
-### GMMA 的 A/B 布局为什么线程维度 stride 是 0
+源码中，`smem_desc<Major>` 继承 `DescriptorIterator`，后者解引用得到 `GmmaDescriptor`；它表示一种**带有主方向的 descriptor fragment 视图**：
 
-源码中 `ABLayout` 定义为：
+```cpp
+struct DescriptorIterator
+{
+  using reference    = GmmaDescriptor;
+  using element_type = GmmaDescriptor;
+  using value_type   = GmmaDescriptor;
+
+  GmmaDescriptor desc_;
+
+  CUTE_HOST_DEVICE constexpr
+  reference operator*() const { return desc_; }
+  // 省略其余迭代器操作。
+};
+
+template <Major>
+struct smem_desc : DescriptorIterator {};
+```
+
+具体从 `include/cute/atom/mma_atom.hpp` 的 `MMA_Atom::make_fragment_A` 往下追。这个 Operation 的 `MMA_Traits` 已经声明 `FrgTypeA = GMMA::smem_desc<tnspA>`；`MMA_Atom` 通过 `FrgTypeA_or_Default<Traits>` 取到它，不会退回默认的 `ValTypeA = half_t`。`make_fragment_A` 期望传入已按 `VMK` 分区的 A Tensor，先用 `rank >= 3`、第 0 个 mode 的大小等于 `ALayout` 的 value 大小做基本形状检查，接着进行如下编译期分支。这里省略了 true 分支中的 `value_type` 静态断言：
+
+```cpp
+if constexpr (has_dereference<FrgTypeA>::value) {
+  // 省略对 atensor.value_type 的静态检查。
+  return make_tensor<FrgTypeA>(static_cast<ATensor&&>(atensor));
+} else {
+  return make_fragment_like<FrgTypeA>(atensor);
+}
+```
+
+`has_dereference<T>` 用 `decltype(*declval<T&>())` 检测类型是否支持解引用。`smem_desc<tnspA>` 继承了上面 `DescriptorIterator::operator*`，所以这里**选择 true 分支**：先核对输入元素类型与 `ValTypeA` 兼容，再把整个 `atensor` 交给 `make_tensor<FrgTypeA>`。这是由 `FrgTypeA` 决定的编译期分派，不是运行时检查 `atensor` 是否位于共享内存；`make_fragment_like` 这一寄存器 fragment 路径不会被实例化。
+
+下一跳在 `include/cute/tensor_impl.hpp`：带显式模板参数的 `make_tensor<FrgTypeA>(atensor)` 走 `make_tensor<T>(Args const&...)` 重载，调用 `MakeTensor<FrgTypeA>{}(atensor)`。由于 `FrgTypeA` 恰好是 `smem_desc<tnspA>`，于是命中 `include/cute/atom/mma_traits_sm90_gmma.hpp` 中的以下特化，而不是通用的 `MakeTensor<T>`：
+
+```cpp
+template <SM90::GMMA::Major MajorMode>
+struct MakeTensor<SM90::GMMA::smem_desc<MajorMode>>
+{
+  template <class TEngine, class TLayout>
+  CUTE_HOST_DEVICE constexpr auto
+  operator()(Tensor<TEngine,TLayout> const& smem_tensor)
+  {
+    static_assert(is_smem<TEngine>::value, "Expected SMEM Tensor to construct a GMMA Desc Tensor");
+    return make_tensor(SM90::GMMA::DescriptorIterator{SM90::GMMA::make_gmma_desc<MajorMode>(tensor<0>(smem_tensor))},
+                       replace<0>(recast<uint128_t const>(smem_tensor).layout(), Layout<_1,_0>{}));
+  }
+};
+```
+
+这里才通过 `is_smem<TEngine>` 静态断言确认输入确实是 shared memory Tensor。`tensor<0>(smem_tensor)` 取的是分区布局的**第 0 个 mode（V mode）**，不是取坐标为 0 的一个元素；该 mode 的内部布局是二维的 M/K（B 则是 N/K）。`make_gmma_desc<MajorMode>` 因而能从这个二维共享内存布局生成初始 descriptor，并再次检查 shared memory 和 rank-2 条件；`MajorMode = tnspA` 决定按 `Major::MN` 还是 `Major::K` 的规范布局解释地址、步幅与 swizzle。
+
+返回值中的 `recast<uint128_t const>(smem_tensor).layout()` 把布局换算到 128-bit 单位，`replace<0>(..., Layout<_1,_0>{})` 则将 V mode 换成大小为 1、stride 为 0 的 descriptor mode，保留其他分区维度。最后这个**不带显式类型参数**的 `make_tensor(DescriptorIterator{...}, layout)` 走迭代器重载；通用 `MakeTensor<DescriptorIterator>` 发现首参数可解引用，构造非拥有的 `ViewEngine<DescriptorIterator>` Tensor。它解引用时得到 `GmmaDescriptor`，并不会把 A 的所有 `half_t` 元素复制到寄存器。
+
+`make_fragment_B` 是对称路径：检查 `VNK` 分区，`FrgTypeB = smem_desc<tnspB>` 也使 `has_dereference` 为真，随后用 `tnspB` 生成 B 的 descriptor 视图。
+
+所以 `FrgTypeA/B` 不是 `half_t` 数组，也不是共享内存的复制品。A、B 的逻辑元素类型仍由 `ValTypeA/B = half_t` 给出；最终传给 `SS` Operation 的则是两个 64-bit descriptor。descriptor 记录共享内存 tile 的地址、步幅与 swizzle 等信息。模板参数 `tnspA/tnspB` 选择 K-major 或 M/N-major，必须与用来生成 descriptor 的实际共享内存布局一致。
+
+#### `ALayout/BLayout`：共享输入的逻辑坐标
+
+两个别名都来自同一个模板：
 
 ```cpp
 template <int M, int K>
@@ -605,54 +624,47 @@ using ABLayout = Layout<Shape <_128,Shape <Int<M>,Int<K>>>,
                         Stride<  _0,Stride<    _1,Int<M>>>>;
 ```
 
-这表示：
+代入参数后，`ALayout = ABLayout<64,16>` 表示 `(T128,V(64,16)) -> A(64,16)`，返回 $m+64k$；`BLayout = ABLayout<16,16>` 表示 `(T128,V(16,16)) -> B(16,16)`，返回 $n+16k$。
 
-```cpp
-// (T128, V(M,K)) -> (M,K)
-```
+这里最关键的是线程维度的 stride 为 **`_0`**：同一个 value 坐标无论配哪个逻辑线程，都会得到相同的矩阵坐标。这是在**逻辑坐标层面广播共享输入 tile**；
 
-线程维度的 stride 是 `_0`，意味着 128 个线程在 layout 视角下都映射到同一个 tile 起点。原因是 SS 形式的 GMMA 从 shared memory descriptor 读取 A/B，不是每个线程手里各自拿一小段 A/B 寄存器。
+#### `CLayout`：累加器的线程 / 元素映射
 
-这里需要谨慎理解：
-
-- 这不是说 128 个线程真的都去读同一个元素。
-- 它表达的是 **CuTe 的逻辑 fragment 视角**：A/B 操作数由 shared memory descriptor 描述，线程维度不再像 Volta HMMA 那样拆分 A/B 寄存器所有权。
-- 真正的数据搬运和矩阵读取由 GMMA 硬件根据 descriptor 完成。
-
-### GMMA 的 CLayout
-
-源码中 `CLayout_64xN` 定义为：
+`CLayout_64x16` 是把 `N=16` 代入通用别名 `CLayout_64xN`：
 
 ```cpp
 template<int N>
 using CLayout_64xN =
   Layout<Shape <Shape <  _4,_8, _4>,Shape < _2,_2,Int<N/8>>>,
          Stride<Stride<_128,_1,_16>,Stride<_64,_8,   _512>>>;
+
+using CLayout_64x16 = CLayout_64xN<16>;
 ```
 
-`CLayout_64x128` 就是：
+展开后，线程形状是 $4\times8\times4=128$，value 形状是 $2\times2\times2=8$，恰好覆盖 $64\times16=1024$ 个 C/D 元素。每线程的 8 个 F16 累加值打包在 Operation 的 4 个 `uint32_t` 寄存器中。
 
-```cpp
-using CLayout_64x128 = CLayout_64xN<128>;
-```
+令线程坐标为 $(t_0,t_1,t_2)$，value 坐标为 $(v_0,v_1,v_2)$。按 C 的列优先线性编码 $m+64n$ 展开 Stride，可以得到：
 
-这和官方文档里从 $64 \times 8$ 核心模式扩展到 $64 \times 128$ 的描述一致。这里先记住结论：Hopper GMMA 的 C 累加器 layout 仍然是 `(thread,value) -> (M,N)`，只是它的线程规模变成 128，N 方向也有更多重复模式。
+$$
+m=t_1+16t_2+8v_1,\qquad n=2t_0+v_0+8v_2.
+$$
+
+例如 $t_0$ 增加 1 对应 N 增加 2，$v_2$ 增加 1 对应 N 增加 8。`CLayout` 描述的是**累加器寄存器如何分布到 128 个线程**，与 A/B 的 descriptor 视图不同。
+
+最后，`accumulate_` 默认是 `GMMA::ScaleOut::One`。CuTe 的 GMMA `mma_unpack` 会把它传给 Operation 的 `fma`：`One` 继续累加旧 C，`Zero` 忽略旧 C。`scaleA/scaleB` 已在 Operation 模板实例化时确定，只负责输入的正负号；它们不由 `ALayout/BLayout/CLayout` 控制。
 
 ## `MMA_Atom`
 
-**用途**
+`MMA_Atom` 将一条 Operation 的 `MMA_Traits` 变成可以构造 fragment、调用 MMA 的接口。以下只讨论 `include/cute/atom/mma_atom.hpp` 中的 `MMA_Atom` 本身；`partition_A/B/C` 属于后面的 `ThrMMA`，不是 `MMA_Atom` 的成员。
 
-`MMA_Atom` 把 `MMA_Traits` 包装成可调用对象。它继承 traits，暴露 value type、layout type、fragment type，并提供 `call` 和 `make_fragment_*` 接口。
+### 模板入口：先匹配偏特化，再看继承
 
-**源码位置**
-
-```text
-include/cute/atom/mma_atom.hpp
-```
-
-**核心声明**
+源码从一个**只有声明、没有定义**的可变参数主模板开始。下面两段都是它的偏特化，而不是针对某条指令单独写出的特化：
 
 ```cpp
+template <class... Args>
+struct MMA_Atom;
+
 template <class MMAOperation>
 struct MMA_Atom<MMAOperation> : MMA_Atom<MMA_Traits<MMAOperation>>
 {};
@@ -661,65 +673,219 @@ template <class MMAOperation, class... Args>
 struct MMA_Atom<MMA_Traits<MMAOperation, Args...>>
   : MMA_Traits<MMAOperation, Args...>
 {
-  using MMA_Op = MMAOperation;
-  using Traits = MMA_Traits<MMAOperation, Args...>;
-
-  using ValTypeD = typename Traits::ValTypeD;
-  using ValTypeA = typename Traits::ValTypeA;
-  using ValTypeB = typename Traits::ValTypeB;
-  using ValTypeC = typename Traits::ValTypeC;
-
-  using Shape_MNK  = typename Traits::Shape_MNK;
-  using ThrID      = typename Traits::ThrID;
-  using LayoutC_TV = typename Traits::CLayout;
-  using LayoutA_TV = typename Traits::ALayout;
-  using LayoutB_TV = typename Traits::BLayout;
+  // 下面的类型别名与成员函数在后文展开。
 };
 ```
 
-**构造参数 / 成员变量**
+以 `using Op = SM80_16x8x16_F16F16F16F16_TN;` 为例，`MMA_Atom<Op>` 先匹配“一个 Operation 类型”的偏特化，它继承 `MMA_Atom<MMA_Traits<Op>>`。后者同时符合两个偏特化，但 `MMA_Traits<...>` 形式更具体，所以匹配第三段，并继承 `MMA_Traits<Op>`。继承链即 `MMA_Atom<Op> → MMA_Atom<MMA_Traits<Op>> → MMA_Traits<Op>`。
 
-| 成员 | 类型 | 含义 |
+这里的冒号表示**类继承**，不是“再调用一次模板”。`MMA_Atom<Op>` 和 `MMA_Atom<MMA_Traits<Op>>` 是两个不同的 C++ 类型；前者通过继承获得后者的接口。若显式以 Traits 类型作为模板实参，也可以直接写 `MMA_Atom<MMA_Traits<Op>>`。`Args...` 是 `MMA_Traits` 自己额外接受的**类型参数**；SM90 Operation 的 `tnspA/tnspB/scaleA/scaleB` 已包含在 `MMAOperation` 类型内部，不是这里的 `Args...`。
+
+### 类型别名、继承状态与 `with`
+
+实际实现所在的第三段偏特化，从基类 Traits 导出下面这些别名。代码保留源码结构，中文注释为本文补充：
+
+```cpp
+using MMA_Op = MMAOperation;
+using Traits = MMA_Traits<MMAOperation, Args...>;
+
+using ValTypeD = typename Traits::ValTypeD;
+using ValTypeA = typename Traits::ValTypeA;
+using ValTypeB = typename Traits::ValTypeB;
+using ValTypeC = typename Traits::ValTypeC;
+
+using Shape_MNK  = typename Traits::Shape_MNK;
+using ThrID      = typename Traits::ThrID;
+using LayoutC_TV = typename Traits::CLayout;
+using LayoutA_TV = typename Traits::ALayout;
+using LayoutB_TV = typename Traits::BLayout;
+
+using FrgTypeD = typename detail::FrgTypeC_or_Default<Traits>::type;
+using FrgTypeA = typename detail::FrgTypeA_or_Default<Traits>::type;
+using FrgTypeB = typename detail::FrgTypeB_or_Default<Traits>::type;
+using FrgTypeC = typename detail::FrgTypeC_or_Default<Traits>::type;
+
+template <class... TraitsArgs>
+CUTE_HOST_DEVICE auto
+with(TraitsArgs&&... args) const {
+  auto traits = Traits::with(static_cast<TraitsArgs&&>(args)...);
+  return MMA_Atom<decltype(traits)>{traits};
+}
+```
+
+| 名称 | 得到什么 |
+| --- | --- |
+| `MMA_Op`、`Traits` | 分别是底层 Operation 类型与对应的 Traits 类型；都是类型别名，不是数据成员。 |
+| `ValTypeD/A/B/C` | D/A/B/C 的逻辑元素类型，不等于 Operation 声明的物理寄存器类型。 |
+| `Shape_MNK`、`ThrID` | 单次 Operation 的 $(M,N,K)$ 形状，以及逻辑线程 ID 到参与线程的映射。 |
+| `LayoutA_TV/B_TV/C_TV` | Traits 中 `ALayout/BLayout/CLayout` 的别名，描述 `(thread,value)` 到矩阵坐标的映射；并非共享内存 Tensor 自身的物理 layout。 |
+| `FrgTypeA/B/C/D` | 构造 fragment 时使用的类型。Traits 未声明相应 `FrgTypeA/B/C` 时，分别回退到 `ValTypeA/B/C`。源码中的 `FrgTypeD` **也使用 `FrgTypeC_or_Default`**，不是独立查找 `FrgTypeD`。 |
+
+`MMA_Atom` 本身没有另存一份这些类型信息；它**公开继承 Traits**。如果 Traits 有数据成员（例如本节 SM90 Traits 的 `accumulate_`），Atom 对象也包含这份基类状态。`with(args...)` 调用 `Traits::with(...)`，再用返回的 Traits 对象构造一个新的 `MMA_Atom<decltype(traits)>`；**只有 Traits 实际提供匹配的 `with` 时，这个成员模板才能被调用**。下面选的 SM80、SM90 Traits 都没有这样的 `with`，SM90 的 `scaleA/scaleB` 也不是通过此接口设置。
+
+### `call`：把单次调用交给 `mma_unpack`
+
+两个重载都返回 `void`。输入必须是**单次 Atom 指令对应的 rank-1 fragment Tensor**；由 `partition_*` 得到的高阶 Tensor，不能不切片就直接传给 `call`。源码主体如下：
+
+```cpp
+template <class TD, class DLayout,
+          class TA, class ALayout,
+          class TB, class BLayout,
+          class TC, class CLayout>
+CUTE_HOST_DEVICE constexpr void
+call(Tensor<TD, DLayout>      & D,
+     Tensor<TA, ALayout> const& A,
+     Tensor<TB, BLayout> const& B,
+     Tensor<TC, CLayout> const& C) const
+{
+  static_assert(DLayout::rank == 1, "Expected rank-1 D tensor");
+  static_assert(ALayout::rank == 1, "Expected rank-1 A tensor");
+  static_assert(BLayout::rank == 1, "Expected rank-1 B tensor");
+  static_assert(CLayout::rank == 1, "Expected rank-1 C tensor");
+
+  // 显式转成基类，使 mma_unpack 拿到 Traits 类型和其中的状态。
+  return mma_unpack(static_cast<Traits const&>(*this), D, A, B, C);
+}
+
+template <class TA, class ALayout,
+          class TB, class BLayout,
+          class TC, class CLayout>
+CUTE_HOST_DEVICE constexpr void
+call(Tensor<TA, ALayout> const& A,
+     Tensor<TB, BLayout> const& B,
+     Tensor<TC, CLayout>      & C) const
+{
+  // C 同时作为可写的 D 与输入累加器 C。
+  return call(C, A, B, C);
+}
+```
+
+| 调用 | 参数和结果 |
+| --- | --- |
+| `call(D, A, B, C)` | `D` 为可写输出，`A/B/C` 为只读输入；返回 `void`，通过 `D` 写回结果。 |
+| `call(A, B, C)` | `C` 既是输入累加器又是可写输出；返回 `void`，直接更新 `C`。 |
+
+`mma_unpack` 位于 `mma_traits.hpp`（SM90 GMMA 有自己的重载）：它检查 fragment 的寄存器接口，将逻辑元素重新解释为 Operation 要求的寄存器类型，核对寄存器数量，再展开参数调用 `MMA_Op::fma`。**`call` 自身只检查 rank-1，不负责自动分块，也不返回一个新的结果 Tensor。** 对于本节的 SM90 GMMA，专用 `mma_unpack` 从可写 `D` 取得累加器，虽静态检查 `D/C` 的元素类型和 layout 相同，却不检查两者是否真的引用同一份数据；因此应优先使用三参形式 `call(A,B,C)`。
+
+### `make_fragment_C`：创建累加器容器
+
+参数 `ctensor` 应是已经按 `VMN` 分区的 C Tensor。源码只用它的形状，不读取、复制其元素：
+
+```cpp
+template <class CTensor>
+CUTE_HOST_DEVICE static constexpr auto
+make_fragment_C(CTensor&& ctensor)
+{
+  CUTE_STATIC_ASSERT_V(rank(ctensor) >= Int<3>{});  // VMN
+  CUTE_STATIC_ASSERT_V(size<0>(ctensor) == size<1>(LayoutC_TV{}));
+
+  // 输入 C 的元素类型不强制等于累加器类型；新 Tensor 按 FrgTypeC 构造。
+  return make_tensor<FrgTypeC>(shape(ctensor));
+}
+```
+
+**返回值**是一个新建的、拥有自身存储的 `Tensor`，元素类型为 `FrgTypeC`，形状与 `ctensor` 相同；它不是 `ctensor` 的视图，也不会自动填入 `ctensor` 的值。单次 Atom 的 V mode 对应每线程的 C 累加元素，额外的 M/N mode 表示外层重复。调用 `call` 之前仍须为累加器准备正确初值。
+
+### `make_fragment_A/B`：寄存器 fragment 或 descriptor 视图
+
+两个接口都期望输入已经按线程分区：A 为 `VMK`，B 为 `VNK`。下面保留两条源码分支；低位宽兼容条件也按源码列出，以免把静态检查误写成“总是要求元素类型完全相同”：
+
+```cpp
+template <class ATensor>
+CUTE_HOST_DEVICE static constexpr auto
+make_fragment_A(ATensor&& atensor)
+{
+  CUTE_STATIC_ASSERT_V(rank(atensor) >= Int<3>{});  // VMK
+  CUTE_STATIC_ASSERT_V(size<0>(atensor) == size<1>(LayoutA_TV{}));
+
+  if constexpr (has_dereference<FrgTypeA>::value) {
+    // FrgTypeA 是迭代器/视图标志；先核对底层输入元素类型。
+    static_assert(is_same<ValTypeA, typename remove_cvref_t<ATensor>::value_type>::value
+                      || (sizeof_bits_v<typename remove_cvref_t<ATensor>::value_type> == 8 &&
+                          (sizeof_bits_v<ValTypeA> == 8 || sizeof_bits_v<ValTypeA> == 6 || sizeof_bits_v<ValTypeA> == 4))
+                      || (sizeof_bits_v<typename remove_cvref_t<ATensor>::value_type> == 4 &&
+                          (sizeof_bits_v<ValTypeA> == 4 || sizeof_bits_v<ValTypeA> == 3 || sizeof_bits_v<ValTypeA> == 2)),
+                  "Expecting ValTypeA type");
+    return make_tensor<FrgTypeA>(static_cast<ATensor&&>(atensor));
+  } else {
+    // FrgTypeA 是值类型：新建寄存器 fragment，而不是复制 atensor 元素。
+    return make_fragment_like<FrgTypeA>(atensor);
+  }
+  CUTE_GCC_UNREACHABLE;
+}
+
+template <class BTensor>
+CUTE_HOST_DEVICE static constexpr auto
+make_fragment_B(BTensor&& btensor)
+{
+  CUTE_STATIC_ASSERT_V(rank(btensor) >= Int<3>{});  // VNK
+  CUTE_STATIC_ASSERT_V(size<0>(btensor) == size<1>(LayoutB_TV{}));
+
+  if constexpr (has_dereference<FrgTypeB>::value) {
+    static_assert(is_same<ValTypeB, typename remove_cvref_t<BTensor>::value_type>::value
+                      || (sizeof_bits_v<typename remove_cvref_t<BTensor>::value_type> == 8 &&
+                          (sizeof_bits_v<ValTypeB> == 8 || sizeof_bits_v<ValTypeB> == 6 || sizeof_bits_v<ValTypeB> == 4)),
+                  "Expecting ValTypeB type");
+    return make_tensor<FrgTypeB>(static_cast<BTensor&&>(btensor));
+  } else {
+    return make_fragment_like<FrgTypeB>(btensor);
+  }
+  CUTE_GCC_UNREACHABLE;
+}
+```
+
+**返回值取决于 `FrgTypeA/B`，而不是只取决于传入 Tensor 在什么内存空间。** 如果它是 `half_t` 这样的值类型，`has_dereference` 为假，`make_fragment_like` 创建拥有自身存储的寄存器 fragment：逻辑形状与分区输入对应，value（第 0）mode 按适合 fragment 的紧凑布局重排，**不自动把输入数据复制进去**。如果它是可解引用的 `smem_desc<Major>`，则走 `make_tensor<FrgTypeA/B>`；上一节已追踪这个特化，它要求输入是 shared memory Tensor，返回以 `DescriptorIterator` 为引擎的非拥有 descriptor Tensor。两条路径都不是“返回原输入 Tensor 本身”。
+
+### 代入 SM80 和 SM90 看具体类型
+
+这里的“代入”不是为每种架构再写一份 `MMA_Atom` 特化。两者都匹配同一个 `MMA_Atom<MMAOperation>` 入口，再进入同一个 Traits 形式的实现；**变化的是 `MMA_Traits<Op>` 的具体特化**：
+
+```cpp
+using Op80 = SM80_16x8x16_F16F16F16F16_TN;
+using Atom80 = MMA_Atom<Op80>;
+
+using Op90 = SM90_64x16x16_F16F16F16_SS<
+    GMMA::Major::K, GMMA::Major::K>;
+using Atom90 = MMA_Atom<Op90>;
+```
+
+| 展开项 | `Atom80` | `Atom90`（`Major::K/K`） |
 | --- | --- | --- |
-| `MMA_Op` | Operation 类型 | 底层 PTX Operation。 |
-| `Traits` | `MMA_Traits<...>` | Operation 对应的逻辑 traits。 |
-| `ValTypeD/A/B/C` | traits 中的类型 | D/A/B/C 的逻辑 value type。 |
-| `Shape_MNK` | traits 中的类型 | 单条 MMA 的逻辑形状。 |
-| `ThrID` | traits 中的类型 | 单条 MMA 内部的线程映射。 |
-| `LayoutA_TV/B_TV/C_TV` | traits 中的类型 | `(thread,value)` 到矩阵坐标的映射。 |
-| `FrgTypeA/B/C/D` | traits 或默认值 | fragment 中实际存储 / 引用的类型。 |
+| 继承链末端 | `MMA_Traits<Op80>` | `MMA_Traits<Op90>` |
+| `Shape_MNK` / `ThrID` | `(16,8,16)` / 32 线程 | `(64,16,16)` / 128 线程 |
+| `ValTypeA/B/C` | 均为 `half_t` | 均为 `half_t` |
+| `FrgTypeA/B` | 回退为 `half_t` / `half_t` | `smem_desc<Major::K>` / `smem_desc<Major::K>` |
+| `FrgTypeC/D` | 均回退为 `half_t` | 均回退为 `half_t` |
+| `make_fragment_A/B` | 返回元素类型为 `half_t` 的新寄存器 Tensor；单个 Atom 的 V mode 分别容纳 8/4 个 F16。 | 返回非拥有的 descriptor Tensor；单个 Atom 的 A/B 各由一个 64-bit descriptor 表示，要求输入来自 shared memory。 |
+| `make_fragment_C` | 返回元素类型为 `half_t` 的新寄存器 Tensor；单个 Atom 的 V mode 为 4 个 F16。 | 返回元素类型为 `half_t` 的新寄存器 Tensor；单个 Atom 的 V mode 为 8 个 F16。 |
+| `call` 的物理接口 | `mma_unpack` 把 A/B/C/D 分别打包为 4/2/2/2 个 `uint32_t` 寄存器后调用 `mma.sync`。 | A/B 各为 1 个 `uint64_t` descriptor，C 为 4 个 `uint32_t`；调用 `wgmma`，累加行为还取自继承的 `accumulate_`。 |
 
-**重要接口**
-
-| 接口 | 原型 | 含义 |
-| --- | --- | --- |
-| `with` | `auto with(TraitsArgs&&... args) const` | 基于 traits 的 `with` 生成带额外参数的新 Atom，常见于 GMMA scale / accumulate 参数。 |
-| `call` | `void call(D&, A const&, B const&, C const&) const` | 检查 rank 后调用 `mma_unpack`，最终进入 Operation 的 `fma`。 |
-| `call` | `void call(A const&, B const&, C&) const` | 三参数版本，表示 `D` 和 `C` 是同一个输出累加器。 |
-| `make_fragment_A/B/C` | `static auto make_fragment_*(Tensor&&)` | 根据已经 partition 后的 tensor 构造适合该 Atom 的 fragment。 |
-
-**注意点**
-
-- `call` 要求 A/B/C/D tensor 都是 rank-1，这一点源码里有 `static_assert`。
-- `make_fragment_A/B/C` 期望输入已经经过 `partition_A/B/C`，不是任意原始矩阵 tensor。
-- 对 GMMA 这类 descriptor 操作数，`FrgTypeA/B` 可能是 descriptor 类型，而不是普通寄存器值类型。
+对于 `Atom80`，`make_fragment_A/B` 的 `if constexpr` 选 **`make_fragment_like`** 分支；对于 `Atom90`，`smem_desc<Major::K>` 可解引用，选 **`make_tensor<FrgTypeA/B>`** 分支。两者的 `make_fragment_C` 都只新建累加器 Tensor。`call` 均返回 `void`，但 SM90 建议使用让 C 原位更新的三参重载。这里列的是**单次 Atom 的 V mode**；如果传入的分区 Tensor 还有外层重复，返回的完整 fragment Tensor 会保留相应的外层形状，不能把表中的元素数理解成整个分区 Tensor 的总元素数。
 
 ## `TiledMMA`
 
-**用途**
+`MMA_Atom` 定义一条指令内部的线程—元素映射；`TiledMMA` 进一步指定**多个 Atom 副本如何铺到 M/N/K 方向**，并把输入 Tensor 的 `(M,K)`、`(N,K)`、`(M,N)` layout 改写成“线程坐标 + 每线程 fragment 坐标”。本节介绍的构造、布局变换和线程切片接口不发出 MMA 指令，也不搬运 Tensor 元素；`TiledMMA` 仍继承了 `MMA_Atom` 的调用接口。源码位于 `include/cute/atom/mma_atom.hpp`。
 
-`TiledMMA` 把一个 `MMA_Atom` 按 `AtomLayoutMNK` 复制和排列，形成更大的 MMA tile。它不改变单条 MMA 指令本身，而是描述 **Atom 在线程空间如何复制**，以及 **逻辑 M/N/K 模式如何被重排**。
+理解本节时先分清三个对象：
 
-这几个名字一定要分清：
+| 对象 | 负责什么 |
+| --- | --- |
+| `MMA_Atom` | 单条指令的 `Shape_MNK`、`ThrID` 和 A/B/C 的 `(thread,value)` 映射。 |
+| `TiledMMA` | Atom 副本的线程布局、逻辑 tiler，以及**所有线程一起看**的 A/B/C 分解。 |
+| `ThrMMA` | `get_slice(thread_id)` 返回的特定线程对象；它才把线程坐标固定，得到该线程的 A/B/C Tensor 视图。 |
 
-- **`MMA_Atom`**：单条 MMA 指令的逻辑封装。
-- **`AtomLayoutMNK`**：多个 Atom 在线程维度上如何铺到 M/N/K。
-- **`PermutationMNK`**：M/N/K 三个逻辑模式各自如何重排。
-- **`ThrLayoutVMNK`**：源码里由 `tiled_product(AtomThrID{}, AtomLayoutMNK{})` 推出来的最终线程布局。
+### 模板参数、构造与线程布局
 
-**源码声明**
+下面保留类的类型定义、约束和构造逻辑；Doxygen 注释为本文补充：
 
 ```cpp
+/**
+ * @brief 把单条 MMA Atom 按 M/N/K 副本布局组织成更大的线程级 MMA。
+ *
+ * @tparam MMA_Atom 单条 MMA 的类型，提供 Shape_MNK、ThrID 和 A/B/C TV layout。
+ * @tparam AtomLayoutMNK rank-3 的 Atom 副本布局；三个 mode 依次对应 M/N/K。
+ * @tparam PermutationMNK rank-3、静态的 M/N/K tiler，默认各维为 _。
+ */
 template <class MMA_Atom,
           class AtomLayoutMNK,
           class PermutationMNK = Tile<Underscore,Underscore,Underscore>>
@@ -732,1253 +898,605 @@ struct TiledMMA : MMA_Atom
   using AtomLayoutA_TV = typename MMA_Atom::LayoutA_TV;
   using AtomLayoutB_TV = typename MMA_Atom::LayoutB_TV;
 
+  static_assert(rank_v<AtomLayoutMNK> == 3, "TiledMMA requires rank-3 AtomLayoutMNK");
+  static_assert(rank_v<PermutationMNK> == 3, "TiledMMA requires rank-3 PermutationMNK");
+  static_assert(is_tuple<PermutationMNK>::value, "TiledMMA requires independent permutations of MNK.");
+  static_assert(is_static<PermutationMNK>::value, "TiledMMA requires static permutations of MNK.");
+
   using ThrLayoutVMNK = decltype(tiled_product(AtomThrID{}, AtomLayoutMNK{}));
   ThrLayoutVMNK thr_layout_vmnk_;
+
+  /**
+   * @brief 保存 Atom 状态，并把 Atom 内部线程与 M/N/K 副本布局合成。
+   *
+   * @param mma_atom 基础 Atom；若 Traits 有状态，这里复制其状态。
+   * @param thr_layout_mnk rank-3 的副本布局，坐标为 (ThrM,ThrN,ThrK)。
+   */
+  CUTE_HOST_DEVICE constexpr
+  TiledMMA(MMA_Atom const& mma_atom = {}, AtomLayoutMNK const& thr_layout_mnk = {})
+    : MMA_Atom(mma_atom),
+      thr_layout_vmnk_(tiled_product(AtomThrID{}, thr_layout_mnk)) {}
+
+  /**
+   * @brief 查询完整的线程布局。
+   * @return ThrLayoutVMNK 的值；逻辑坐标为 (ThrV,ThrM,ThrN,ThrK)，
+   *         layout 值是实际的线程编号。
+   */
+  CUTE_HOST_DEVICE constexpr auto
+  get_thr_layout_vmnk() const {
+    return thr_layout_vmnk_;
+  }
+
+  // 其余接口分组列在后面；此处不是类的完整源码。
 };
 ```
 
-**模板参数**
+`ThrV` 是**单个 Atom 内部**的逻辑线程坐标；`ThrM/ThrN/ThrK` 指向 M/N/K 方向的 Atom 副本。`tiled_product` 把 `AtomThrID` 和 `AtomLayoutMNK` 合成 `ThrLayoutVMNK`，后者是从这些逻辑坐标到线程编号的 layout。`get_thr_layout_vmnk()` 返回这个 layout 的副本；它不接收 Tensor，也不选某个线程。
 
-| 参数 | 含义 |
-| --- | --- |
-| `MMA_Atom` | 要复制的基本 Atom。 |
-| `AtomLayoutMNK` | Atom 在 M/N/K 维度上的线程布局。源码要求 rank 为 3。 |
-| `PermutationMNK` | 对 M/N/K 模式应用的 permutation，默认三个维度都是 `_`。 |
-
-### `AtomLayoutMNK` 怎么理解
-
-`AtomLayoutMNK` 最好不要先理解成普通矩阵 layout，而要理解成：**我要把一个 MMA Atom 复制成多少份，这些副本分别放在 M/N/K 哪个方向上**。
-
-先看一个基础 Atom。假设使用 SM80 的 `16x8x16` Atom：
-
-```text
-一个 MMA_Atom
-
-        N: 8
-   +-----------+
- M |           |
-:16|  Atom     |   K:16 是这一次乘加吃掉的 K 深度
-   |           |
-   +-----------+
-```
-
-这个 Atom 自己已经知道：
-
-- 单个 Atom 的形状是 `Shape_MNK = Shape<_16,_8,_16>`。
-- 单个 Atom 内部 32 个线程怎么协作，由 `MMA_Traits::ThrID` 和 `LayoutA/B/C_TV` 描述。
-- 但它只是一条 MMA 指令级别的块，还不是更大的 tiled GEMM 块。
-
-`AtomLayoutMNK` 做的事情，就是把这个 Atom 复制成一个 Atom 网格。
-
-例如：
+`TiledMMA` 模板本身要求 rank-3。常用的 `make_tiled_mma` 允许传 rank-2 的副本布局，并用单元素、stride 为 0 的 K mode 补齐；对 permutation 也补到三个 mode：
 
 ```cpp
-cute::Layout<cute::Shape<cute::_2, cute::_2>,
-             cute::Stride<cute::_2, cute::_1>>{}
-```
-
-这表示在 M/N 方向复制成 `2 x 2` 个 Atom。因为没有显式写 K 维，`make_tiled_mma` 会在源码里补成 rank-3：
-
-```cpp
-auto thr_layout_mnk = append<3>(thr_layout, Layout<_1,_0>{});
-```
-
-所以可以把它理解成：
-
-```cpp
-// 逻辑含义：M 方向 2 份，N 方向 2 份，K 方向 1 份。
-Layout<Shape<_2, _2, _1>, ...>
-```
-
-画出来就是：
-
-```text
-AtomLayoutMNK = Shape<2,2,1>
-
-                N 方向
-      Atom(0,0,0)   Atom(0,1,0)
-          +------+      +------+
-          |      |      |      |
-          +------+      +------+
-M 方向
-      Atom(1,0,0)   Atom(1,1,0)
-          +------+      +------+
-          |      |      |      |
-          +------+      +------+
-
-每个小方块都是一个完整的 MMA_Atom。
-如果基础 Atom 是 16x8x16，那么这个 tiled MMA 的自然形状是：
-M = 16 * 2
-N =  8 * 2
-K = 16 * 1
-```
-
-也就是：
-
-```text
-最终自然 tile 形状 = (32, 16, 16)
-```
-
-![示例图](/blog-assets/gpu-programming/cute-mma-atom/figure1.png)
-
-这里的“自然”很重要：如果没有额外的 `PermutationMNK`，`tile_size_mnk<I>()` 就按源码里的公式计算：
-
-```cpp
-size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk())
-```
-
-其中 `get_thr_layout_vmnk()` 来自：
-
-```cpp
-using ThrLayoutVMNK = decltype(tiled_product(AtomThrID{}, AtomLayoutMNK{}));
-```
-
-这一步把 **Atom 内部线程** 和 **Atom 副本布局** 合成最终线程布局：
-
-```mermaid
-flowchart LR
-    A["AtomThrID<br/>单个 Atom 内部的线程"] --> C["ThrLayoutVMNK"]
-    B["AtomLayoutMNK<br/>Atom 副本在 M/N/K 上的排列"] --> C
-    C --> D["线程坐标<br/>(ThrV, ThrM, ThrN, ThrK)"]
-```
-
-可以把 `ThrLayoutVMNK` 读成：
-
-| 坐标 | 含义 |
-| --- | --- |
-| `ThrV` | 当前线程在单个 Atom 内部的逻辑线程坐标。对 SM80 常见 Atom 来说，对应 32 个 lane。 |
-| `ThrM` | 当前线程属于 M 方向第几个 Atom 副本。 |
-| `ThrN` | 当前线程属于 N 方向第几个 Atom 副本。 |
-| `ThrK` | 当前线程属于 K 方向第几个 Atom 副本。 |
-
-所以 `AtomLayoutMNK` 不是“这个线程加载矩阵哪个元素”，而是“这个线程属于哪个 Atom 副本”。
-
-### `Stride` 在 `AtomLayoutMNK` 里控制什么
-
-`AtomLayoutMNK` 的 `Stride` 控制的是 **这些 Atom 副本在线程编号空间里的排列顺序**。
-
-还是用 `2 x 2 x 1` 举例：
-
-```cpp
-using LayoutMN = cute::Layout<
-    cute::Shape<cute::_2, cute::_2>,
-    cute::Stride<cute::_2, cute::_1>>;
-```
-
-坐标到副本编号的关系是：
-
-| Atom 坐标 `(m,n,k)` | 副本编号 |
-| --- | --- |
-| `(0,0,0)` | `0` |
-| `(1,0,0)` | `2` |
-| `(0,1,0)` | `1` |
-| `(1,1,0)` | `3` |
-
-画成图是：
-
-```text
-Stride<_2,_1>：N 方向变化更快
-
-          N0      N1
-M0      mma0    mma1
-M1      mma2    mma3
-```
-
-如果换成：
-
-```cpp
-cute::Layout<cute::Shape<cute::_2, cute::_2>,
-             cute::Stride<cute::_1, cute::_2>>{}
-```
-
-就是：
-
-```text
-Stride<_1,_2>：M 方向变化更快
-
-          N0      N1
-M0      mma0    mma2
-M1      mma1    mma3
-```
-
-这两种写法覆盖的数学 tile 形状一样，都是 `2 x 2 x 1` 个 Atom；不同的是 **Atom 副本和线程编号的对应顺序**。这个顺序会继续影响 `get_slice(thr_idx)` 得到的 `(ThrV,ThrM,ThrN,ThrK)`。
-
-### K 维复制是什么情况
-
-如果显式写 K 维：
-
-```cpp
-auto mma = cute::make_tiled_mma(
-    cute::SM80_16x8x16_F32F16F16F32_TN{},
-
-    // 这里 Shape 是 (M,N,K) = (2,2,2)。
-    // 含义是：M/N/K 三个方向都复制 Atom。
-    cute::Layout<cute::Shape<cute::_2, cute::_2, cute::_2>,
-                 cute::Stride<cute::_4, cute::_2, cute::_1>>{});
-```
-
-可以画成两层 K-slice：
-
-```text
-K0 层：
-
-          N0      N1
-M0      mma0    mma2
-M1      mma4    mma6
-
-K1 层：
-
-          N0      N1
-M0      mma1    mma3
-M1      mma5    mma7
-```
-
-这里 `Stride<_4,_2,_1>` 表示 K 坐标变化最快，然后是 N，最后是 M。也就是说相邻副本优先沿 K 方向变化。
-
-如果只看 `TiledMMA` 的整体逻辑包络，基础 Atom 是 `16x8x16`，`AtomLayoutMNK = Shape<2,2,2>` 会得到：
-
-```text
-M = 16 * 2 = 32
-N =  8 * 2 = 16
-K = 16 * 2 = 32
-```
-
-但是这里最容易误解：**这不是说一个 warp 的 MMA 从 `16x8x16` 变成了 `16x8x32`**。
-
-单个 SM80 MMA Atom 仍然是一个 warp 处理一个 `16x8x16`：
-
-```text
-单个 warp / 单个 MMA_Atom 的视角：
-
-C: 16 x 8
-A: 16 x 16
-B:  8 x 16
-K: 只有一个 AtomK = 16
-```
-
-`AtomLayoutMNK` 的 K 方向复制，意思是 **TiledMMA 里多放一组 `ThrK` 坐标的 MMA Atom 实例**。这些 Atom 实例会处理同一个 C 区域的不同 K 分片，而不是让同一个 warp 多吃一倍 K。
-
-C 只看 M/N：
-
-```cpp
-thrfrg_C(ctensor) 使用 permutation_mnk<0>() 和 permutation_mnk<1>()
-```
-
-A 和 B 的整体分片才会看到 K 方向复制：
-
-```cpp
-thrfrg_A(atensor) 使用 permutation_mnk<0>() 和 permutation_mnk<2>()
-thrfrg_B(btensor) 使用 permutation_mnk<1>() 和 permutation_mnk<2>()
-```
-
-把 C/A/B 三个视角同时画出来会更清楚。
-
-先看 C。C 是累加结果，只由 M/N 定位，所以 K0 和 K1 的 MMA 都会累加到同一块 C tile 上：
-
-```text
-C 视角：(M,N)
-
-          N0        N1
-M0     C(0,0)    C(0,1)
-M1     C(1,0)    C(1,1)
-
-K0 层的 mma0/mma2/mma4/mma6 会累加到这些 C 块。
-K1 层的 mma1/mma3/mma5/mma7 也会累加到这些 C 块。
-区别只是它们各自吃不同的 K 分片。
-```
-
-A 是 `(M,K)` 视角，因此 **整个 TiledMMA** 会覆盖 M 方向复制和 K 方向复制：
-
-```text
-整个 TiledMMA 的 A 视角：(M,K)
-
-             K0        K1
-M0        A(0,0)    A(0,1)
-M1        A(1,0)    A(1,1)
-
-A(0,0) 供给 mma0 和 mma2，因为它们都是 M0、K0，只是 N 不同。
-A(0,1) 供给 mma1 和 mma3，因为它们都是 M0、K1，只是 N 不同。
-A(1,0) 供给 mma4 和 mma6。
-A(1,1) 供给 mma5 和 mma7。
-```
-
-但落到单个 Atom / warp 上时，不会同时拿 `K0` 和 `K1`：
-
-```text
-单个 Atom 的 A 视角：
-
-mma0: A(M0,K0)，大小仍是 16 x 16
-mma1: A(M0,K1)，大小仍是 16 x 16
-mma4: A(M1,K0)，大小仍是 16 x 16
-mma5: A(M1,K1)，大小仍是 16 x 16
-
-也就是说，K0 和 K1 是两个不同 Atom 实例的坐标，不是一个 warp 内部的两个 K。
-```
-
-B 是 `(N,K)` 视角，因此 **整个 TiledMMA** 会覆盖 N 方向复制和 K 方向复制：
-
-```text
-整个 TiledMMA 的 B 视角：(N,K)
-
-             K0        K1
-N0        B(0,0)    B(0,1)
-N1        B(1,0)    B(1,1)
-
-B(0,0) 供给 mma0 和 mma4，因为它们都是 N0、K0，只是 M 不同。
-B(0,1) 供给 mma1 和 mma5，因为它们都是 N0、K1，只是 M 不同。
-B(1,0) 供给 mma2 和 mma6。
-B(1,1) 供给 mma3 和 mma7。
-```
-
-单个 Atom / warp 仍然只看其中一个 K slice：
-
-```text
-单个 Atom 的 B 视角：
-
-mma0: B(N0,K0)，大小仍是 8 x 16
-mma1: B(N0,K1)，大小仍是 8 x 16
-mma2: B(N1,K0)，大小仍是 8 x 16
-mma3: B(N1,K1)，大小仍是 8 x 16
-```
-
-![示例图](/blog-assets/gpu-programming/cute-mma-atom/figure2.png)
-
-所以 K 方向的 `AtomLayoutMNK` 可以这样记：
-
-| 视角 | 会用到哪些 AtomLayout 维度 | 原因 |
-| --- | --- | --- |
-| C / D | M、N | C 是输出累加器，逻辑坐标是 `(M,N)`。 |
-| A | M、K | A 参与乘法的逻辑坐标是 `(M,K)`。 |
-| B | N、K | B 参与乘法的逻辑坐标是 `(N,K)`。 |
-
-所以从数据流上看：
-
-```mermaid
-flowchart TD
-    A["M/N 方向复制 MMA Atom"] --> C["C/D 覆盖更大的 M/N 区域"]
-    B["K 方向复制 MMA Atom"] --> D["增加 ThrK 坐标的 Atom 实例"]
-    D --> E["每个 Atom 仍只处理一个 AtomK"]
-    D --> F["不同 ThrK 的 Atom 累加到同一个 C/D 区域"]
-```
-
-实际工程里是否显式复制 K，要看 mainloop 如何组织 A/B fragment、累加器和归约。它不是单独改一个 `_2` 就自动更快的参数。
-
-
-### `PermutationMNK` 怎么理解
-
-如果说 `AtomLayoutMNK` 决定“复制多少个 Atom、这些副本怎么分配给线程”，那么 `PermutationMNK` 决定的是：**M/N/K 逻辑维度在被 `logical_divide` 之前，按什么 tiler 或 layout 重新切开**。
-
-源码里默认值是：
-
-```cpp
-Tile<Underscore, Underscore, Underscore>
-```
-
-`TiledMMA::permutation_mnk<I>()` 的逻辑是：
-
-```cpp
-auto perm = get<I>(PermutationMNK{});
-return conditional_return(
-    is_underscore<decltype(perm)>{},
-    size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk()),
-    perm
-);
-```
-
-也就是说：
-
-- 如果第 `I` 个 permutation 是 `_`，CuTe 就用自然大小：`AtomShape_MNK[I] * 对应线程复制数`。
-- 如果第 `I` 个 permutation 是一个整数 tiler，例如 `_32`，CuTe 就按这个大小切分该逻辑维度。
-- 如果第 `I` 个 permutation 是一个 layout，CuTe 就用这个 layout 作为该维度的重排规则。
-
-然后 `thrfrg_C/A/B` 会先使用 permutation 做 `logical_divide`：
-
-```cpp
-// C 是 (M,N) 视角，所以用 M/N 两个 permutation。
-auto t_tile = make_tile(permutation_mnk<0>(),
-                        permutation_mnk<1>());
-auto t_tensor = logical_divide(ctensor, t_tile);
-
-// A 是 (M,K) 视角，所以用 M/K。
-auto t_tile = make_tile(permutation_mnk<0>(),
-                        permutation_mnk<2>());
-auto t_tensor = logical_divide(atensor, t_tile);
-
-// B 是 (N,K) 视角，所以用 N/K。
-auto t_tile = make_tile(permutation_mnk<1>(),
-                        permutation_mnk<2>());
-auto t_tensor = logical_divide(btensor, t_tile);
-```
-
-可以用一张图理解：
-
-```mermaid
-flowchart TD
-    A["原始 C tensor<br/>(M,N)"] --> B["PermutationMNK<br/>选择 M/N 的切分或重排方式"]
-    B --> C["按 AtomShape_MNK<br/>切成单个 Atom 大小"]
-    C --> D["AtomLayoutC_TV<br/>变成单 Atom 内部的 (ThrV, FrgV)"]
-    D --> E["AtomLayoutMNK<br/>再按 ThrM/ThrN 分给不同 Atom 副本"]
-```
-
-更具体一点，假设基础 Atom 是 `16x8x16`，`AtomLayoutMNK = Shape<2,2,1>`。
-
-默认 `PermutationMNK = Tile<_,_,_>` 时：
-
-```text
-M permutation = 16 * 2 = 32
-N permutation =  8 * 2 = 16
-K permutation = 16 * 1 = 16
-
-C 先被看成 32 x 16 的 tile：
-
-        N: 16
-   +----------------+
- M | Atom00 Atom01  |
-:32| Atom10 Atom11  |
-   +----------------+
-```
-
-如果 `AtomLayoutMNK = Shape<2,2,2>`，默认 permutation 会变成：
-
-```text
-M permutation = 16 * 2 = 32
-N permutation =  8 * 2 = 16
-K permutation = 16 * 2 = 32
-```
-
-这表示 **TiledMMA 的整体 logical tile** 是 `32x16x32`。它不是单个 warp 的形状；单个 SM80 Atom 仍然是 `16x8x16`。
-
-这时 C/A/B 的 `logical_divide` 整体视角分别是：
-
-```text
-C 视角：logical_divide(C, make_tile(M=32, N=16))
-
-        N: 16
-   +----------------+
- M | C tile         |
-:32| 覆盖 M/N       |
-   +----------------+
-
-C 不直接看 K，所以 K permutation 不进入 thrfrg_C 的 t_tile。
-```
-
-```text
-A 视角：logical_divide(A, make_tile(M=32, K=32))
-
-        K: 32
-       K0-slice     K1-slice
-   +------------+------------+
- M | A(M0,K0)   | A(M0,K1)   |
-:32| A(M1,K0)   | A(M1,K1)   |
-   +------------+------------+
-
-A 会同时使用 M permutation 和 K permutation。
-这里的 K=32 是整个 TiledMMA 的 logical tile K。
-partition 到某个 `ThrK` 坐标之后，单个 Atom / warp 仍然只拿一个 16-wide K slice。
-```
-
-```text
-B 视角：logical_divide(B, make_tile(N=16, K=32))
-
-        K: 32
-       K0-slice     K1-slice
-   +------------+------------+
- N | B(N0,K0)   | B(N0,K1)   |
-:16| B(N1,K0)   | B(N1,K1)   |
-   +------------+------------+
-
-B 会同时使用 N permutation 和 K permutation。
-这里的 K=32 也是整个 TiledMMA 的 logical tile K。
-partition 到某个 `ThrK` 坐标之后，单个 Atom / warp 仍然只拿一个 16-wide K slice。
-```
-
-把 `thrfrg_A/B/C` 对应起来就是：
-
-| 接口 | 输入逻辑平面 | 使用的 permutation | K 维是否参与 |
-| --- | --- | --- | --- |
-| `thrfrg_C` | `(M,N)` | `permutation_mnk<0>()`、`permutation_mnk<1>()` | 不参与。 |
-| `thrfrg_A` | `(M,K)` | `permutation_mnk<0>()`、`permutation_mnk<2>()` | 参与。 |
-| `thrfrg_B` | `(N,K)` | `permutation_mnk<1>()`、`permutation_mnk<2>()` | 参与。 |
-
-所以只看 C 图会误解 K 方向。K 方向的 `AtomLayoutMNK` 和 `PermutationMNK` 主要体现在 A/B 的整体分片上；落到单个 warp 时，仍然是一个 AtomK。最终效果是多个 `ThrK` 上的 Atom 实例对同一块 C 做累加。
-
-如果显式写：
-
-```cpp
-auto mma = cute::make_tiled_mma(
-    cute::SM80_16x8x16_F32F16F16F32_TN{},
-
-    // 复制 2x2 个 Atom。
-    cute::Layout<cute::Shape<cute::_2, cute::_2>,
-                 cute::Stride<cute::_2, cute::_1>>{},
-
-    // M/N/K 三个逻辑维度分别使用指定 tiler。
-    cute::Tile<cute::_32, cute::_16, cute::_16>{});
-```
-
-这个 `Tile<_32,_16,_16>` 和默认自然大小相同，所以它主要是把默认行为显式写出来。
-
-但 `PermutationMNK` 不要求一定等于这个自然大小。CUTLASS tutorial 里有一个很典型的 SM80 例子：
-
-```cpp
-TiledMMA mmaC = make_tiled_mma(
-    SM80_16x8x16_F16F16F16F16_TN{},
-
-    // 复制 2x2x1 个 MMA Atom。
-    // 基础 Atom 是 16x8x16，所以按 AtomLayout 自然推导是 32x16x16。
-    Layout<Shape<_2,_2>>{},
-
-    // 这里显式要求 logical tile 按 32x32x16 来切。
-    // N=32 大于自然推导出来的 N=16，这是为了配合后面的 LDSM 分片。
-    Tile<_32,_32,_16>{});
-```
-
-这段代码里最容易困惑的是：`AtomLayoutMNK` 的 N 方向只有 `_2`，基础 Atom 的 N 是 `_8`，自然覆盖应该是：
-
-```text
-N 自然大小 = AtomN * ThrN = 8 * 2 = 16
-```
-
-但第三个参数写了：
-
-```text
-PermutationN = 32
-```
-
-这不是矛盾。原因是 `PermutationMNK` 不是“Atom 副本数量”，而是 `logical_divide` 的外层 tiler。源码流程是：
-
-```cpp
-// 先按 permutation 把 C 看成 32x32 的逻辑 tile。
-auto t_tile = make_tile(permutation_mnk<0>(),
-                        permutation_mnk<1>());
-auto t_tensor = logical_divide(ctensor, t_tile);
-
-// 再按单个 Atom 的 16x8 把这个 tile 切成 Atom 子块。
-auto c_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})),
-                        make_layout(size<1>(AtomShape_MNK{})));
-auto c_tensor = zipped_divide(t_tensor, c_tile);
-
-// 最后再按 Atom 内部 TV layout 和 AtomLayoutMNK 分给线程。
-```
-
-所以这个例子的 C 视角可以画成：
-
-```text
-PermutationMNK 给出的 C logical tile：32x32
-
-                     N: 32
-           8        8        8        8
-      +--------+--------+--------+--------+
-M 16  | Atom00 | Atom01 | Atom02 | Atom03 |
-      +--------+--------+--------+--------+
-  16  | Atom10 | Atom11 | Atom12 | Atom13 |
-      +--------+--------+--------+--------+
-
-单个 Atom 的 C 形状是 16x8。
-因此 32x32 会被切成 2 x 4 个 Atom-sized 子块。
-```
-
-而 `AtomLayoutMNK = Shape<2,2,1>` 只提供：
-
-```text
-线程副本布局里的 Atom 网格：2x2x1
-
-          N0      N1
-M0      mma0    mma1
-M1      mma2    mma3
-```
-
-两者合在一起后，可以理解成：
-
-```text
-PermutationN=32 产生 4 个 AtomN 子块。
-AtomLayout 的 ThrN=2 只把其中 2 个 N 方向副本直接映射到不同线程组。
-剩下的 N 方向分块不会凭空消失，而是留在 thrfrg_C 的 RestN / MMA_N 维度里。
-```
-
-这正好对应 tutorial kernel 里的注释形状：
-
-```cpp
-Tensor tCgC = thr_mma.partition_C(gC);                 // (MMA,MMA_M,MMA_N)
-Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0)); // (MMA,MMA_M,MMA_K)
-Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0)); // (MMA,MMA_N,MMA_K)
-Tensor tCrC = thr_mma.make_fragment_C(tCgC);           // (MMA,MMA_M,MMA_N)
-```
-
-也就是说，`Tile<_32,_32,_16>` 的 N=32 是让整个 `TiledMMA` 面向一个 `32x32x16` 的逻辑 MMA tile；`Layout<Shape<_2,_2>>{}` 只是说明线程层面的 Atom 副本怎么铺。二者可以不完全相等，差出来的部分会作为 fragment / rest 维度继续存在。
-
-对 A/B 来说也一样：
-
-```text
-A 视角使用 (M,K)：Tile<_32,_32,_16> 里的 M=32、K=16。
-B 视角使用 (N,K)：Tile<_32,_32,_16> 里的 N=32、K=16。
-```
-
-所以这个例子里 N=32 主要会反映在 B 的 `(N,K)` 分片和 C 的 `(M,N)` 累加器分片上。tutorial 注释里说 `32x32x16 Tiled MMA for LDSM`，意思就是让 MMA 分片形状和后续 `SM75_U32x4_LDSM_N` 的 shared-memory 到 register 加载方式更容易对齐。
-
-下面用一个完整例子把 `tCrA / tCrB / tCrC` 的形状推出来。这个例子里同时存在两个来源：
-
-- `Tile<_32,_32,_16>` 让 `TiledMMA_N = 32`，大于 `AtomLayoutMNK` 自然覆盖的 N=16。
-- CTA/shared-memory tile 的 `K=32`，大于一次 `TiledMMA` 的 `K=16`。
-
-例如：
-
-```text
-CTA Tile (M,N,K):        32, 32, 32
-A/B dtype:               cute::half_t
-C/Accumulator dtype:     float
-Static SMEM Bytes:       4096
-MMA Atom:                SM80_16x8x16_F32F16F16F32_TN
-MMA Atom Layout (M,N,K): 2, 2, 1
-TiledMMA Tile (M,N,K):   32, 32, 16
-MMA threads:             128
-```
-
-先看基础信息：
-
-```text
-AtomShape_MNK = 16 x 8 x 16
-AtomLayoutMNK =  2 x 2 x 1
-PermutationMNK / Tile = 32 x 32 x 16
-
-ThrM = 2
-ThrN = 2
-ThrK = 1
-```
-
-单个 Atom 内每个线程持有多少 value，可以从寄存器数量 / 逻辑元素数理解：
-
-```text
-A atom 元素数 = 16 * 16 = 256，32 个线程平均每线程 8 个 half
-B atom 元素数 =  8 * 16 = 128，32 个线程平均每线程 4 个 half
-C atom 元素数 = 16 *  8 = 128，32 个线程平均每线程 4 个 float
-```
-
-所以输出 shape 的第一个维度是：
-
-```text
-tCrA 的 MMA = 8
-tCrB 的 MMA = 4
-tCrC 的 MMA = 4
-```
-
-接下来按源码流程推导。
-
-#### `tCrA = (8, 1, 2)`
-
-`thrfrg_A` 处理的是 A 的 `(M,K)` 平面。源码第一步：
-
-```cpp
-auto t_tile = make_tile(permutation_mnk<0>(),
-                        permutation_mnk<2>());
-auto t_tensor = logical_divide(atensor, t_tile); // (PermM,PermK)
-```
-
-对 A 来说：
-
-```text
-sA shape = CTA_A = (M,K) = 32 x 32
-Permutation M/K = 32 x 16
-```
-
-所以：
-
-```text
-M 方向：32 / 32 = 1 个 TiledMMA-M 分片
-K 方向：32 / 16 = 2 个 TiledMMA-K 分片
-```
-
-第二步按单个 Atom 切：
-
-```cpp
-auto a_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})),
-                        make_layout(size<2>(AtomShape_MNK{})));
-auto a_tensor = zipped_divide(t_tensor, a_tile); // ((AtomM,AtomK),(RestM,RestK))
-```
-
-对 A 来说，单个 Atom 是：
-
-```text
-Atom A tile = (M,K) = 16 x 16
-```
-
-在一个 `32x16` 的 TiledMMA A tile 内：
-
-```text
-AtomM = 32 / 16 = 2
-AtomK = 16 / 16 = 1
-```
-
-第三步 `compose(AtomLayoutA_TV{}, _)` 把单个 Atom 内的 `(AtomM,AtomK)` 变成 `(ThrV,FrgV)`，这里每线程 `FrgV=8`。
-
-第四步按线程副本布局切：
-
-```cpp
-auto thr_tile = make_tile(_,
-                          make_tile(make_layout(size<1>(thr_layout_vmnk_)),
-                                    make_layout(size<3>(thr_layout_vmnk_))));
-auto thr_tensor = zipped_divide(tv_tensor, thr_tile);
-```
-
-对 A 来说用的是 `ThrM` 和 `ThrK`：
-
-```text
-ThrM = 2
-ThrK = 1
-```
-
-所以：
-
-```text
-MMA_M = AtomM / ThrM = 2 / 2 = 1
-MMA_K = CTA_K / TiledMMA_K = 32 / 16 = 2
-```
-
-因此：
-
-```cpp
-Tensor tCrA = thr_mma.partition_fragment_A(sA); // (MMA,MMA_M,MMA_K) = (8,1,2)
-```
-
-注意：这里的 `MMA_K=2` 来自 **CTA/shared-memory 的 K=32 比 TiledMMA_K=16 多一份**，不是单个 warp 的 `AtomK` 变成 2。
-
-#### `tCrB = (4, 2, 2)`
-
-`thrfrg_B` 处理的是 B 的 `(N,K)` 平面。源码第一步：
-
-```cpp
-auto t_tile = make_tile(permutation_mnk<1>(),
-                        permutation_mnk<2>());
-auto t_tensor = logical_divide(btensor, t_tile); // (PermN,PermK)
-```
-
-对 B 来说：
-
-```text
-sB shape = CTA_B = (N,K) = 32 x 32
-Permutation N/K = 32 x 16
-```
-
-所以：
-
-```text
-N 方向：32 / 32 = 1 个 TiledMMA-N 分片
-K 方向：32 / 16 = 2 个 TiledMMA-K 分片
-```
-
-第二步按单个 Atom 切：
-
-```cpp
-auto b_tile = make_tile(make_layout(size<1>(AtomShape_MNK{})),
-                        make_layout(size<2>(AtomShape_MNK{})));
-auto b_tensor = zipped_divide(t_tensor, b_tile); // ((AtomN,AtomK),(RestN,RestK))
-```
-
-对 B 来说，单个 Atom 是：
-
-```text
-Atom B tile = (N,K) = 8 x 16
-```
-
-在一个 `32x16` 的 TiledMMA B tile 内：
-
-```text
-AtomN = 32 / 8  = 4
-AtomK = 16 / 16 = 1
-```
-
-第三步 `compose(AtomLayoutB_TV{}, _)` 得到单个 Atom 内每线程 `FrgV=4`。
-
-第四步按线程副本布局切。对 B 来说用的是 `ThrN` 和 `ThrK`：
-
-```text
-ThrN = 2
-ThrK = 1
-```
-
-所以：
-
-```text
-MMA_N = AtomN / ThrN = 4 / 2 = 2
-MMA_K = CTA_K / TiledMMA_K = 32 / 16 = 2
-```
-
-因此：
-
-```cpp
-Tensor tCrB = thr_mma.partition_fragment_B(sB); // (MMA,MMA_N,MMA_K) = (4,2,2)
-```
-
-这里终于能看清楚：**`MMA_N=2` 和 `MMA_K=2` 来自不同原因**。
-
-- `MMA_N=2`：`Tile` 让 `TiledMMA_N=32`，而 `AtomN * ThrN = 8 * 2 = 16`，所以 N 方向还剩两份。
-- `MMA_K=2`：CTA/shared-memory 的 `K=32`，而 `TiledMMA_K=16`，所以 K 方向还剩两份。
-
-#### `tCrC = (4, 1, 2)`
-
-`thrfrg_C` 处理的是 C 的 `(M,N)` 平面。源码第一步：
-
-```cpp
-auto t_tile = make_tile(permutation_mnk<0>(),
-                        permutation_mnk<1>());
-auto t_tensor = logical_divide(ctensor, t_tile); // (PermM,PermN)
-```
-
-对 C 来说：
-
-```text
-sC / gC shape = CTA_C = (M,N) = 32 x 32
-Permutation M/N = 32 x 32
-```
-
-所以 C 没有额外的 CTA 外层分片：
-
-```text
-M 方向：32 / 32 = 1
-N 方向：32 / 32 = 1
-```
-
-第二步按单个 Atom 切：
-
-```cpp
-auto c_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})),
-                        make_layout(size<1>(AtomShape_MNK{})));
-auto c_tensor = zipped_divide(t_tensor, c_tile); // ((AtomM,AtomN),(RestM,RestN))
-```
-
-对 C 来说，单个 Atom 是：
-
-```text
-Atom C tile = (M,N) = 16 x 8
-```
-
-在一个 `32x32` 的 TiledMMA C tile 内：
-
-```text
-AtomM = 32 / 16 = 2
-AtomN = 32 / 8  = 4
-```
-
-第三步 `compose(AtomLayoutC_TV{}, _)` 得到单个 Atom 内每线程 `FrgV=4`。
-
-第四步按线程副本布局切。对 C 来说用的是 `ThrM` 和 `ThrN`：
-
-```text
-ThrM = 2
-ThrN = 2
-```
-
-所以：
-
-```text
-MMA_M = AtomM / ThrM = 2 / 2 = 1
-MMA_N = AtomN / ThrN = 4 / 2 = 2
-```
-
-因此：
-
-```cpp
-Tensor tCrC = thr_mma.partition_fragment_C(sC); // (MMA,MMA_M,MMA_N) = (4,1,2)
-```
-
-这也解释了为什么 `tCrC` 没有 `MMA_K`：C 是 `(M,N)` 平面，K 只通过 A/B 的多段乘加累加到 C。
-
-把结果汇总一下：
-
-```cpp
-Tensor tCrA = thr_mma.partition_fragment_A(sA); // (MMA,MMA_M,MMA_K) = (8,1,2)
-Tensor tCrB = thr_mma.partition_fragment_B(sB); // (MMA,MMA_N,MMA_K) = (4,2,2)
-Tensor tCrC = thr_mma.partition_fragment_C(sC); // (MMA,MMA_M,MMA_N) = (4,1,2)
-```
-
-可以这样画：
-
-```text
-sA 视角：CTA A tile = (M,K) = 32 x 32
-
-          TiledMMA_K0      TiledMMA_K1
-          K: 0..15         K: 16..31
-       +---------------+---------------+
-M 0..31|   A tile 0    |   A tile 1    |
-       +---------------+---------------+
-
-TiledMMA_K = 16
-CTA_K      = 32
-所以当前线程的 A fragment 上出现 MMA_K = 2。
-```
-
-```text
-sB 视角：CTA B tile = (N,K) = 32 x 32
-
-          TiledMMA_K0      TiledMMA_K1
-          K: 0..15         K: 16..31
-       +---------------+---------------+
-N 0..31|   B tile 0    |   B tile 1    |
-       +---------------+---------------+
-
-同时因为 TiledMMA_N = 32，而 AtomLayout 的自然 N 线程副本只有一部分直接覆盖，
-B fragment 里还可能出现 MMA_N = 2。
-```
-
-所以 `MMA_M / MMA_N / MMA_K > 1` 可能有两个来源：
-
-| 来源 | 含义 | 例子 |
-| --- | --- | --- |
-| `PermutationMNK` / `Tile` 比自然覆盖更大 | `logical_divide` 先把一个更大的 logical tile 切开，差出来的部分进入 rest / fragment 维度。 | `Tile<_32,_32,_16>` 中 N=32 大于自然 N=16。 |
-| 被 partition 的 tensor 比 `TiledMMA` tile 更大 | CTA/shared-memory tile 本身包含多个 TiledMMA tile，`partition_fragment_*` 会把这些分片保留下来。 | `CTA_K=32`、`TiledMMA_K=16`，所以 `MMA_K=2`。 |
-
-这也是为什么 tutorial 里常见：
-
-```cpp
-Tensor tCrA = thr_mma.partition_fragment_A(sA(_,_,0)); // 只取一个 pipeline stage，但仍可能含多个 MMA_K
-Tensor tCrB = thr_mma.partition_fragment_B(sB(_,_,0));
-```
-
-如果传入的 `sA(_,_,0)` 形状是 CTA 级 `(M,K) = 32x32`，而 `TiledMMA` 的 K tile 是 16，那么 `tCrA` 的第三维自然就是两个 K 分片。
-
-所以可以把二者分开记：
-
-| 参数 | 改变什么 | 不改变什么 |
-| --- | --- | --- |
-| `AtomLayoutMNK` | 增加 TiledMMA 中 Atom 实例的 `(ThrM,ThrN,ThrK)` 排列。 | 不改变单个 warp / 单个 Atom 的 `Shape_MNK`。 |
-| `PermutationMNK` / `Tile` | 改变 `logical_divide` 面向的 M/N/K logical tile，可能增加 fragment / rest 维度上的工作量。 | 仍然不改变硬件 MMA 指令本身的 `Shape_MNK`。 |
-
-因此，`AtomLayoutMNK` 写成 `Shape<_2,_2,_2>` 时，一个 warp 的 A/B 视角仍然只有一个 `AtomK`；如果人为把 `Tile` 写得更大，比如把某个维度从自然大小扩到两倍，增加的是 TiledMMA 分解出来的 logical tile / fragment 工作量，而不是把单条 `mma.sync` 指令变大。
-
-真正有差异的是某一维给一个 layout。例如：
-
-```cpp
-auto mma = cute::make_tiled_mma(
-    cute::SM80_16x8x16_F32F16F16F32_TN{},
-
-    // 仍然复制 2x2 个 Atom。
-    cute::Layout<cute::Shape<cute::_2, cute::_2>,
-                 cute::Stride<cute::_2, cute::_1>>{},
-
-    cute::Tile<
-        // M 维不按简单连续的 32 个元素切，而是按一个 4x8 的 layout 重排。
-        cute::Layout<cute::Shape<cute::_4, cute::_8>,
-                     cute::Stride<cute::_1, cute::_4>>,
-
-        // N/K 维仍然使用简单 tiler。
-        cute::_16,
-        cute::_16>{});
-```
-
-示意图可以这样看：
-
-```text
-没有 M permutation layout 时：
-
-M 维逻辑顺序：
-0, 1, 2, 3, 4, 5, 6, 7, ... , 31
-
-给 M 维一个 Layout<Shape<_4,_8>, Stride<_1,_4>> 后：
-
-M 维先被看成 4 x 8 的二维坐标：
-
-列0   列1   列2   列3   ...   列7
- 0     4     8    12          28
- 1     5     9    13          29
- 2     6    10    14          30
- 3     7    11    15          31
-
-后续 thrfrg_C / thrfrg_A 会沿这个重排后的 M 维继续分给 Atom 和线程。
-```
-
-因此，`PermutationMNK` 不是“复制 Atom”，它控制的是 **逻辑矩阵维度如何被切分和重排**。复制 Atom 是 `AtomLayoutMNK` 的职责。
-
-这就是为什么第三个参数非常重要。它不是简单“目标 tile shape”，而是告诉 `TiledMMA`：**这个逻辑维度先按什么布局重排，再参与 `thrfrg_A/B/C` 的分解**。
-
-### `cute::Tile` 是什么
-
-源码里 `Tile` 的定义很简单：
-
-```cpp
-template <class... Layouts>
-using Tile = cute::tuple<Layouts...>;
-```
-
-所以 `cute::Tile<A, B, C>` 本质上是一个 tuple-like 容器，用来把 M/N/K 三个 mode 的 tiler 或 permutation 放在一起。
-
-这解释了两个容易混淆的写法：
-
-```cpp
-cute::Tile<cute::_32, cute::_32, cute::_4>{}
-```
-
-这表示 M/N/K 三个维度分别给一个简单大小。可以理解为没有复杂重排，只是指定每个 mode 的 tiler 大小。
-
-```cpp
-cute::Tile<
-    cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_2>,
-                 cute::Stride<cute::_1, cute::_8, cute::_4>>,
-    cute::_32,
-    cute::_4>{}
-```
-
-这表示：
-
-- M 维不是简单 `_32`，而是一个带 shape/stride 的 layout permutation。
-- N 维是简单 `_32`。
-- K 维是简单 `_4`。
-
-所以 `Tile<_32,_32,_4>` 更像“每个维度给自然大小”，而 `Tile<Layout<...>, _32, _4>` 是“某个维度要按指定 layout 重排”。
-
-再强调一次：`cute::Tile` 和 `cute::Shape` 的语义不一样。
-
-| 写法 | 更接近的含义 |
-| --- | --- |
-| `Shape<_32,_32,_4>` | 一个对象的形状大小。 |
-| `Tile<_32,_32,_4>` | 三个 mode 的 tiler / permutation 组合。 |
-| `Tile<Layout<...>, _32, _4>` | M 维使用 layout 重排，N/K 使用简单 tiler。 |
-
-因此，在 `make_tiled_mma` 的第三个参数里看到 `Tile<_32,_32,_4>` 时，不要只把它理解成“目标 tile shape”。从源码接口看，它是 `PermutationMNK`，只是当每个 mode 都是简单整数时，看起来很像普通 tile shape。
-
-**构造参数 / 成员变量**
-
-| 成员 | 类型 | 含义 |
-| --- | --- | --- |
-| `thr_layout_vmnk_` | `ThrLayoutVMNK` | `tiled_product(AtomThrID{}, AtomLayoutMNK{})` 的结果，描述线程到 `(V,M,N,K)` 的映射。 |
-
-**重要接口**
-
-| 接口 | 含义 |
-| --- | --- |
-| `get_thr_layout_vmnk()` | 返回线程布局。 |
-| `thrfrg_C(ctensor)` | 把 `(M,N,...)` 的 tensor/layout 分解成 `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN,...)))`。 |
-| `thrfrg_A(atensor)` | 把 `(M,K,...)` 的 tensor/layout 分解成线程和 fragment 视角。 |
-| `thrfrg_B(btensor)` | 把 `(N,K,...)` 的 tensor/layout 分解成线程和 fragment 视角。 |
-| `get_slice(thr_idx)` | 返回某个线程的 `ThrMMA` 视角。 |
-| `get_layoutA_TV/B_TV/C_TV()` | 返回可视化和调试用的 `(thread,value)` layout。 |
-
-### `make_tiled_mma`
-
-**用途**
-
-`make_tiled_mma` 是构造 `TiledMMA` 的便捷函数。它可以接收一个 `MMA_Atom`，也可以直接接收一个 Operation，然后内部自动包成 `MMA_Atom`。
-
-**源码摘录**
-
-```cpp
+/**
+ * @brief 从已构造的 Atom 创建 TiledMMA。
+ *
+ * @tparam MMA_Op Atom 内封装的 Operation 类型。
+ * @tparam MMAThrLayout Atom 副本在线程编号空间的布局类型。
+ * @tparam Permutations M/N/K 三维的 tiler 类型。
+ * @param mma_atom 基础 Atom；其 Traits 状态会复制到返回对象。
+ * @param thr_layout Atom 副本的布局；rank 不足 3 时在末尾补单元素 mode。
+ * @param permutations 三维 tiler；不足 3 个 mode 时在末尾补 _。
+ * @return TiledMMA<MMA_Atom<MMA_Op>, 补维后的布局类型, 补维后的 tiler 类型>。
+ */
 template <class MMA_Op,
           class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
           class Permutations = Tile<Underscore,Underscore,Underscore>>
-CUTE_HOST_DEVICE constexpr
-auto
+CUTE_HOST_DEVICE constexpr auto
 make_tiled_mma(MMA_Atom<MMA_Op> const& mma_atom,
-               MMAThrLayout     const& thr_layout   = {},
-               Permutations     const& permutations = {});
-
-template <class MMA_Op,
-          class MMAThrLayout = Layout<Shape<_1,_1,_1>>,
-          class Permutations = Tile<Underscore,Underscore,Underscore>>
-CUTE_HOST_DEVICE constexpr
-auto
-make_tiled_mma(MMA_Op       const&,
-               MMAThrLayout const& thr_layout   = {},
-               Permutations const& permutations = {});
+               MMAThrLayout const& thr_layout = {},
+               Permutations const& permutations = {})
+{
+  auto thr_layout_mnk  = append<3>(thr_layout, Layout<_1,_0>{});
+  auto permutation_mnk = append<3>(permutations, _);
+  return TiledMMA<MMA_Atom<MMA_Op>,
+                  decltype(thr_layout_mnk),
+                  decltype(permutation_mnk)>{mma_atom, thr_layout_mnk};
+}
 ```
 
-**参数**
+另一个重载可以直接传 `MMA_Op{}`：它先构造 `MMA_Atom<MMA_Op>{}`，再调用上面的重载。若需要保留一个有状态 Atom 的配置，应传入那个 Atom 对象，而不是只传 Operation 类型。
 
-| 参数 | 类型 | 含义 |
-| --- | --- | --- |
-| `mma_atom` / `MMA_Op` | `MMA_Atom<MMA_Op>` 或 Operation | 基础 MMA Atom 或可被包装成 Atom 的 Operation。 |
-| `thr_layout` | `MMAThrLayout` | Atom 在 M/N/K 方向上的线程复制布局；不足 rank-3 时源码用 `append<3>` 补齐。 |
-| `permutations` | `Permutations` | M/N/K 维度上的 permutation；默认使用 `_` 表示按 Atom 和线程布局自然推导。 |
+### `AtomLayoutMNK` 与 `PermutationMNK` 各管什么
 
-**返回值**
+`AtomLayoutMNK` 的 shape 给出 `(ThrM,ThrN,ThrK)` 各有多少个副本；stride 决定这些副本对应的**线程编号顺序**，不是 A/B/C Tensor 的内存 stride。例如 SM80 `16×8×16` Atom 使用 32 个线程，传入 `Layout<Shape<_2,_2>, Stride<_2,_1>>{}` 后，辅助函数补成 `(2,2,1):(2,1,0)`。它用四组线程铺 M/N：N 坐标变化一次，副本编号加 1；M 坐标变化一次，副本编号加 2。
 
-返回一个 `TiledMMA<MMA_Atom<MMA_Op>, ...>` 对象。
+`PermutationMNK` 作用在**数据的逻辑坐标**上。源码的两个查询接口是：
 
-### `thr_layout` 与 `permutations` 的关系
+```cpp
+/**
+ * @brief 取得第 I 个 M/N/K 逻辑 mode 的 tiler。
+ *
+ * @tparam I 逻辑 mode 编号：0=M、1=N、2=K。
+ * @return 显式指定的 tiler；若该项是 _，返回 Atom 大小乘对应副本数。
+ */
+template <int I>
+CUTE_HOST_DEVICE constexpr auto
+permutation_mnk() const {
+  static_assert(0 <= I && I < 3);
+  auto perm = get<I>(PermutationMNK{});
+  return conditional_return(
+      is_underscore<decltype(perm)>{},
+      size<I>(AtomShape_MNK{}) * size<I+1>(get_thr_layout_vmnk()),
+      perm);
+}
 
-这两个参数经常一起出现，但职责完全不同。
+/**
+ * @brief 查询第 I 个逻辑 mode 的 tiler 大小。
+ *
+ * @tparam I 逻辑 mode 编号：0=M、1=N、2=K。
+ * @return size(permutation_mnk<I>())；可能是自然大小，也可能是显式大小。
+ */
+template <int I>
+CUTE_HOST_DEVICE constexpr auto
+tile_size_mnk() const {
+  static_assert(0 <= I && I < 3);
+  return size(permutation_mnk<I>());
+}
+```
 
-| 参数 | 回答的问题 | 影响对象 |
-| --- | --- | --- |
-| `thr_layout` | “我要复制多少个 Atom？这些 Atom 的线程组怎么编号？” | 影响 `ThrLayoutVMNK` 和线程数量。 |
-| `permutations` | “M/N/K 逻辑坐标在被分块前要不要重排？” | 影响 `permutation_mnk<I>()` 和 `thrfrg_A/B/C` 的分解结果。 |
+默认 `Tile<_,_,_>` 时，自然 tile 大小是 `AtomShape_MNK × (ThrM,ThrN,ThrK)`。例如上面的 `16×8×16` Atom 与 `2×2×1` 副本给出 `(32,16,16)`。显式传 `Tile<_32,_32,_16>` 时，N 的 tiler 扩成 32，但线程副本仍只有 `ThrN=2`；多出的 N 子块留在每线程的 fragment/rest mode 中，**不会额外生成线程**。若某一项是 `Layout<...>`，它还可以指定该维度的重排顺序，而不仅是大小。
 
-一个实用判断：
+### `thrfrg_A/B/C` 怎样改写输入 layout
 
-- 想增加参与计算的线程组数量，改 `thr_layout`。
-- 想改变每个线程拿到的 fragment 在逻辑矩阵中的连续性，改 `permutations`。
+三个接口都要求输入至少 rank-2，可以接收 `Layout` 或 `Tensor`：A 的前两维是 `(M,K)`，B 是 `(N,K)`，C 是 `(M,N)`。返回值与输入同类：传 Layout 得到新 Layout；传 Tensor 得到**共享原数据指针、换了 layout 的 Tensor 视图**，不复制元素。具体是否能满足 tiler 的静态形状与布局约束，要由 `logical_divide` 等布局运算检查。
+
+| 接口 | 逻辑输入 | 第一步选用的 tiler | 单 Atom 的二维 tile | 副本线程维 |
+| --- | --- | --- | --- | --- |
+| `thrfrg_A(atensor)` | `(M,K,...)` | `permutation_mnk<0/2>()` | `(AtomM,AtomK)` | `(ThrM,ThrK)` |
+| `thrfrg_B(btensor)` | `(N,K,...)` | `permutation_mnk<1/2>()` | `(AtomN,AtomK)` | `(ThrN,ThrK)` |
+| `thrfrg_C(ctensor)` | `(M,N,...)` | `permutation_mnk<0/1>()` | `(AtomM,AtomN)` | `(ThrM,ThrN)` |
+
+以 A 为例，下面保留完整的布局处理主体。四步的顺序是：按 permutation 切分 → 按单个 Atom 的 M/K 大小切分 → 用 Atom 的 `ALayout` 换成 `(ThrV,FrgV)` → 把 M/K 副本分给 `ThrM/ThrK`。
+
+```cpp
+/**
+ * @brief 把 A 的 (M,K,...) layout 改写为线程/fragment layout。
+ *
+ * @tparam ATensor 输入 Layout 或 Tensor 的类型。
+ * @param atensor 前两维为 (M,K) 的对象；若是 Tensor，返回视图借用其数据。
+ * @return 形状约为 ((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK,...))) 的
+ *         Layout 或 Tensor；第一大 mode 是线程，第二大 mode 是 fragment。
+ */
+template <class ATensor>
+CUTE_HOST_DEVICE constexpr auto
+thrfrg_A(ATensor&& atensor) const
+{
+  CUTE_STATIC_ASSERT_V(rank(atensor) >= Int<2>{});
+
+  auto t_tile = make_tile(permutation_mnk<0>(), permutation_mnk<2>());
+  auto t_tensor = logical_divide(atensor, t_tile);
+
+  auto a_tile = make_tile(make_layout(size<0>(AtomShape_MNK{})),
+                          make_layout(size<2>(AtomShape_MNK{})));
+  auto a_tensor = zipped_divide(t_tensor, a_tile);
+
+  auto tv_tensor = a_tensor.compose(AtomLayoutA_TV{}, _);
+
+  auto thr_tile = make_tile(
+      _,
+      make_tile(make_layout(size<1>(thr_layout_vmnk_)),
+                make_layout(size<3>(thr_layout_vmnk_))));
+  auto thr_tensor = zipped_divide(tv_tensor, thr_tile);
+  return thr_tensor;
+}
+```
+
+`logical_divide` 先把 M/K 分成一个 permutation tile 和剩余区域；`zipped_divide` 再把**单 Atom 内的** `(AtomM,AtomK)` 收到同一个 mode。`compose(AtomLayoutA_TV{}, _)` 用 Traits 给出的 `(ThrV,FrgV) → (AtomM,AtomK)` 映射替换单 Atom 坐标。最后一次 `zipped_divide` 才出现 `(ThrM,ThrK)`。返回的线程 mode **仍是自由维度**，尚未代入任何 `thread_id`。
+
+B、C 的实现遵循同样四步，只替换维度与 Traits layout；下面是对应接口签名的 Doxygen 摘要，具体实现与 A 对照阅读：
+
+```cpp
+/**
+ * @brief 把 B 的 (N,K,...) layout 改写为线程/fragment layout。
+ *
+ * @tparam BTensor 输入 Layout 或 Tensor 的类型。
+ * @param btensor 前两维为 (N,K) 的对象；Tensor 情况下不复制数据。
+ * @return 形状约为 ((ThrV,(ThrN,ThrK)),(FrgV,(RestN,RestK,...))) 的
+ *         Layout 或 Tensor。
+ */
+template <class BTensor>
+CUTE_HOST_DEVICE constexpr auto thrfrg_B(BTensor&& btensor) const;
+
+/**
+ * @brief 把 C 的 (M,N,...) layout 改写为线程/fragment layout。
+ *
+ * @tparam CTensor 输入 Layout 或 Tensor 的类型。
+ * @param ctensor 前两维为 (M,N) 的对象；Tensor 情况下不复制数据。
+ * @return 形状约为 ((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN,...))) 的
+ *         Layout 或 Tensor；不含 ThrK。
+ */
+template <class CTensor>
+CUTE_HOST_DEVICE constexpr auto thrfrg_C(CTensor&& ctensor) const;
+```
+
+这两段**仅是接口签名与新增注释，不是两个函数的完整定义**。B 在源码中改用 `AtomLayoutB_TV`、`ThrN/ThrK`；C 改用 `AtomLayoutC_TV`、`ThrM/ThrN`。尤其注意：C 的 layout 不含 K 副本坐标，A 不含 N，B 不含 M。
+
+### `get_slice(thread_id)`：从线程编号到分区坐标
+
+`get_slice` 本身**不接收 A/B/C Tensor，也不划分数据**。它先对 `ThrLayoutVMNK` 做坐标反查，然后把完整的 `TiledMMA` 配置和该线程坐标放入一个 `ThrMMA` 对象。`get_thread_slice` 只是同义转发：
+
+```cpp
+/**
+ * @brief 由线程编号取得该线程的 MMA 分区对象。
+ *
+ * @tparam ThrIdx 整数线程编号类型。
+ * @param thr_idx 当前线程在 ThrLayoutVMNK 中的编号。
+ * @return ThrMMA<TiledMMA, decltype(thr_vmnk)>；对象内保存
+ *         (ThrV,ThrM,ThrN,ThrK)，尚未绑定输入 Tensor。
+ */
+template <class ThrIdx,
+          __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
+CUTE_HOST_DEVICE constexpr auto
+get_slice(ThrIdx const& thr_idx) const
+{
+  auto thr_vmnk = thr_layout_vmnk_.get_flat_coord(thr_idx);
+  return ThrMMA<TiledMMA, decltype(thr_vmnk)>{*this, thr_vmnk};
+}
+
+/**
+ * @brief get_slice 的同义接口。
+ *
+ * @tparam ThrIdx 整数线程编号类型。
+ * @param thr_idx 当前线程编号。
+ * @return 与 get_slice(thr_idx) 相同的 ThrMMA 对象。
+ */
+template <class ThrIdx,
+          __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
+CUTE_HOST_DEVICE constexpr auto
+get_thread_slice(ThrIdx const& thr_idx) const
+{
+  return get_slice(thr_idx);
+}
+```
+
+`get_flat_coord` 计算满足当前线程 layout 的**扁平四维逻辑坐标**；它不是简单把编号按 M/N/K 连续取模，更不能无视 `AtomLayoutMNK` 的 stride。调用者应传入布局覆盖的有效线程编号，源码在此没有额外运行时越界检查。返回对象按值保存 `TiledMMA` 配置与线程坐标；这一步不创建 A/B/C fragment，也不复制 Tensor 数据。
+
+以 `SM80_16x8x16_F16F16F16F16_TN`、`Layout<Shape<_2,_2>,Stride<_2,_1>>` 为例，补 K mode 后线程布局可读作 `(ThrV,ThrM,ThrN,ThrK):(1,64,32,0)`，其中 `ThrV` 为 0–31，`ThrM/ThrN` 各为 0–1，`ThrK` 只有 0。于是 `thread_id=37` 反查为 `(ThrV,ThrM,ThrN,ThrK)=(5,0,1,0)`。如果把副本 stride 换成 `Stride<_1,_2>`，相同的 37 会落在不同的 M/N 副本上。
+
+接下来才由 `ThrMMA::partition_*` 固定线程 mode。为了看清“传具体线程 ID 去划分”，这里提前摘录这三个接口的**坐标选择**；完整 `ThrMMA` 实现留待下一节：
+
+| 调用 | 从 `thr_vmnk_` 取出的线程坐标 | 忽略的副本维度 | 返回的每线程 Tensor 形状 |
+| --- | --- | --- | --- |
+| `partition_A(A)` | `(ThrV,(ThrM,ThrK))` | `ThrN`：同 M/K、同 Atom lane 的 N 副本可共用 A。 | `(FrgV,(RestM,RestK,...))` |
+| `partition_B(B)` | `(ThrV,(ThrN,ThrK))` | `ThrM`：同 N/K、同 Atom lane 的 M 副本可共用 B。 | `(FrgV,(RestN,RestK,...))` |
+| `partition_C(C)` | `(ThrV,(ThrM,ThrN))` | `ThrK`：C 只有 M/N 逻辑坐标。 | `(FrgV,(RestM,RestN,...))` |
+
+例如在这个布局中，`thread_id=5` 的坐标是 `(5,0,0,0)`，`thread_id=37` 是 `(5,0,1,0)`。两者的 `ThrN` 不同，但 `partition_A` 选的都是 `(5,(0,0))`，因而看到相同的 A 逻辑分区；B/C 则会区分这两个 N 副本。`partition_*` 用原 Tensor 的数据指针和 `thrfrg_*` 生成的 layout 建立视图，再固定线程坐标；它不把整块矩阵复制进线程私有存储。
+
+### 查询整块的 `(thread,value)` 映射
+
+`get_layoutA_TV()`、`get_layoutB_TV()`、`get_layoutC_TV()` 不需要用户传 Tensor。源码先按 `tile_size_mnk<I>()` 建立一个**参考矩阵 layout**，交给相应的 `thrfrg_*`，再用 `ThrLayoutVMNK` 的逆映射把线程编号接上。返回的是 Layout，不是 Tensor，更不是某个线程的 fragment：
+
+```cpp
+/**
+ * @brief 查询整块 A 的 (thread_id,value) 到 (M,K) 线性坐标的映射。
+ * @return A 的 TV Layout；N 副本对 A 广播。
+ */
+CUTE_HOST_DEVICE constexpr auto get_layoutA_TV() const;
+
+/**
+ * @brief 查询整块 B 的 (thread_id,value) 到 (N,K) 线性坐标的映射。
+ * @return B 的 TV Layout；M 副本对 B 广播。
+ */
+CUTE_HOST_DEVICE constexpr auto get_layoutB_TV() const;
+
+/**
+ * @brief 查询整块 C 的 (thread_id,value) 到 (M,N) 线性坐标的映射。
+ * @return C 的 TV Layout；K 副本不出现在 C 的逻辑坐标中。
+ */
+CUTE_HOST_DEVICE constexpr auto get_layoutC_TV() const;
+```
+
+这三个片段也是**接口签名摘要**。实现中，A 的 `atile` 给 N 线程维度 stride 0，B 的 `btile` 给 M 线程维度 stride 0；C 本身只调用 M/N 方向的 `thrfrg_C`。因此这些查询适合验证线程—元素映射，不应误读为原输入 Tensor 的 global/shared memory stride。
 
 ## `ThrMMA`
 
-**用途**
+`ThrMMA` 是 `TiledMMA::get_slice(thr_idx)` 返回的**每线程切片对象**。`TiledMMA` 保存整个线程布局和 MMA Atom；`ThrMMA` 继承这些配置，再保存一个线程在该布局中的坐标。这里先只读源码，不代入具体的矩阵规模或线程编号。
 
-`ThrMMA` 是 `TiledMMA` 的每线程视角。`TiledMMA` 描述全体线程如何组织，`ThrMMA` 描述某个 `thr_idx` 对应的线程应该看到 A/B/C 的哪一片。
+### 对象从哪里来
 
-**源码声明**
+`ThrMMA` 的两个模板参数分别是 `TiledMMA` 类型和线程坐标类型 `ThrVMNK`。它没有单独定义构造函数；`get_slice` 先用线程布局把 `thr_idx` 转成四维坐标，再以 `{*this, thr_vmnk}` 初始化继承的 `TiledMMA` 部分和成员 `thr_vmnk_`：
 
 ```cpp
 template <class TiledMMA, class ThrVMNK>
 struct ThrMMA : TiledMMA
 {
+  // 当前线程在线程布局中的 (ThrV, ThrM, ThrN, ThrK) 坐标。
   ThrVMNK thr_vmnk_;
 
-  template <class CTensor>
-  CUTE_HOST_DEVICE constexpr auto partition_C(CTensor&& ctensor) const;
-
-  template <class ATensor>
-  CUTE_HOST_DEVICE constexpr auto partition_A(ATensor&& atensor) const;
-
-  template <class BTensor>
-  CUTE_HOST_DEVICE constexpr auto partition_B(BTensor&& btensor) const;
-
-  template <class CTensor>
-  CUTE_HOST_DEVICE constexpr auto partition_fragment_C(CTensor&& ctensor) const;
-
-  template <class ATensor>
-  CUTE_HOST_DEVICE constexpr auto partition_fragment_A(ATensor&& atensor) const;
-
-  template <class BTensor>
-  CUTE_HOST_DEVICE constexpr auto partition_fragment_B(BTensor&& btensor) const;
+  // 下文展开六个成员函数。
 };
+
+// TiledMMA 中创建 ThrMMA 的实现。
+template <class ThrIdx,
+          __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
+CUTE_HOST_DEVICE constexpr
+auto
+get_slice(ThrIdx const& thr_idx) const
+{
+  auto thr_vmnk = thr_layout_vmnk_.get_flat_coord(thr_idx);
+  return ThrMMA<TiledMMA, decltype(thr_vmnk)>{*this, thr_vmnk};
+}
 ```
 
-**构造参数 / 成员变量**
+因此，`thr_vmnk_` 不是原始的线性线程编号，也不保存 A/B/C 数据。它的四个分量分别表示 Atom 内线程坐标 `ThrV`，以及 Atom 在 M、N、K 方向复制后的线程坐标 `ThrM`、`ThrN`、`ThrK`。继承 `TiledMMA` 使下面的成员函数能够使用 `thrfrg_A/B/C` 和 `make_fragment_A/B/C`。
 
-| 成员 | 类型 | 含义 |
+### `partition_A/B/C`：固定线程坐标，保留 fragment 坐标
+
+这三个函数的参数是尚未按当前线程切分的 Tensor：A 的前两维是 `(M,K)`，B 是 `(N,K)`，C 是 `(M,N)`；后面可以还有额外维度。源码如下，中文注释只解释各步的作用：
+
+```cpp
+/**
+ * @brief 从 C 的 (M,N,...) Tensor 中取得当前线程的片段视图。
+ * @tparam CTensor 输入 Tensor 类型。
+ * @param ctensor C 的输入 Tensor。
+ * @return 固定 (ThrV,ThrM,ThrN) 后、保留 fragment 维度的 Tensor 视图。
+ */
+template <class CTensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_C(CTensor&& ctensor) const
+{
+  // 用 thrfrg_C 重排原布局，并绑定到输入 Tensor 的数据。
+  auto thr_tensor = make_tensor(static_cast<CTensor&&>(ctensor).data(),
+                                this->thrfrg_C(ctensor.layout()));
+
+  // C 不含 K 逻辑维度，因此不取 ThrK。
+  auto thr_vmn = make_coord(get<0>(thr_vmnk_),
+                            make_coord(get<1>(thr_vmnk_), get<2>(thr_vmnk_)));
+  return thr_tensor(thr_vmn, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
+}
+
+/**
+ * @brief 从 A 的 (M,K,...) Tensor 中取得当前线程的片段视图。
+ * @tparam ATensor 输入 Tensor 类型。
+ * @param atensor A 的输入 Tensor。
+ * @return 固定 (ThrV,ThrM,ThrK) 后、保留 fragment 维度的 Tensor 视图。
+ */
+template <class ATensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_A(ATensor&& atensor) const
+{
+  auto thr_tensor = make_tensor(static_cast<ATensor&&>(atensor).data(),
+                                this->thrfrg_A(atensor.layout()));
+
+  // A 不含 N 逻辑维度，因此不取 ThrN。
+  auto thr_vmk = make_coord(get<0>(thr_vmnk_),
+                            make_coord(get<1>(thr_vmnk_), get<3>(thr_vmnk_)));
+  return thr_tensor(thr_vmk, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
+}
+
+/**
+ * @brief 从 B 的 (N,K,...) Tensor 中取得当前线程的片段视图。
+ * @tparam BTensor 输入 Tensor 类型。
+ * @param btensor B 的输入 Tensor。
+ * @return 固定 (ThrV,ThrN,ThrK) 后、保留 fragment 维度的 Tensor 视图。
+ */
+template <class BTensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_B(BTensor&& btensor) const
+{
+  auto thr_tensor = make_tensor(static_cast<BTensor&&>(btensor).data(),
+                                this->thrfrg_B(btensor.layout()));
+
+  // B 不含 M 逻辑维度，因此不取 ThrM。
+  auto thr_vnk = make_coord(get<0>(thr_vmnk_),
+                            make_coord(get<2>(thr_vmnk_), get<3>(thr_vmnk_)));
+  return thr_tensor(thr_vnk, make_coord(_, repeat<rank<1,1>(thr_tensor)>(_)));
+}
+```
+
+每个 `partition_*` 都分两步。第一步调用继承来的 `thrfrg_*`，把输入 Layout 拆成**线程模式**与 **fragment 模式**，再由 `make_tensor(data(), layout)` 用输入数据和新 Layout 构造 Tensor。它改变的是寻址视图，不搬运元素，也不规定输入必须位于 global、shared 或 register memory。
+
+第二步是对这个 Tensor 切片：第一个实参 `thr_vmn`、`thr_vmk` 或 `thr_vnk` 固定线程模式；第二个实参中的 `_` 保留 `FrgV`，`repeat<rank<1,1>(thr_tensor)>(_)` 为嵌套的剩余维度逐一填入通配符，保留 `RestM`、`RestN`、`RestK` 及可能的后续维度。于是返回值仍是引用输入数据的每线程 Tensor 视图，而不是新分配或已填充的 fragment；输入数据必须在视图使用期间有效。
+
+| 接口 | `thrfrg_*` 形成的逻辑模式 | 固定的线程坐标 | 返回视图保留的模式 |
+| --- | --- | --- | --- |
+| `partition_A` | `((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK,...)))` | `(ThrV,(ThrM,ThrK))` | `(FrgV,(RestM,RestK,...))` |
+| `partition_B` | `((ThrV,(ThrN,ThrK)),(FrgV,(RestN,RestK,...)))` | `(ThrV,(ThrN,ThrK))` | `(FrgV,(RestN,RestK,...))` |
+| `partition_C` | `((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN,...)))` | `(ThrV,(ThrM,ThrN))` | `(FrgV,(RestM,RestN,...))` |
+
+注意“未取用某个线程坐标”不等于把那一方向的数据丢掉：A 的复制由 N 方向的其他线程共享，B 由 M 方向的其他线程共享，C 则没有 K 逻辑维度。具体共享关系由 `TiledMMA` 的线程布局决定。
+
+### `partition_fragment_A/B/C`：从每线程视图构造 Atom 操作数
+
+三个组合接口本身没有新的布局计算，都是先调用上面的 `partition_*`，再调用继承自 `MMA_Atom` 的静态 `make_fragment_*`：
+
+```cpp
+/**
+ * @brief 按当前线程划分 C，再构造累加器 fragment。
+ * @tparam CTensor 输入 Tensor 类型。
+ * @param ctensor C 的输入 Tensor。
+ * @return 与当前线程 C 分区同形状、类型由 FrgTypeC 决定的 Tensor。
+ */
+template <class CTensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_fragment_C(CTensor&& ctensor) const
+{
+  return TiledMMA::make_fragment_C(partition_C(ctensor));
+}
+
+/**
+ * @brief 按当前线程划分 A，再构造 Atom 所需的 A fragment。
+ * @tparam ATensor 输入 Tensor 类型。
+ * @param atensor A 的输入 Tensor。
+ * @return 由 FrgTypeA 决定的 A fragment Tensor。
+ */
+template <class ATensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_fragment_A(ATensor&& atensor) const
+{
+  return TiledMMA::make_fragment_A(partition_A(atensor));
+}
+
+/**
+ * @brief 按当前线程划分 B，再构造 Atom 所需的 B fragment。
+ * @tparam BTensor 输入 Tensor 类型。
+ * @param btensor B 的输入 Tensor。
+ * @return 由 FrgTypeB 决定的 B fragment Tensor。
+ */
+template <class BTensor>
+CUTE_HOST_DEVICE constexpr
+auto
+partition_fragment_B(BTensor&& btensor) const
+{
+  return TiledMMA::make_fragment_B(partition_B(btensor));
+}
+```
+
+`make_fragment_C` 会按分区后的 shape 构造 `FrgTypeC` 累加器 Tensor，**不会把 `ctensor` 的原值复制进去**。A/B 则看 `FrgTypeA/B`：如果它们是可解引用的视图类型，就将分区后的 Tensor 交给 `make_tensor<FrgTypeA/B>`，例如 GMMA 的 shared-memory descriptor 路径；否则调用 `make_fragment_like<FrgTypeA/B>`，构造新的寄存器 fragment。后一种情形同样不负责把原 Tensor 的数值搬入 fragment。也就是说，`partition_fragment_*` 负责**形成操作数对象**，并不执行数据加载、初始化、同步或 MMA 指令；这些步骤由调用方按具体 Atom 的要求安排。
+
+## 贯穿示例：从 `TiledMMA` 到每线程 fragment
+
+固定一个 CTA 的逻辑问题规模为 `(M,N,K)=(64,64,32)`，分别在 shared memory 中放 A `(64,32)`、B `(64,32)`、C `(64,64)`。这里的 `(64,64,32)` **不是一个三维 shared-memory Tensor**，而是三块二维 Tensor 共用的 GEMM 规模。为了单独观察 shape，下例使用简单的 K 连续 A/B 和 N 连续 C 布局；它不是完整 GEMM，也未配置实际的 LDSM 搬运流程。
+
+### 配置与可运行的检查代码
+
+下面的 CUDA 程序只构造布局、切片和寄存器 fragment，不读取未初始化的 shared memory，也不发出 MMA 指令。一个 CTA 有 128 个线程；只让 `threadIdx.x == 37` 打印每线程结果。
+
+```cpp
+#include <cstdio>
+#include <cuda_runtime.h>
+
+#include <cute/atom/mma_atom.hpp>
+#include <cute/tensor.hpp>
+
+using namespace cute;
+
+/**
+ * @brief 检查指定 SM80 TiledMMA 在 64x64x32 CTA 数据上的线程分区形状。
+ *
+ * grid 只有一个 CTA，block 有 128 个线程；各线程只建立自己的
+ * ThrMMA 视图，不访问 shared memory 中尚未初始化的元素。
+ */
+__global__ void inspect_tiled_mma()
+{
+  __shared__ half_t smem_a[64 * 32];
+  __shared__ half_t smem_b[64 * 32];
+  __shared__ half_t smem_c[64 * 64];
+
+  TiledMMA mma_c = make_tiled_mma(
+      SM80_16x8x16_F16F16F16F16_TN{},
+      Layout<Shape<_2, _2>>{},       // M/N/K 方向有 2x2x1 个 Atom 副本。
+      Tile<_32, _32, _16>{});        // 一次参考 tile 的逻辑形状。
+
+  Tensor s_a = make_tensor(
+      make_smem_ptr(smem_a),
+      Layout<Shape<_64, _32>, Stride<_32, _1>>{});  // (M,K)，K 连续。
+  Tensor s_b = make_tensor(
+      make_smem_ptr(smem_b),
+      Layout<Shape<_64, _32>, Stride<_32, _1>>{});  // (N,K)，K 连续。
+  Tensor s_c = make_tensor(
+      make_smem_ptr(smem_c),
+      Layout<Shape<_64, _64>, Stride<_64, _1>>{});  // (M,N)，N 连续。
+
+  ThrMMA thr_mma = mma_c.get_slice(threadIdx.x);
+  Tensor t_a = thr_mma.partition_A(s_a);
+  Tensor t_b = thr_mma.partition_B(s_b);
+  Tensor t_c = thr_mma.partition_C(s_c);
+
+  // 从每线程 shared-memory 视图构造新的寄存器 fragment；没有拷贝数据。
+  Tensor f_a = mma_c.make_fragment_A(t_a);
+  Tensor f_b = mma_c.make_fragment_B(t_b);
+  Tensor f_c = mma_c.make_fragment_C(t_c);
+
+  // 三个组合接口等价于先 partition，再调用对应的 make_fragment。
+  Tensor f_a2 = thr_mma.partition_fragment_A(s_a);
+  Tensor f_b2 = thr_mma.partition_fragment_B(s_b);
+  Tensor f_c2 = thr_mma.partition_fragment_C(s_c);
+
+  if (threadIdx.x == 37) {
+    print("thread_coord = "); print(thr_mma.thr_vmnk_); print("\n");
+    print("A = "); print(shape(t_a)); print(" -> ");
+    print(shape(f_a)); print(" -> "); print(shape(f_a2)); print("\n");
+    print("B = "); print(shape(t_b)); print(" -> ");
+    print(shape(f_b)); print(" -> "); print(shape(f_b2)); print("\n");
+    print("C = "); print(shape(t_c)); print(" -> ");
+    print(shape(f_c)); print(" -> "); print(shape(f_c2)); print("\n");
+  }
+}
+
+int main()
+{
+  inspect_tiled_mma<<<1, 128>>>();
+  cudaError_t status = cudaGetLastError();
+  if (status != cudaSuccess) {
+    std::fprintf(stderr, "kernel launch: %s\n", cudaGetErrorString(status));
+    return 1;
+  }
+  status = cudaDeviceSynchronize();  // 等待设备端打印，并检查 kernel 执行错误。
+  if (status != cudaSuccess) {
+    std::fprintf(stderr, "kernel execution: %s\n", cudaGetErrorString(status));
+    return 1;
+  }
+  return 0;
+}
+```
+
+### `TiledMMA` 自身的布局和 tile 大小
+
+`SM80_16x8x16_F16F16F16F16_TN` 的单 Atom 形状是 `(16,8,16)`，内部有 32 个线程。`Layout<Shape<_2,_2>>{}` 默认紧凑布局是 `(_2,_2):(_1,_2)`；`make_tiled_mma` 再补一个大小为 1 的 K mode，得到 `(_2,_2,_1):(_1,_2,_0)`。**这与前文显式写 `Stride<_2,_1>` 的例子不是同一线程编号顺序。**
+
+| 接口或属性 | 本例返回值 | 怎样理解 |
 | --- | --- | --- |
-| `thr_vmnk_` | `ThrVMNK` | 当前线程在线程布局中的坐标，包含 `ThrV / ThrM / ThrN / ThrK` 信息。 |
+| `MMA_Atom::Shape_MNK` | `(_16,_8,_16)` | 单条指令的 M/N/K 大小。 |
+| `MMA_Atom::ThrID` | `_32:_1` | 单 Atom 的 32 个线程。 |
+| `get_thr_layout_vmnk()` | `(_32,_2,_2,_1):(_1,_32,_64,_0)` | `(ThrV,ThrM,ThrN,ThrK) → thread_id`。 |
+| `permutation_mnk<0/1/2>()` | `_32 / _32 / _16` | 三个显式 tiler，均只有大小，没有额外重排。 |
+| `tile_size_mnk<0/1/2>()` | `_32 / _32 / _16` | 分别是三个 tiler 的 `size`。 |
+| `tile_shape(mma_c)` | `(_32,_32,_16)` | 一次参考 tile 的逻辑 M/N/K 形状。 |
+| `size(mma_c)`、`thr_size(mma_c)` | `_128` | 线程总数：`32 × 2 × 2 × 1`。 |
 
-**重要接口**
+`ThrLayoutVMNK` 的 stride 表示线程编号：`thread_id = ThrV + 32 ThrM + 64 ThrN`，`ThrK` 恒为 0。`Tile<_32,_32,_16>` 的 N=32 比两份 Atom 的自然 N=16 大一倍；这部分 N 数据会落入每线程剩余 fragment 维度，**不会让线程数增加到 256**。
 
-| 接口 | 含义 |
+### Atom 的 `LayoutA/B/C_TV` 与整块的 `get_layoutA/B/C_TV()`
+
+继承自 `MMA_Atom` 的 `LayoutA_TV`、`LayoutB_TV`、`LayoutC_TV` 描述**单条 SM80 指令**内的 `(ThrV,FrgV) → (M,K)/(N,K)/(M,N)`。本例 Traits 展开后，CuTe 打印的三个 Layout 为：
+
+```text
+LayoutA_TV = ((_4,_8),(_2,_2,_2)):((_32,_1),(_16,_8,_128))
+LayoutB_TV = ((_4,_8),(_2,_2)):((_16,_1),(_8,_64))
+LayoutC_TV = ((_4,_8),(_2,_2)):((_32,_1),(_16,_8))
+```
+
+第一 mode 都是 `(_4,_8)`，大小 32，对应 `ThrV`；第二 mode 分别有 8、4、4 个值，对应每线程执行**一条 Atom 指令**所需的 A、B、C 元素。冒号后的 stride 是这些 `(thread,value)` 坐标在 Atom 逻辑矩阵中的线性映射，**不是**上面三块 shared memory 的 stride。
+
+`get_layoutA/B/C_TV()` 则把线程副本与显式 tiler 都纳入，返回**整个 `32×32×16` 参考 tile** 的 `(thread_id,value) → 逻辑元素` Layout。下面保留 CuTe 打印出来的完整 shape 和 stride；下划线表示编译期整数：
+
+```text
+get_layoutA_TV()
+  = ((_4,_8,_2,_2),((_2,_2,_2),(_1,_1)))
+  : ((_64,_1,_16,_0),((_32,_8,_256),(_0,_0)))
+
+get_layoutB_TV()
+  = ((_4,_8,_2,_2),((_2,_2),(_2,_1)))
+  : ((_64,_1,_0,_8),((_32,_256),(_16,_0)))
+
+get_layoutC_TV()
+  = ((_4,_8,_2,_2),((_2,_2),(_1,_2)))
+  : ((_64,_1,_16,_256),((_32,_8),(_0,_512)))
+```
+
+三者第一个大 mode 都有 `4×8×2×2=128` 个线程，第二个大 mode 都有 8 个 value，但**不能因此认为 A/B/C 各有 1024 个不同元素**：A 的参考矩阵只有 `32×16=512` 个元素，`ThrN` 副本复用 A，所以对应线程 stride 为 0；B 同为 512 个元素，`ThrM` 副本复用 B；C 的参考矩阵是 `32×32=1024`，没有这种 M/N 广播。`get_layout*_TV()` 内部用自己的参考 Layout 建立映射，因此这些 stride 也不能用作 `s_a/s_b/s_c` 的 shared-memory 地址步幅。
+
+### `thrfrg_A/B/C`：把整块 shared-memory Tensor 拆成线程与 fragment
+
+这一步才把 `(64,64,32)` 的三个输入 Tensor 代进去。传 `s_a/s_b/s_c` 返回的是借用原数据的 Tensor 视图；若传它们的 `layout()`，返回对应 Layout。两种传法的 **shape 相同**，但 stride 随原输入 Layout 而定。
+
+| 调用 | 返回 shape | 线程 mode 大小 | fragment mode 大小 |
+| --- | --- | --- | --- |
+| `mma_c.thrfrg_A(s_a)` | `(((_4,_8),(_2,_1)),((_2,_2,_2),(_2,_2)))` | `32×2×1=64` | `8×2×2=32` |
+| `mma_c.thrfrg_B(s_b)` | `(((_4,_8),(_2,_1)),((_2,_2),(_4,_2)))` | `32×2×1=64` | `4×4×2=32` |
+| `mma_c.thrfrg_C(s_c)` | `(((_4,_8),(_2,_2)),((_2,_2),(_2,_4)))` | `32×2×2=128` | `4×2×4=32` |
+
+A 的线程 mode 不含 `ThrN`，B 不含 `ThrM`，所以它们只有 64 个**不同的线程坐标组合**，各自被另一方向的两个线程副本共享；不是说 CTA 只运行 64 个线程。fragment 中的剩余维度可直接从题设算出：
+
+- A：`RestM = 64/(16×2)=2`、`RestK = 32/(16×1)=2`，所以每个线程视图有 `8×2×2=32` 个元素。
+- B：`RestN = 64/(8×2)=4`、`RestK=2`，所以是 `4×4×2=32` 个元素。
+- C：`RestM=2`、`RestN=4`，所以是 `4×2×4=32` 个元素。
+
+### `ThrMMA`：选定线程，再构造操作数
+
+`get_slice(thread_id)` 和 `get_thread_slice(thread_id)` 返回同样的 `ThrMMA` 对象。这个对象**不是 Tensor，没有独立的 A/B/C shape**；它保存完整的 `TiledMMA` 配置和一个 `thr_vmnk_` 坐标。例如 `thread_id=37` 对应 `(ThrV,ThrM,ThrN,ThrK)=(5,1,0,0)`。随后 `partition_*` 固定各自需要的线程坐标，留下 fragment 维度；这一步不复制 shared-memory 数据。
+
+| 接口 | `thread_id=37` 固定的坐标 | 返回的精确 shape | 元素数 |
+| --- | --- | --- | --- |
+| `partition_A(s_a)` | `(5,(1,0))` | `((_2,_2,_2),_2,_2)` | 32 |
+| `partition_B(s_b)` | `(5,(0,0))` | `((_2,_2),_4,_2)` | 32 |
+| `partition_C(s_c)` | `(5,(1,0))` | `((_2,_2),_2,_4)` | 32 |
+
+其中 A/B/C 第一 mode 分别是单 Atom 的 `FrgV=8/4/4`；后两个 mode 分别是 `(RestM,RestK)`、`(RestN,RestK)`、`(RestM,RestN)`。注意 `thrfrg_*` 的返回 shape 把“线程 / fragment”两组显式嵌套；`partition_*` 用具体坐标切片后，结果显示为 `(FrgV,Rest*,Rest*)`，所以不要把它们当成不同的数据量。
+
+这个 SM80 Atom 的 `FrgTypeA/B/C` 都是 `half_t`。将上述每线程视图传入 `make_fragment_A/B/C`，或直接调用 `partition_fragment_A/B/C(s_a/s_b/s_c)`，得到的**寄存器 Tensor shape 与各自 `partition_*` 的 shape 相同**：
+
+| 构造路径 | 返回的寄存器 fragment shape |
 | --- | --- |
-| `partition_C(ctensor)` | 从全局 C tensor 的逻辑布局中切出当前线程负责的 C 片段视图。 |
-| `partition_A(atensor)` | 从 A tensor 中切出当前线程负责的 A 片段视图。 |
-| `partition_B(btensor)` | 从 B tensor 中切出当前线程负责的 B 片段视图。 |
-| `partition_fragment_C(ctensor)` | 先 `partition_C`，再构造适合 MMA Atom 的 C fragment。 |
-| `partition_fragment_A(atensor)` | 先 `partition_A`，再构造 A fragment。 |
-| `partition_fragment_B(btensor)` | 先 `partition_B`，再构造 B fragment。 |
+| `mma_c.make_fragment_A(thr_mma.partition_A(s_a))` / `thr_mma.partition_fragment_A(s_a)` | `((_2,_2,_2),_2,_2)` |
+| `mma_c.make_fragment_B(thr_mma.partition_B(s_b))` / `thr_mma.partition_fragment_B(s_b)` | `((_2,_2),_4,_2)` |
+| `mma_c.make_fragment_C(thr_mma.partition_C(s_c))` / `thr_mma.partition_fragment_C(s_c)` | `((_2,_2),_2,_4)` |
 
-**使用场景**
+两条路径返回的形状相同，但 `make_fragment_*` 只构造存储及 fragment Layout，**不会自动从 `partition_*` 视图拷入 A/B，也不会从 `s_c` 初始化累加器 C**。用来做 GEMM 时，还需要显式数据搬运、累加器初始化以及适当同步。
 
-典型写法是先从 `TiledMMA` 得到当前线程切片，再 partition A/B/C：
+同一头文件里还有无需具体线程的辅助自由函数：`partition_shape_A(mma_c, Shape<_64,_32>{})`、`partition_shape_B(mma_c, Shape<_64,_32>{})`、`partition_shape_C(mma_c, Shape<_64,_64>{})`，依次也返回上表的 A/B/C shape；它们只用形状推导，不接收 Tensor 或线程编号。自由函数 `partition_fragment_C(mma_c, Shape<_64,_64>{})` 则按 C 的推导 shape 创建一个累加器 Tensor。A/B 的 fragment 仍应走具体线程的 Tensor 分区路径，因为其构造可能依赖输入 Layout 或线程坐标。
 
-```cpp
-// 当前线程在线程块内的线性编号。
-int tid = threadIdx.x;
+在本机 GPU 上运行上面的检查代码，`thread_id=37` 的输出为：
 
-// 构造一个 tiled MMA。这里使用 SM80 作为例子。
-auto tiled_mma = cute::make_tiled_mma(
-    cute::SM80_16x8x16_F32F16F16F32_TN{},
-
-    // 只在 M/N 方向做 2x2 Atom 复制。
-    // 源码会自动补 K 维为 1。
-    cute::Layout<cute::Shape<cute::_2, cute::_2>,
-                 cute::Stride<cute::_2, cute::_1>>{});
-
-// 得到当前线程的 ThrMMA 视角。
-auto thr_mma = tiled_mma.get_slice(tid);
-
-// tAgA / tBgB / tCgC 是已经构造好的 CuTe tensor。
-// partition_A/B/C 返回当前线程负责的逻辑片段视图。
-auto tCrA = thr_mma.partition_A(tAgA);
-auto tCrB = thr_mma.partition_B(tBgB);
-auto tCrC = thr_mma.partition_C(tCgC);
-
-// partition_fragment_* 会进一步构造适合 MMA Atom 的寄存器 fragment。
-auto frgA = thr_mma.partition_fragment_A(tAgA);
-auto frgB = thr_mma.partition_fragment_B(tBgB);
-auto frgC = thr_mma.partition_fragment_C(tCgC);
+```text
+thread_coord = (5,1,0,_0)
+A = ((_2,_2,_2),_2,_2) -> ((_2,_2,_2),_2,_2) -> ((_2,_2,_2),_2,_2)
+B = ((_2,_2),_4,_2) -> ((_2,_2),_4,_2) -> ((_2,_2),_4,_2)
+C = ((_2,_2),_2,_4) -> ((_2,_2),_2,_4) -> ((_2,_2),_2,_4)
 ```
-
-注意：上面 `tAgA / tBgB / tCgC` 的具体构造依赖 GEMM 主循环里的 tensor layout，这里只演示 `ThrMMA` 接口关系。
-
-## TiledMMA 示例
-
-### 单个 Atom
-
-```cpp
-auto mma = cute::MMA_Atom<cute::SM70_8x8x4_F32F16F16F32_NT>{};
-cute::print_latex(mma);
-```
-
-预留图：
-
-![单个 SM70 MMA Atom](/blog-assets/gpu-programming/cute-mma-atom/sm70-single-mma-atom.png)
-
-这个对象表示单条 $8 \times 8 \times 4$ 的 Volta HMMA。它已经知道：
-
-- 使用哪个 Operation。
-- 单条 MMA 的 `Shape_MNK`。
-- A/B/C 的 `(thread,value)` layout。
-
-### 线程间复制 Atom
-
-```cpp
-auto mma = cute::make_tiled_mma(
-    // 基础 Operation，会被 make_tiled_mma 包成 MMA_Atom。
-    cute::SM70_8x8x4_F32F16F16F32_NT{},
-
-    // Atom 在线程空间按 M/N = 2x2 复制。
-    // Stride<_2,_1> 表示 N-major 排列这些 Atom 副本。
-    cute::Layout<cute::Shape<cute::_2, cute::_2>,
-                 cute::Stride<cute::_2, cute::_1>>{});
-cute::print_latex(mma);
-```
-
-预留图：
-
-![线程间复制 MMA Atom](/blog-assets/gpu-programming/cute-mma-atom/sm70-tiled-mma-2x2.png)
-
-这表示把 Atom 在 M/N 方向做 $2 \times 2$ 的线程布局复制。对 SM70 这个 Atom 来说，单个 Atom 的形状是 $8 \times 8 \times 4$，所以自然会得到 $16 \times 16 \times 4$ 级别的组合视角。
-
-### 扩大 tile 并使用 permutation
-
-```cpp
-auto mma = cute::make_tiled_mma(
-    // 基础 Volta HMMA Atom。
-    cute::SM70_8x8x4_F32F16F16F32_NT{},
-
-    // 线程层面的 Atom 复制：M/N = 2x2，K 维由源码补成 1。
-    cute::Layout<cute::Shape<cute::_2, cute::_2>,
-                 cute::Stride<cute::_2, cute::_1>>{},
-
-    // M/N/K 三个维度的 permutation。
-    // M 维使用 Layout 重排，N 维使用自然大小 32，K 维使用自然大小 4。
-    cute::Tile<
-        cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_2>,
-                     cute::Stride<cute::_1, cute::_8, cute::_4>>,
-        cute::_32,
-        cute::_4>{});
-cute::print_latex(mma);
-```
-
-预留图：
-
-![带 permutation 的 TiledMMA](/blog-assets/gpu-programming/cute-mma-atom/sm70-tiled-mma-permutation.png)
-
-这里的第三个参数不是简单的目标 shape，而是 `PermutationMNK`。它会影响 `TiledMMA::permutation_mnk<I>()` 的结果，从而影响 `thrfrg_A/B/C` 如何把逻辑矩阵分解到线程和 fragment。
-
-这部分不要简单理解成“把矩阵变大”。更准确地说：
-
-- `thr_layout` 描述 Atom 在线程空间如何复制。
-- `permutations` 描述 M/N/K 逻辑模式如何重排。
-- `TiledMMA` 根据 Atom 自身形状、线程布局和 permutation，推导每个线程看到的 fragment 形状。
-
-## 阅读源码时的主线
-
-如果想继续看 CuTe MMA Atom 的源码，可以按这个顺序：
-
-- 先看 `include/cute/arch/mma_sm70.hpp`：理解 Operation 结构体只关心寄存器和 PTX。
-- 再看 `include/cute/atom/mma_traits_sm70.hpp`：理解 `MMA_Traits` 如何把 `(thread,value)` 映射到矩阵坐标。
-- 再看 `include/cute/arch/mma_sm80.hpp` 和 `include/cute/atom/mma_traits_sm80.hpp`：对比 Ampere warp-level MMA 和 Volta QP-level MMA 的差异。
-- 再看 `include/cute/arch/mma_sm89.hpp` 和 `include/cute/atom/mma_traits_sm89.hpp`：理解 Ada FP8 MMA 如何沿用 warp-level 组织方式。
-- 然后看 `include/cute/atom/mma_atom.hpp`：理解 `MMA_Atom::call`、`make_fragment_*`、`TiledMMA::thrfrg_*` 和 `ThrMMA::partition_*`。
-- 最后看 `include/cute/atom/mma_traits_sm90_gmma.hpp`：对比 Hopper GMMA 为什么 A/B 变成 descriptor，为什么 `ABLayout` 的线程 stride 是 0。
-
-## 小结
-
-CuTe 的 MMA 抽象不是单纯“封装一条汇编”。它把一条硬件指令拆成了两类信息：
-
-- **物理接口**：由 Operation 结构体描述，主要是寄存器类型、寄存器数量和 `fma`。
-- **逻辑映射**：由 `MMA_Traits` 描述，主要是类型、形状、线程映射和 value 映射。
-
-`MMA_Atom` 把这两类信息合并成可调用对象，`TiledMMA` 再把 Atom 复制和排列成更大的计算 tile。理解这条链路之后，再看 CUTLASS 3.x GEMM 里的 `TiledMMA`、`ThrMMA`、`partition_fragment_A/B/C`，就不会只看到一堆模板类型，而能看出它们分别在表达硬件指令、线程布局和每线程寄存器视角。

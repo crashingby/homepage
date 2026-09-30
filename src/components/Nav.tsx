@@ -15,7 +15,6 @@ export function Nav() {
                     <span className="site-monogram">cb.</span>
                     <span>
                         Crashing By
-                        <span className="site-mark-caption">Huang Xinying</span>
                     </span>
                 </NavLink>
                 <div className="nav-links">
