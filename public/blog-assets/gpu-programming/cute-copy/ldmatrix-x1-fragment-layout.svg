@@ -1,0 +1,407 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1340" height="920" viewBox="0 0 1340 920" role="img" aria-labelledby="title description">
+  <title id="title">ldmatrix.x1：8×8 矩阵到 32 个 lane 的寄存器分配</title>
+  <desc id="description">SM75_U32x1_LDSM_N 的非转置映射。左侧 lane 0 到 7 各提供一行的起始地址；矩阵中每格是一个 16-bit 元素，四个连续 lane 接收一行，每个 lane 的 dst0 打包相邻两个元素，分别位于低 16 bit 和高 16 bit。</desc>
+  <metadata>参考 NVIDIA PTX ISA 的 Figure 107：ldmatrix fragment layout for one 8x8 Matrix with 16-bit elements。https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#mma-ldmatrix-fragments 本图重新绘制，并补充地址提供者与寄存器位段。</metadata>
+  <style>
+    text { font-family: "Noto Sans CJK SC", "Droid Sans Fallback", "Microsoft YaHei", sans-serif; fill: #1e293b; }
+    .heading { font-size: 30px; font-weight: 700; }
+    .subtitle { font-size: 18px; fill: #475569; }
+    .header { font-size: 19px; font-weight: 600; text-anchor: middle; }
+    .source { font-size: 21px; text-anchor: middle; }
+    .index { font-size: 23px; font-weight: 600; text-anchor: middle; }
+    .lane { font-family: "DejaVu Sans Mono", Consolas, monospace; font-size: 20px; font-weight: 600; text-anchor: middle; }
+    .bits { font-size: 16px; fill: #475569; text-anchor: middle; }
+    .note { font-size: 19px; }
+  </style>
+  <defs>
+    <marker id="arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7" fill="#64748b"/></marker>
+  </defs>
+  <rect width="1340" height="920" fill="#ffffff"/>
+  <text x="32" y="48" class="heading">ldmatrix.x1：8×8 矩阵的寄存器分配</text>
+  <text x="32" y="82" class="subtitle">SM75_U32x1_LDSM_N · 每格一个 16-bit 元素；相邻两格打包到同一 lane 的 dst0（32 bit）</text>
+  <text x="104" y="144" class="header">行首地址提供者</text>
+  <rect x="204" y="120" width="60" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="156" class="header">行 / 列</text>
+  <rect x="264" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="327" y="156" class="index">0</text>
+  <rect x="390" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="453" y="156" class="index">1</text>
+  <rect x="516" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="579" y="156" class="index">2</text>
+  <rect x="642" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="705" y="156" class="index">3</text>
+  <rect x="768" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="831" y="156" class="index">4</text>
+  <rect x="894" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="957" y="156" class="index">5</text>
+  <rect x="1020" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="1083" y="156" class="index">6</text>
+  <rect x="1146" y="120" width="126" height="60" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="1209" y="156" class="index">7</text>
+  <rect x="32" y="180" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="221" class="source">lane 0</text>
+  <path d="M180 214 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="180" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="222" class="index">0</text>
+  <g class="element" transform="translate(264 180)" data-row="0" data-col="0" data-lane="0" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T0: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 180)" data-row="0" data-col="1" data-lane="0" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T0: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 180)" data-row="0" data-col="2" data-lane="1" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T1: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 180)" data-row="0" data-col="3" data-lane="1" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T1: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 180)" data-row="0" data-col="4" data-lane="2" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T2: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 180)" data-row="0" data-col="5" data-lane="2" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T2: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 180)" data-row="0" data-col="6" data-lane="3" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T3: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 180)" data-row="0" data-col="7" data-lane="3" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T3: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="248" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="289" class="source">lane 1</text>
+  <path d="M180 282 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="248" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="290" class="index">1</text>
+  <g class="element" transform="translate(264 248)" data-row="1" data-col="0" data-lane="4" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T4: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 248)" data-row="1" data-col="1" data-lane="4" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T4: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 248)" data-row="1" data-col="2" data-lane="5" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T5: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 248)" data-row="1" data-col="3" data-lane="5" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T5: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 248)" data-row="1" data-col="4" data-lane="6" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T6: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 248)" data-row="1" data-col="5" data-lane="6" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T6: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 248)" data-row="1" data-col="6" data-lane="7" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T7: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 248)" data-row="1" data-col="7" data-lane="7" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T7: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="316" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="357" class="source">lane 2</text>
+  <path d="M180 350 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="316" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="358" class="index">2</text>
+  <g class="element" transform="translate(264 316)" data-row="2" data-col="0" data-lane="8" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T8: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 316)" data-row="2" data-col="1" data-lane="8" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T8: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 316)" data-row="2" data-col="2" data-lane="9" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T9: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 316)" data-row="2" data-col="3" data-lane="9" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T9: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 316)" data-row="2" data-col="4" data-lane="10" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T10: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 316)" data-row="2" data-col="5" data-lane="10" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T10: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 316)" data-row="2" data-col="6" data-lane="11" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T11: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 316)" data-row="2" data-col="7" data-lane="11" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T11: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="384" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="425" class="source">lane 3</text>
+  <path d="M180 418 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="384" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="426" class="index">3</text>
+  <g class="element" transform="translate(264 384)" data-row="3" data-col="0" data-lane="12" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T12: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 384)" data-row="3" data-col="1" data-lane="12" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T12: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 384)" data-row="3" data-col="2" data-lane="13" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T13: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 384)" data-row="3" data-col="3" data-lane="13" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T13: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 384)" data-row="3" data-col="4" data-lane="14" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T14: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 384)" data-row="3" data-col="5" data-lane="14" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T14: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 384)" data-row="3" data-col="6" data-lane="15" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T15: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 384)" data-row="3" data-col="7" data-lane="15" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T15: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="452" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="493" class="source">lane 4</text>
+  <path d="M180 486 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="452" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="494" class="index">4</text>
+  <g class="element" transform="translate(264 452)" data-row="4" data-col="0" data-lane="16" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T16: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 452)" data-row="4" data-col="1" data-lane="16" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T16: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 452)" data-row="4" data-col="2" data-lane="17" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T17: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 452)" data-row="4" data-col="3" data-lane="17" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T17: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 452)" data-row="4" data-col="4" data-lane="18" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T18: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 452)" data-row="4" data-col="5" data-lane="18" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T18: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 452)" data-row="4" data-col="6" data-lane="19" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T19: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 452)" data-row="4" data-col="7" data-lane="19" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T19: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="520" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="561" class="source">lane 5</text>
+  <path d="M180 554 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="520" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="562" class="index">5</text>
+  <g class="element" transform="translate(264 520)" data-row="5" data-col="0" data-lane="20" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T20: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 520)" data-row="5" data-col="1" data-lane="20" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T20: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 520)" data-row="5" data-col="2" data-lane="21" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T21: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 520)" data-row="5" data-col="3" data-lane="21" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T21: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 520)" data-row="5" data-col="4" data-lane="22" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T22: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 520)" data-row="5" data-col="5" data-lane="22" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T22: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 520)" data-row="5" data-col="6" data-lane="23" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T23: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 520)" data-row="5" data-col="7" data-lane="23" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T23: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="588" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="629" class="source">lane 6</text>
+  <path d="M180 622 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="588" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="630" class="index">6</text>
+  <g class="element" transform="translate(264 588)" data-row="6" data-col="0" data-lane="24" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T24: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 588)" data-row="6" data-col="1" data-lane="24" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T24: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 588)" data-row="6" data-col="2" data-lane="25" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T25: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 588)" data-row="6" data-col="3" data-lane="25" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T25: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 588)" data-row="6" data-col="4" data-lane="26" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T26: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 588)" data-row="6" data-col="5" data-lane="26" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T26: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 588)" data-row="6" data-col="6" data-lane="27" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T27: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 588)" data-row="6" data-col="7" data-lane="27" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T27: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="656" width="144" height="68" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="104" y="697" class="source">lane 7</text>
+  <path d="M180 690 H198" stroke="#64748b" stroke-width="1.5" fill="none" marker-end="url(#arrow)"/>
+  <rect x="204" y="656" width="60" height="68" fill="#f1f5f9" stroke="#94a3b8"/>
+  <text x="234" y="698" class="index">7</text>
+  <g class="element" transform="translate(264 656)" data-row="7" data-col="0" data-lane="28" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T28: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(390 656)" data-row="7" data-col="1" data-lane="28" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#eff6ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T28: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(516 656)" data-row="7" data-col="2" data-lane="29" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T29: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(642 656)" data-row="7" data-col="3" data-lane="29" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f0fdfa" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T29: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(768 656)" data-row="7" data-col="4" data-lane="30" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T30: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(894 656)" data-row="7" data-col="5" data-lane="30" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#f5f3ff" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T30: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1020 656)" data-row="7" data-col="6" data-lane="31" data-register="dst0" data-bits="15:0">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T31: dst0</text>
+    <text x="63" y="54" class="bits">低 16 bit</text>
+  </g>
+  <g class="element" transform="translate(1146 656)" data-row="7" data-col="7" data-lane="31" data-register="dst0" data-bits="31:16">
+    <rect width="126" height="68" fill="#fff7ed" stroke="#94a3b8"/>
+    <text x="63" y="29" class="lane">T31: dst0</text>
+    <text x="63" y="54" class="bits">高 16 bit</text>
+  </g>
+  <rect x="32" y="756" width="1240" height="120" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="52" y="790" class="note">Tn 表示 lane n。列 2t、2t+1 的两个元素分别进入同一 dst0 的低、高 16 bit。</text>
+  <text x="52" y="822" class="note">例如 lane 1 提供第 1 行的起始地址，但 dst0 接收第 0 行的列 2、3。</text>
+  <text x="52" y="854" class="note">地址由 lane 0–7 提供；所有 32 个 lane 都参与执行并各接收 32 bit，共 128 B。</text>
+  <text x="32" y="902" class="subtitle">参考 NVIDIA PTX ISA Figure 107 重新绘制；格子表示矩阵元素，标签表示接收该元素的寄存器位置。</text>
+</svg>

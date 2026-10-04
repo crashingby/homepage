@@ -1,2166 +1,2545 @@
 ---
-title: CuTe TMA 设计与 API 笔记
-date: 2026-07-15
-tags: [CUDA, CuTe, CUTLASS, TMA, Hopper, SM90]
-summary: 对照 CUTLASS CuTe 源码整理 SM90 TMA 的 tensor map 描述符、swizzle、make_tma_atom / tma_partition、SM90_TMA_LOAD 系列 API、cluster launch 和 kernel 内部 barrier / pipeline 协议。
+title: CuTe TMA：从 SM90 PTX 指令开始
+date: 2026-10-03
+tags: [CUDA, CuTe, CUTLASS, PTX, TMA, Hopper, SM90]
+summary: 从 SM90 PTX 指令理解 TMA 的 descriptor、mbarrier 和完成协议，阅读 CUTLASS 异步流水线，再分别展开 make_tma_atom 与 make_tma_copy 的用法、实例化类型和张量分区。
 ---
 
-# CuTe TMA 设计与 API 笔记
+# CuTe TMA：从 SM90 PTX 指令开始
 
-TMA 是 Hopper / SM90 引入的 Tensor Memory Accelerator。它不是传统的“每个线程手写地址、从 global load 到寄存器、再 store 到 shared”的搬运方式，而是把一块多维 tensor tile 描述成一个 **tensor map descriptor**，然后用 `cp.async.bulk.tensor` 这类指令让硬件负责地址生成和异步搬运。
+理解 TMA，先把三个问题分开：**硬件怎样找到数据、怎样发起搬运、怎样确认搬运完成。**
 
-在 CUDA 原始 API 里，TMA 的重点是“如何描述一个多维 tensor”：全局内存基地址、rank、每一维大小、stride、一次搬运的 box shape、shared memory swizzle、L2 promotion、越界填充值等。
+- **tensor map descriptor（张量映射描述符）** 保存 global tensor 的地址、形状、步幅和一次搬运的 box 等信息，是硬件生成地址和确定传输区域的依据。
+- **TMA 指令**读取 descriptor 和本次坐标，发起 global 与 shared 之间的异步搬运。线程在发起后继续执行，通过完成协议确认数据就绪。
+- **完成协议**由指令变体决定：SM90 的 global → shared load 使用 mbarrier；shared → global store 使用 bulk async-group。
+- **fence（内存栅栏）** 建立内存访问的顺序或不同 proxy 之间的可见性。异步传输的完成由 mbarrier wait 或 bulk-group wait 确认。
 
-在 CuTe 里，这些信息被拆进了更高层的对象：
+本文先读 PTX 和 CuTe 的 arch 层封装，再从 CUTLASS 的 barrier、状态和 pipeline 理解异步执行的控制流。CUDA 官方 API 用一个例子作对应；随后分别阅读 `make_tma_atom` 和 `make_tma_copy` 两条路径，用具体实例化的 Traits、Atom 与 TiledCopy 串起 descriptor 构造、张量分区和指令发射。
 
-| CUDA / PTX 视角 | CuTe 里的来源 | 作用 |
-| --- | --- | --- |
-| `CUtensorMap` / TMA descriptor | `make_tma_copy`、`make_tma_atom` 内部生成的 `TmaDescriptor` | 描述 global tensor、TMA box、swizzle、L2 policy。 |
-| global rank / shape / stride | `Tensor<GEngine, GLayout>` | 从 GMEM tensor 的 layout 推导。 |
-| box shape / element stride | `SLayout` 和 `CTA_Tiler` | 从 SMEM tile 和 CTA tile 推导一次 TMA 指令搬多少。 |
-| shared-memory swizzle | `ComposedLayout<Swizzle<...>, smem_ptr_flag, Layout<...>>` | 同时服务 TMA 写入和 GMMA 读取。 |
-| async completion | `ClusterTransactionBarrier` / `mbarrier` | TMA load 完成时按 transaction bytes 通知 barrier。 |
-| multicast | `cluster_size`、`cta_layout`、`create_tma_multicast_mask` | 一个 TMA load 可以把数据送到 cluster 中多个 CTA 的 shared memory。 |
+## 源码位置与阅读范围
 
-所以 CuTe TMA 的核心问题是：
+本地源码位于 `/home/huangxy/Projects/cutlass`，对应提交 `e406c186f510a15091cce01f782020ceb7ba8eb5`。下面的链接固定到该提交，避免后来版本改变接口。
 
-> 用 CuTe 的 `Tensor` / `Layout` / `Copy_Atom` 把 CUDA tensor map 描述符、PTX TMA 指令和 kernel 里的 barrier 协议组织起来。
-
-这篇笔记主要对照这些源码：
-
-| 源码文件 | 主要内容 |
+| 源码 | 本文读取的内容 |
 | --- | --- |
-| `cutlass/include/cute/atom/mma_traits_sm90_gmma.hpp` | GMMA shared memory swizzle layout：`Layout_MN_SW128_Atom` 等。 |
-| `cutlass/include/cute/swizzle.hpp`、`pointer_swizzle.hpp`、`pointer_flagged.hpp` | 地址位 XOR、position-dependent swizzle pointer，以及比特单位 layout 到带元素类型 pointer 的 `upcast`。 |
-| `cutlass/include/cute/layout.hpp` | 普通 `Layout` 的 `upcast` / `downcast` 规则。 |
-| `cutlass/include/cute/atom/copy_traits_sm90_tma.hpp` | `make_tma_copy`、`make_tma_atom`、`tma_partition`、multicast mask。 |
-| `cutlass/include/cute/atom/copy_traits_sm90_tma_swizzle.hpp` | 从 CuTe `Swizzle<B,M,S>` 提取 TMA swizzle width 和 base。 |
-| `cutlass/include/cute/arch/copy_sm90_tma.hpp` | `SM90_TMA_LOAD`、`SM90_TMA_STORE`、`SM90_TMA_REDUCE_ADD` 等 arch-level TMA 指令封装。 |
-| `cutlass/include/cute/arch/copy_sm90_desc.hpp` | `TmaDescriptor`、swizzle / L2 / OOB fill 到 `CUtensorMap` 枚举的映射。 |
-| `cutlass/include/cute/arch/cluster_sm90.hpp` | cluster-level barrier 和 CTA rank 查询。 |
-| `cutlass/include/cutlass/cluster_launch.hpp` | host 侧 cluster launch 封装。 |
-| `cutlass/include/cutlass/arch/barrier.h` | `ClusterBarrier`、`ClusterTransactionBarrier`。 |
-| `cutlass/include/cutlass/pipeline/sm90_pipeline.hpp` | `PipelineState` 环形 stage 和 phase。 |
-| `cutlass/examples/cute/tutorial/hopper/wgmma_tma_sm90.cu` | CuTe TMA + WGMMA 教程示例，本文只看 TMA 相关部分。 |
+| [`include/cute/arch/copy_sm90_tma.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/arch/copy_sm90_tma.hpp) | `SM90_TMA_LOAD/STORE`、multicast、reduce-add、线性 bulk copy，以及 store 的 fence、commit、wait。 |
+| [`include/cute/arch/copy_sm90_desc.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/arch/copy_sm90_desc.hpp) | `initialize_barrier`、`set_barrier_transaction_bytes`、`arrive_barrier`、`wait_barrier`；descriptor 类型、预取、修改和发布。 |
+| [`include/cute/arch/cluster_sm90.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/arch/cluster_sm90.hpp) | cluster barrier、CTA rank、远端 shared 地址和线程选举。 |
+| [`include/cutlass/arch/barrier.h`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/arch/barrier.h) | `ClusterBarrier`、`ClusterTransactionBarrier`，以及 `expect_tx`、`complete_tx`、`inval` 和初始化 fence。 |
+| [`include/cutlass/pipeline/sm90_pipeline.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/pipeline/sm90_pipeline.hpp) | Token、`PipelineState`、`PipelineTmaAsync`，以及 `PipelineAsync` / `PipelineTransactionAsync` 的控制协议。 |
+| [`include/cute/atom/copy_traits_sm90_tma.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_traits_sm90_tma.hpp) | TMA Traits、descriptor 构造、`make_tma_atom`、`make_tma_copy` 和 `tma_partition`。 |
+| [`include/cute/atom/copy_atom.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_atom.hpp) | `Copy_Atom`、`TiledCopy`、`ThrCopy` 的成员和分区接口。 |
+| [`include/cute/algorithm/copy.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/algorithm/copy.hpp) | 分区 Tensor 如何通过 `copy` 交给 Atom 执行。 |
 
-## TMA multicast 先说清楚
+**mbarrier 的 CuTe 封装位于 `copy_sm90_desc.hpp` 中**。`copy_sm90.hpp` 自身主要封装 `stmatrix`，末尾再包含 descriptor 和 TMA 头文件。
 
-**multicast（多播）** 在 TMA 这里的意思是：一条 TMA load 不只把 global memory 的数据写进当前 CTA 的 shared memory，还可以把同一份数据写进同一个 cluster 里多个 CTA 的 shared memory。
+以下 PTX 代码使用语义化操作数名；`%0`、`%1` 等编号只在展示 C++ 内联汇编绑定时出现。PTX 是虚拟指令集，最终还要由工具链翻译成机器指令。
 
-这件事只对 **cluster launch** 有意义。普通 CUDA launch 里 CTA 之间基本互相独立；SM90 cluster launch 会把几个 CTA 组成一个 cluster，cluster 内 CTA 可以使用 cluster-scope shared memory 通信、barrier，以及 TMA multicast。
+本文讨论 **Hopper / SM90 路径**，普通 load 的目标空间为 `shared::cluster`。同一源码中的 SM120 分支使用 `shared::cta`。
 
-为什么 GEMM 需要它？看 A/B operand 的复用：
+## 先读一条 TMA load
 
-| operand | 一个 CTA 计算的 C tile | 哪些 CTA 可能复用它 | multicast 直觉 |
-| --- | --- | --- | --- |
-| A tile `(M,K)` | 不同 `N` tile 会用同一块 A | cluster 内沿 `N` 方向排布的 CTA | A 可以沿 `N` 方向多播。 |
-| B tile `(N,K)` | 不同 `M` tile 会用同一块 B | cluster 内沿 `M` 方向排布的 CTA | B 可以沿 `M` 方向多播。 |
+### 2D global → shared 的指令形式
 
-所以 multicast 不是“把元素排布做了某种 layout”，而是 **TMA load 的接收范围变大了**：
+`SM90_TMA_LOAD_2D::copy` 在 SM90 分支发出的指令是：
 
-```text
-非 multicast:
-  CTA 0 发起 TMA load -> 只写 CTA 0 的 shared memory
-
-multicast:
-  某个 CTA 发起一条 TMA load -> 同时写 CTA 0 / CTA 1 / ... 的 shared memory
+```ptx
+cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint
+    [dst_smem], [tensor_map, {coord0, coord1}], [mbar], cache_policy;
 ```
 
-真实 GEMM mainloop 里还可能让多个 CTA 分片发起同一个逻辑 tile 的 TMA load；每个分片再 multicast 给同一组接收 CTA。后面的 `cta_layout` 就是描述这种分工的。
+这条指令表达：按照 `tensor_map` 描述的规则，从 global tensor 的 `(coord0, coord1)` 开始取一个 box，写入 `dst_smem`；完成后按搬运字节数通知 `mbar`。
 
-CuTe 里和 multicast 有关的名字主要分三层：
+先拆开指令名字：
 
-| 名字 | 回答的问题 | 出现位置 |
+| 指令组成 | 含义 |
+| --- | --- |
+| `cp` | 执行拷贝。 |
+| `async` | 发起后线程可以继续执行，搬运与线程后续指令异步推进。 |
+| `bulk` | 整块数据传输；与 SM80 每线程搬 4/8/16 字节的普通 `cp.async` 区分。 |
+| `tensor.2d` | 使用二维 tensor map 坐标生成地址。这里是 descriptor 的 TMA rank，不一定等于原始 CuTe Tensor 的逻辑 rank。 |
+| `shared::cluster.global` | **目标空间在前、源空间在后**：从 global 搬到 cluster shared 地址空间。 |
+| `mbarrier::complete_tx::bytes` | 采用 mbarrier 完成机制，硬件完成通知的单位是字节。 |
+| `L2::cache_hint` | 存在最后一个 64 位缓存策略操作数；它是性能提示，不负责同步。 |
+
+`shared::cluster` 指定目标地址空间。普通 load 的目标由 shared 地址确定；multicast load 的接收集合由 `multicast::cluster` 修饰符和 CTA mask 指定。普通 launch 的 cluster 大小可以是 1，此时目标位于当前 CTA 的 shared memory。
+
+### 每个操作数是什么
+
+| 操作数 | PTX 输入表示 | 参数含义与约束 |
 | --- | --- | --- |
-| `cluster_size` | 这次 TMA descriptor 按几个 CTA 的 multicast 规模来构造？ | `make_tma_copy` / `make_tma_atom` 参数。 |
-| `cta_layout` | 当前 CTA 在 multicast 分工里是第几号 logical TMA id？ | `tma_partition` 参数。 |
-| `multicast_mask` | 这条 TMA 指令实际写到 cluster 里的哪些 CTA？ | `copy(tma.with(..., multicast_mask), ...)`。 |
+| `dst_smem` | CuTe 传入 32 位 shared 地址，绑定到 `"r"` | 本次搬运的 shared 目标起点，由 `cast_smem_ptr_to_uint` 将 C++ 指针转换为 shared 地址空间中的地址。SM90 tensor copy 的 shared 起点要求 128 字节对齐，swizzle 还要满足对应布局约束。 |
+| `tensor_map` | 64 位 generic 地址，绑定到 `"l"` | **descriptor 对象的地址**。硬件从该对象读取已编码的 global 数据基地址、形状、步幅和 box 规则。对象须位于该 PTX 版本支持的 descriptor 存储空间中。 |
+| `coord0`、`coord1` | 两个 `.s32` 坐标，绑定到 `"r"` | 在 descriptor 所定义维度上的起始元素坐标，单位为元素。例如从编号 3、宽度为 32 的 tile 开始搬运，列起始坐标为 `3 * 32`。 |
+| `mbar` | CuTe 传入 32 位 shared 地址，绑定到 `"r"` | 接收完成通知的 mbarrier 对象地址。对象占 8 字节、要求 8 字节对齐，必须先初始化，并为本 phase 登记对应的 expected bytes。 |
+| `cache_policy` | 64 位策略编码，绑定到 `"l"` | 本次指令使用的 L2 eviction（驱逐）策略。源码给出 `TMA::CacheHintSm90::EVICT_NORMAL/FIRST/LAST`。descriptor 内的 `l2Promotion` 则指定 promotion 粒度。 |
 
-如果不做 multicast，这三个量都退化成最小情况：
+`[tensor_map, {coord0, coord1}]` 是 tensor 寻址操作数：方括号中组合了“描述符地址”和“起点坐标”，硬件据此应用 descriptor 的多维地址生成规则。
 
-```text
-cluster_size = 1
-cta_layout(Int<0>{}) = 0
-multicast_mask 只包含当前 CTA
-```
+### C++ 参数怎样绑定到 PTX
 
-## CUDA TMA 描述符到底描述什么
-
-TMA descriptor 可以理解成“给硬件看的多维 tensor 地址公式”。对 rank 为 $r$ 的 tensor，硬件拿到一个 TMA 坐标：
-
-$$
-c = (c_0, c_1, \dots, c_{r-1})
-$$
-
-然后根据 descriptor 计算 global memory 地址。CuTe 源码里会检查：
+CuTe 的真实接口为：
 
 ```cpp
-assert(gmem_prob_stride[0] == 1 && "Majorness of smem doesn't match majorness of gmem");
+SM90_TMA_LOAD_2D::copy(
+    void const* desc_ptr,
+    uint64_t* mbar_ptr,
+    uint64_t cache_hint,
+    void* smem_ptr,
+    int32_t const& crd0,
+    int32_t const& crd1);
 ```
 
-也就是说 TMA 的第 0 维是 fastest-changing 维度，它在元素单位上的 stride 隐含为 1。换成字节地址，大致是：
+去掉架构判断和日志后，函数内部的核心绑定如下：
 
-$$
-\text{addr}(c) =
-\text{base} +
-c_0 \cdot \text{sizeof}(T) +
-\sum_{d=1}^{r-1} c_d \cdot \text{globalStrideBytes}_d
-$$
+```cpp
+uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
+uint32_t smem_int_mbar = cast_smem_ptr_to_uint(mbar_ptr);
+uint32_t smem_int_ptr = cast_smem_ptr_to_uint(smem_ptr);
 
-这里的 `globalStrideBytes[d]` 是 descriptor 里存的字节步幅。CuTe 会先从 GMEM tensor 的 layout 得到元素 stride，再乘上 `sizeof(TmaInternalType)` 转成字节步幅。
+asm volatile(
+    "cp.async.bulk.tensor.2d.shared::cluster.global"
+    ".mbarrier::complete_tx::bytes.L2::cache_hint"
+    " [%0], [%1, {%3, %4}], [%2], %5;"
+    :
+    : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar),
+      "r"(crd0), "r"(crd1), "l"(cache_hint)
+    : "memory");
+```
 
-descriptor 还描述一次 TMA 指令搬运的 box：
-
-| 字段 | 含义 | CuTe 里的来源 |
+| 编号 | 对应输入 | 指令里的角色 |
 | --- | --- | --- |
-| `rank` / `dim` | TMA tensor rank，硬件最多支持 5D。 | `tma_gbasis` 的 rank，CuTe 会把多余尾部模式 group 到最多 5D。 |
-| `globalDim` | global tensor 每个 TMA 维度的大小。 | `gtensor` 的 shape 加上 TMA basis 映射。 |
-| `globalStrides` | global tensor 第 1 维及之后的字节步幅。第 0 维隐含 contiguous。 | `gtensor` 的 stride。 |
-| `boxDim` | 一次 TMA 指令搬的 tile shape。 | `SLayout` / `CTA_Tiler` 推导出的 SMEM box shape。 |
-| `elementStrides` | box 内每个 TMA 维度的 element stride。 | 通常是 `{1,1,1,1,1}`，im2col / gather-scatter 会更复杂。 |
-| `interleave` | global tensor map interleave。 | CuTe 常规路径里用 `CU_TENSOR_MAP_INTERLEAVE_NONE`。 |
-| `swizzle` | shared memory swizzle。 | 从 SMEM layout 的 `Swizzle<B,M,S>` 推导。 |
-| `l2Promotion` | L2 promotion hint。 | CuTe 常规路径默认 `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`。 |
-| `oobFill` | 越界填充值策略。 | CuTe 常规路径默认 `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE`。 |
+| `%0` | `smem_int_ptr` | shared 目标地址。 |
+| `%1` | `gmem_int_desc` | descriptor 地址。 |
+| `%2` | `smem_int_mbar` | mbarrier 地址。 |
+| `%3`、`%4` | `crd0`、`crd1` | 两个起始元素坐标。 |
+| `%5` | `cache_hint` | L2 策略。 |
 
-先看 CUDA 原始写法。下面这段是2D 示例：Host 侧创建 `CUtensorMap`，Device 侧把它作为 kernel 参数使用。
+`asm volatile` 保留汇编的副作用；`"memory"` clobber 告诉编译器汇编可能访问内存，约束编译器对相关内存访问的优化。**GPU 的访问顺序由 fence 指令建立，TMA 的完成由 mbarrier 或 bulk-group 协议确认。**
+
+### 1D 到 5D 只改变坐标数
+
+`SM90_TMA_LOAD_1D` 到 `SM90_TMA_LOAD_5D` 保持同一协议；`SM90_TMA_LOAD::copy` 按坐标数量分派：
+
+| 变体 | 指令维度 | 坐标操作数 |
+| --- | --- | --- |
+| `SM90_TMA_LOAD_1D` | `.1d` | `{crd0}` |
+| `SM90_TMA_LOAD_2D` | `.2d` | `{crd0, crd1}` |
+| `SM90_TMA_LOAD_3D` | `.3d` | `{crd0, crd1, crd2}` |
+| `SM90_TMA_LOAD_4D` | `.4d` | `{crd0, crd1, crd2, crd3}` |
+| `SM90_TMA_LOAD_5D` | `.5d` | `{crd0, crd1, crd2, crd3, crd4}` |
+
+descriptor rank、指令维度和坐标个数必须一致。每次调用都要给出 shared 起点和完成 barrier，但不单独传 box shape 或搬运字节数，因为这些由 descriptor 决定。
+
+## descriptor 究竟描述什么
+
+global 数据基地址、tensor 形状、字节步幅和 tile box 形状都预先编码进 **tensor map**。每次 load 再提供坐标、shared 目标地址和完成 barrier。
+
+CuTe 的 `TmaDescriptor` 在普通 CUDA 12+ 编译路径下是 `CUtensorMap` 的别名；兼容路径使用 `alignas(64)` 的 128 字节不透明存储。其内部编码由 CUDA API 和 PTX 的专用字段操作维护。
+
+### 从二维数组理解元素地址
+
+先沿用前面 2D load 的两个坐标，给它们配一块具体数据。假设 global memory 中存放一个按行连续排列的 `float matrix[64][128]`：一共 64 行，每行 128 个元素，每个 `float` 占 4 字节。这里关闭 interleave 和 swizzle，每个元素都参与搬运。
+
+我们用 `x` 表示列号、`y` 表示行号。PTX 中的 `(coord0, coord1)` 对应 `(x, y)`，C++ 中同一个元素写成 `matrix[y][x]`。第 0 维是列，因为沿着一行移动时，列坐标变化最快。
+
+从 `matrix[0][0]` 的地址开始，找到任意一个 `matrix[y][x]`，只需要两步：
+
+1. 向下移动 `y` 行。每行占 `128 * 4 = 512` 字节，因此增加 `y * 512` 字节。
+2. 在这一行向右移动 `x` 列。每个元素占 4 字节，因此再增加 `x * 4` 字节。
+
+把 `matrix[0][0]` 的字节地址记为 `base`，这两步写成公式就是：
+
+$$
+\operatorname{addr}(x,y)=\operatorname{base}+y\times512+x\times4.
+$$
+
+例如 `matrix[16][32]` 的地址是 `base + 16 * 512 + 32 * 4`，即从 `base` 向后移动 8320 字节。这里的 **512 是行步幅**：行坐标增加 1 时，地址增加 512 字节。列方向的步幅则是一个元素的大小，即 4 字节。
+
+descriptor 保存 `base`、元素类型和行步幅。每条 TMA 指令提供本次的 `(x, y)`，硬件用这些信息算出读取起点。
+
+### box 决定从起点取多大的区域
+
+现在已经找到了 `matrix[16][32]`。接着需要告诉硬件：**从这里开始，取多少列、多少行。** 这个矩形区域称为 **box（搬运区域）**，它的各维大小保存在 descriptor 的 `boxDim` 中。
+
+假设 box 宽 32、高 8，从该起点搬运的元素为：
+
+| box 中的行 | global 中选中的元素 | 这一行的读取起点 |
+| --- | --- | --- |
+| 第 0 行 | `matrix[16][32]` 到 `matrix[16][63]` | `base + 16 * 512 + 32 * 4` |
+| 第 1 行 | `matrix[17][32]` 到 `matrix[17][63]` | `base + 17 * 512 + 32 * 4` |
+| 第 2～6 行 | 按同样规则读取 global 第 18～22 行的第 32～63 列。 | 每向下一行，读取起点增加 512 字节。 |
+| 第 7 行 | `matrix[23][32]` 到 `matrix[23][63]` | `base + 23 * 512 + 32 * 4` |
+
+因此，硬件在 global 中读取 **8 个各长 128 字节、行起点相隔 512 字节的区间**，共搬运 `8 * 32 * 4 = 1024` 字节。
+
+**元素坐标选择起点，box 形状选择搬运范围，global 步幅决定范围内各行的实际地址。** 三者合起来，才完整描述这一条 TMA load 要读取的数据。
+
+### 把例子对应到 descriptor 和指令参数
+
+前面的具体数字对应如下：
+
+| 信息 | 数值 | 含义与提供位置 |
+| --- | --- | --- |
+| 数据基地址 | `base` | `matrix[0][0]` 的 global 地址，编码进 descriptor。 |
+| `globalDim` | `{128, 64}` | 完整数组的列数和行数，编码进 descriptor。 |
+| `globalStrides` | `{512}` | 行方向的字节步幅，编码进 descriptor。列方向的连续元素步幅由元素类型确定。 |
+| `boxDim` | `{32, 8}` | 本例一次取 32 列、8 行，编码进 descriptor。 |
+| `elementStrides` | `{1, 1}` | 沿各维逐个取元素，编码进 descriptor。 |
+| `tensorCoords` | `{32, 16}` | 本次读取的列、行起点，作为 `(coord0, coord1)` 传给 TMA 指令。 |
+
+构造好这个 descriptor 后，传入 `{64, 16}` 就会取同样宽 32、高 8 的 box，起点变为 `matrix[16][64]`。这样，一个 descriptor 可以用于同一数组中多个起点的搬运。
+
+TMA 指令还接收本次的 `dst_smem`，用于选择搬运结果放入哪个 shared buffer 或 pipeline stage。下面先把 descriptor 的构造参数逐项列出来，再看 shared 目标和完成字节数。
+
+### `cuTensorMapEncodeTiled` 的参数
+
+下面按调用顺序解释普通 tiled descriptor 的构造参数：
+
+| 参数 | 类型 / 单位 | 含义 |
+| --- | --- | --- |
+| `tensorMap` | `CUtensorMap*` | 输出 descriptor；对象地址要求 64 字节对齐。 |
+| `tensorDataType` | `CUtensorMapDataType` | 描述元素格式，例如 `FLOAT32`；决定地址换算、box 字节数及支持的操作。 |
+| `tensorRank` | `uint32_t` | TMA rank，范围 1～5。 |
+| `globalAddress` | device 数据指针 | global tensor 基地址。普通 SM90 tiled 路径至少要求 16 字节对齐。 |
+| `globalDim` | `uint64_t[rank]`，元素 | 每维完整大小，最快变化维度在第 0 维；每维非零，最大为 $2^{32}$。 |
+| `globalStrides` | `uint64_t[rank-1]`，字节 | 第 1 维及之后的 global 步幅。第 0 维连续元素步幅隐含，不传入；普通路径要求 16 字节倍数且小于 $2^{40}$。 |
+| `boxDim` | `uint32_t[rank]`，元素跨度 | 一条指令沿各维遍历的范围，每维 1～256。无 interleave 时，`boxDim[0] * sizeof(T)` 要是 16 字节倍数。 |
+| `elementStrides` | `uint32_t[rank]`，元素 | box 遍历的采样步长，范围 1～8。普通 CuTe tiled 构造路径使用全 1。 |
+| `interleave` | `CUtensorMapInterleave` | global tensor 的 interleave 编码方式；本文使用 `NONE`。 |
+| `swizzle` | `CUtensorMapSwizzle` | shared 布局的地址重排规则。load 写入与 store 读取必须使用匹配的 shared 布局。 |
+| `l2Promotion` | `CUtensorMapL2promotion` | L2 promotion 粒度提示；与每次指令的 eviction `cache_policy` 不同。 |
+| `oobFill` | `CUtensorMapFloatOOBfill` | load 越界填充策略。普通路径的 `NONE` 对越界位置补零，另一枚举用于特定浮点 NaN 策略。 |
+
+`boxDim` 表示遍历跨度，`elementStrides` 表示采样步长，沿第 `i` 维通常取 `ceil(boxDim[i] / elementStrides[i])` 个元素。无 interleave 时，第 0 维按连续元素访问，`elementStrides[0]` 被忽略。本文后续字节数计算均假设全 1，此时 box 形状就是输出元素形状。
+
+这些是普通 SM90 tiled 模式的约束；swizzle、interleave 和特殊数据格式还会增加要求。完整参数契约见 [CUDA Driver API：`cuTensorMapEncodeTiled`](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__TENSOR__MEMORY.html)。
+
+### shared 目标布局与传输字节数
+
+继续看上面的 32 列、8 行 box。关闭 swizzle 时，TMA 把结果放进按行连续排列的 shared `float tile[8][32]`，其中 `tile[local_y][local_x]` 对应 global 的 `matrix[16 + local_y][32 + local_x]`。
+
+global 中每行起点相隔 512 字节，shared 中每行占 `32 * 4 = 128` 字节。TMA 根据 descriptor 生成 global 各行的读取地址，将选中的 32 个元素逐行放入 shared box。
+
+这次传输量为 `32 * 8 * sizeof(float) = 1024` 字节，后面的 mbarrier 完成协议就按这 1024 字节登记和等待。
+
+打开 swizzle 后，元素的 shared 物理位置由 swizzled layout 计算，消费者须使用同一布局寻址。
+
+三个地址的对齐要求分别是：**global 数据基地址至少 16 字节、tensor copy 的 shared 起点 128 字节、mbarrier 起点 8 字节。** 线性 bulk copy 的 shared 起点要求 16 字节对齐。SM90 tensor copy 的对齐表见 [CUDA TMA 对齐要求](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#asynchronous-data-copies-using-tensor-memory-access-tma)。
+
+### descriptor 的存放位置和生命周期
+
+- **host 构造，kernel 参数传入**：通过 `const __grid_constant__ CUtensorMap` 之类的方式，让设备端使用参数空间中的 descriptor 地址。`__grid_constant__` 保持参数对象供整个 grid 使用，取址时使用该参数对象。
+- **device global descriptor**：新一些的 PTX 支持把 descriptor 放在 global 并在设备端修改；需要正确发布到 tensormap proxy。后文单独说明。
+- **shared descriptor**：设备端修改时的暂存对象。修改后，先将它复制并发布到 global descriptor，再把 global descriptor 地址传给 SM90 tensor copy。
+- descriptor 在硬件读取它期间必须保持有效；它描述的 global 数据缓冲区也必须存活到相应传输完成。
+
+**移动坐标、切换 shared stage 时复用原 descriptor；更换 global 基地址、形状、步幅或 box 规则时构造或合法更新 descriptor。**
+
+## mbarrier：线程到达和数据完成分别记账
+
+TMA load 的完成后缀告诉我们：必须提供一个可以接收 `complete_tx` 的对象。这个对象就是 shared memory 中的 **mbarrier**。
+
+它至少维护三类逻辑状态：
+
+| 状态 | 作用 | 谁推进 |
+| --- | --- | --- |
+| pending arrivals | 本 phase 还有多少次到达没有发生。 | 线程执行 `mbarrier.arrive` 或 `arrive.expect_tx` 等操作。 |
+| tx-count | 本 phase 还有多少异步工作未完成。TMA load 路径以字节计数。 | 软件登记 expected bytes，TMA 完成时扣减 bytes。 |
+| phase | 当前是哪一轮同步。 | 当到达与事务条件都满足时，barrier 自动进入下一 phase。 |
+
+**phase 完成需要 pending arrivals 和 tx-count 都为零。** 线程的 arrive 操作推进到达计数，TMA 的 complete-tx 通知推进事务计数，两项条件共同决定 phase 完成。
+
+### `mbarrier.init`：初始化到达计数
+
+```ptx
+mbarrier.init.shared::cta.b64 [mbar], arrival_count;
+```
+
+CuTe 封装是 `initialize_barrier(uint64_t& smem_barrier, int thread_count = 1)`。
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `[mbar]` | 当前 CTA 的 shared barrier 地址；8 字节对象、8 字节对齐。 |
+| `arrival_count` | 每个 phase 预期的 arrival 总数，32 位计数，合法范围 1～$2^{20}-1$。它由参与到达的线程及其协议规定的到达次数决定。 |
+| `shared::cta` | barrier 存在当前 CTA 的 shared 空间。 |
+| `b64` | barrier 对象的存储宽度为 64 位；输入的到达计数为 32 位。 |
+
+初始化后第一轮 parity 为 0，pending arrivals 等于 `arrival_count`，事务计数为 0。
+
+典型情形是一个 leader 负责登记并发起 load，128 个线程读取 shared 数据：**只要每 phase 只有 leader 执行一次 arrive，就应初始化为 1，即使有 128 个 waiter。**
+
+初始化通常由一个线程执行，再通过适当的 fence 和 CTA / cluster 同步发布。其他线程在发布完成后开始使用 barrier。
+
+### `mbarrier.arrive.expect_tx`：登记字节数，同时到达一次
+
+```ptx
+mbarrier.arrive.expect_tx.shared::cta.b64 state, [mbar], tx_bytes;
+```
+
+CuTe 的 `set_barrier_transaction_bytes(smem_barrier, bytes)` 实际发出：
+
+```ptx
+mbarrier.arrive.expect_tx.shared::cta.b64 _, [mbar], tx_bytes;
+```
+
+| 参数 | 类型 / 单位 | 含义 |
+| --- | --- | --- |
+| `state` 或 `_` | `.b64` 输出 / 丢弃输出 | 本次 arrive 所属 phase 的 opaque token，可作为 token-based wait 的输入；CuTe 用 `_` 丢弃它，采用 parity 等待。 |
+| `[mbar]` | shared 地址 | 要登记并到达的 barrier。 |
+| `tx_bytes` | `.u32`，字节 | 本次为当前 phase **增加**的 expected transaction bytes，按绑定到该 barrier 的传输量计算。 |
+
+这条指令原子地组合两件事：**将 `tx_bytes` 加入事务计数，以及把 pending arrivals 减 1**。`set_barrier_transaction_bytes` 的准确作用就是“登记本次事务量并到达一次”。
+
+对于前面的 1024 字节 tile，可以先执行 `arrive.expect_tx(..., 1024)`，再发起 TMA load。这样唯一的 arrival 已发生，但 barrier 仍会等硬件交回这 1024 字节。
+
+**leader 的一次到达由 `set_barrier_transaction_bytes` 完成。** 初始化为 1 时，本 phase 的 arrival 配额随这次调用归零，随后等待已登记事务完成。
+
+### `mbarrier.arrive`：只到达，不登记事务
+
+```ptx
+mbarrier.arrive.shared::cta.b64 state, [mbar];
+```
+
+CuTe 对应 `arrive_barrier(uint64_t& smem_barrier)`，在内部创建一个 `.b64 state` 寄存器并丢弃返回结果。
+
+| 参数 | 含义 |
+| --- | --- |
+| `state` | 到达所属 phase 的 opaque token，可供非 parity 的 wait 使用。 |
+| `[mbar]` | 本地 shared barrier 地址。 |
+
+省略显式 count 时，这条指令把 pending arrivals 减 1，事务计数保持原值。它可以用于消费者释放 shared stage，或者在使用独立 `expect_tx` 的协议中完成 arrival。
+
+### `mbarrier.try_wait.parity`：等待指定 phase 完成
+
+```ptx
+mbarrier.try_wait.parity.shared::cta.b64 done, [mbar], phase_parity;
+```
+
+CuTe 的 `wait_barrier(uint64_t& smem_barrier, int phase_bit)` 用这条指令构成循环，直到 `done` 为真。
+
+| 参数 | 类型 | 含义 |
+| --- | --- | --- |
+| `done` | `.pred` 输出 | 被等待的 phase 已完成则为真，未完成则为假。 |
+| `[mbar]` | shared 地址 | 当前 CTA 中被等待的本地 barrier 地址。 |
+| `phase_parity` | `.b32`，取值 0/1 | **要等待的那一轮 phase 的 parity**。第一轮传 0，成功后说明 phase 0 已完成，barrier 已进入下一轮。 |
+
+`try_wait` 可能暂时挂起线程，也可能在 phase 完成前返回假，因此单次调用不够，必须检查结果。PTX 还支持可选的 32 位 `suspendTimeHint`，单位是纳秒；CuTe 这个封装没有传入该参数。
+
+源码中的这一指令形式默认使用 acquire 语义。成功观察完成后，等待线程可以按该同步协议使用 TMA 写入的数据。`test_wait` 立即返回测试结果，`try_wait` 可能暂时挂起线程。
+
+**wait 检测 phase 完成，并在成功时建立 acquire 顺序；arrival count 保持原值。** consumer 可以仅承担等待和消费职责，因此同一个 barrier 支持一个 producer 到达、多名 consumer 等待。
+
+### 独立的 expect、complete 和 inval
+
+下面几条指令在 `cutlass/arch/barrier.h` 的 `ClusterTransactionBarrier` / `ClusterBarrier` 中有封装，适合补足指令模型：
+
+```ptx
+mbarrier.expect_tx.shared::cta.b64 [mbar], tx_bytes;
+mbarrier.complete_tx.shared::cluster.relaxed.cluster.b64 [remote_mbar], tx_bytes;
+mbarrier.inval.shared::cta.b64 [mbar];
+```
+
+| 指令 | 全部参数的含义 | 副作用与使用场景 |
+| --- | --- | --- |
+| `expect_tx` | `[mbar]` 是本地 barrier；`tx_bytes` 为 32 位事务计数，在本文 TMA 协议中单位为字节。 | 仅增加 expected bytes，不执行 arrival。如果拆开登记和到达，先登记，再允许最后一次 arrive 发生，避免空 phase 提前完成。 |
+| `complete_tx` | `[remote_mbar]` 是 cluster shared 地址；`tx_bytes` 是完成计数。`relaxed.cluster` 是内存语义 / 作用范围，`shared::cluster` 是地址空间。 | 扣减事务计数，不代替 arrival。普通 TMA load 由硬件执行完成通知，软件不应重复扣减；手动调用用于其他受控事务协议。 |
+| `inval` | `[mbar]` 是不再使用的 barrier 地址。 | 使对象失效。必须先保证没有未完成事务、等待或远端访问；若把这 8 字节改作其他用途，需要先 invalidate。 |
+
+### 一轮 load 的状态变化
+
+对于初始化为 1、传输 1024 字节的单 tile：
+
+| 时刻 | 当前 parity | pending arrivals | tx-count | 数据与同步状态 |
+| --- | --- | --- | --- | --- |
+| `init(..., 1)` 后 | 0 | 1 | 0 | barrier 已初始化，等待 leader 登记事务并到达。 |
+| `arrive.expect_tx(..., 1024)` 后 | 0 | 0 | 1024 | leader 已到达，等待 1024 字节的数据完成通知。 |
+| 发起 TMA 指令后 | 0 | 0 | 尚未完成的字节数 | 硬件正在推进传输，consumer 等待 phase 0。 |
+| 所有 1024 字节完成通知后 | 进入 1 | 重装为 1 | 0 | 成功等待 phase 0 的线程可以读取。 |
+
+硬件可以逐步完成事务，表格只表示逻辑记账，不假设一条指令只触发一次不可分割的物理传输。
+
+如果同一轮有 A、B 两次 load，共享一个 barrier：
+
+$$
+\operatorname{expectedBytes}
+= \operatorname{bytes}(A) + \operatorname{bytes}(B).
+$$
+
+leader 只需一次 `arrive.expect_tx` 登记总量，再发起两条指令；arrival count 仍可以是 1。每条 load 的完成只扣除自己贡献的字节数。
+
+计数按**本 phase 绑定到该 barrier 的所有指令实际传输字节数之和**计算。对于全 1 的 `elementStrides` 和常规元素类型，单条 tiled load 的字节数是各维 box 大小的乘积再乘 `sizeof(T)`；shared 分配中的 padding 按实际传输范围另行处理。
+
+在普通 tiled load 中，global 越界部分也会向 shared 填充数据；expected bytes 按完整传输 box 计算，包含这些填充位置。每个 phase 登记的事务量还须满足 SM90 barrier 的计数范围。
+
+### phase、stage 和缓冲区复用
+
+**stage 是 shared 缓冲区槽位，phase 是某个 barrier 的使用轮次。** 例如双缓冲有两个 stage，各自持有一个 ready barrier；每个 barrier 的 parity 在自己被复用时才翻转。
+
+```cpp
+// 示意：单个 shared stage 串行复用，省略初始化和实际 load 参数。
+int phase = 0;
+for (int tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+    if (threadIdx.x == 0) {
+        cute::set_barrier_transaction_bytes(ready_barrier, tile_bytes);
+        // 发起本轮 TMA load，并绑定 ready_barrier。
+    }
+    cute::wait_barrier(ready_barrier, phase);
+    // 所有消费者读取 shared tile。
+    __syncthreads();  // 所有消费者读完后，producer 才能覆盖同一 stage。
+    phase ^= 1;
+}
+```
+
+ready barrier 的完成表示“数据到达”。上面的 CTA 同步确认“所有消费者读完”，承担释放 stage 的职责；真正的 warp-specialized pipeline 常用另一组 empty / consumed barrier 完成反向通知。
+
+如果消费者是异步 WGMMA，释放 stage 前先通过 WGMMA 完成协议确认其 shared 读取结束，再将 stage 交给下一轮 TMA。`__syncthreads()` 负责 CTA 线程的会合。
+
+parity 只有一位，wait 的有效目标为当前 phase 或紧邻的上一 phase。协议通过 stage 释放控制 producer 的推进，并保证每轮至少成功检测一次完成，再进行下一轮 arrival；这些规则见 [PTX 的 mbarrier phase 规则](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-mbarrier)。
+
+## fence：把可见性和完成等待分开
+
+### generic、async 和 tensormap proxy
+
+PTX 用 **proxy（访问代理）** 区分不同方式发起的内存访问。与本题直接相关的有：
+
+| proxy | 本文中的访问 |
+| --- | --- |
+| generic proxy | 线程普通 load/store，例如 C++ 代码写 shared。 |
+| async proxy | TMA 执行 bulk 数据搬运时读写内存。 |
+| tensormap proxy | 硬件读取 descriptor，用其生成 tensor 地址。 |
+
+同一块物理内存，跨 proxy 访问时仍需要相应的顺序保证。下面三类 fence 的目的不同：发布 barrier 初始化、发布 shared 数据、发布修改后的 descriptor。
+
+### `fence.proxy.async.shared::cta`：把 shared 写入交给 async 访问
+
+```ptx
+fence.proxy.async.shared::cta;
+```
+
+CuTe 对应 `tma_store_fence()`，CUTLASS 也有 `fence_view_async_shared()`。
+
+| 修饰符 / 参数 | 含义 |
+| --- | --- |
+| `proxy.async` | 在 generic 和 async proxy 的访问之间建立顺序。 |
+| `shared::cta` | 指定 fence 约束的**地址空间**：当前 CTA 的 shared memory。线程间的会合由 CTA 同步操作完成。 |
+| 无操作数 | 不传 buffer 指针、长度或 barrier；约束作用于该线程相应的内存访问。 |
+
+典型使用场景是：线程先普通 store 到 shared，之后 TMA store 要从 shared 读取这些结果。多线程共同写 buffer 时，采用：
+
+```cpp
+// 每个 producer 先写自己负责的 shared 数据。
+smem_tile[threadIdx.x] = value;
+cute::tma_store_fence();  // 每个写入线程建立自己的跨 proxy 顺序。
+__syncthreads();          // leader 等所有写入线程完成写入和 fence。
+if (threadIdx.x == 0) {
+    // leader 发起 TMA store。
+}
+```
+
+每个 producer 为自己的 shared 写入建立跨 proxy 顺序，CTA 同步再将所有 producer 的进度汇合到 leader。上面这组“各自 fence → 集体同步 → leader 发起”的组合与 [CUDA 的 TMA 示例](https://docs.nvidia.com/cuda/archive/13.0.0/cuda-c-programming-guide/index.html#asynchronous-data-copies-using-tensor-memory-access-tma) 一致。
+
+这个 fence 也可用于单 CTA 场景下让 barrier 初始化对 async proxy 可见；因此 `tma_store_fence` 虽以 store 命名，其实际指令的用途不限于输出 store。
+
+load 的完成包含隐含的 generic–async proxy fence；consumer 通过正确的 acquire wait 观察完成后，即可用普通 shared load 读取结果。这个完成规则见 [PTX：Async Proxy](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#async-proxy)。
+
+### `fence.mbarrier_init.release.cluster`：发布初始化
+
+```ptx
+fence.mbarrier_init.release.cluster;
+```
+
+它在 `cutlass/arch/barrier.h` 中由 `cutlass::arch::fence_barrier_init()` 封装。
+
+| 修饰符 / 参数 | 含义 |
+| --- | --- |
+| `mbarrier_init` | fence 约束的操作是先前的 barrier 初始化。 |
+| `release` | 建立初始化发布所需的 release 顺序。 |
+| `cluster` | 发布顺序的作用范围覆盖 cluster。 |
+| 无操作数 | 可以批量初始化多个 barrier 后 fence 一次，不需要逐个传 barrier 地址。 |
+
+CUTLASS 的源码注释明确要求它与合适范围的同步组合。例如：
+
+```cpp
+if (threadIdx.x == 0) {
+    cute::initialize_barrier(ready_barrier, 1);
+    cutlass::arch::fence_barrier_init();
+}
+cute::cluster_sync();  // cluster 的所有线程执行，之后再访问接收 CTA 的 barrier。
+```
+
+这里的 fence 发布本线程完成的 barrier 初始化，cluster 同步汇合各 CTA 的初始化进度；随后发起的 TMA load 通过 mbarrier wait 确认完成。
+
+### 三种动作解决三个问题
+
+| 动作 | 直接效果 | 配合的操作 |
+| --- | --- | --- |
+| proxy / init fence | 建立先前 shared 写入或 barrier 初始化与后续相关访问之间的顺序。 | 用 CTA / cluster 同步汇合参与线程的进度。 |
+| `__syncthreads()` / `cluster_sync()` | 参与线程在指定范围内会合，并建立对应的线程间内存顺序。 | 用 mbarrier / bulk-group wait 确认异步工作达到完成条件。 |
+| mbarrier wait / bulk-group wait | 执行等待的线程观察到异步工作的相应完成阶段。 | 用消费者释放协议确认 shared 可复用；用线程间同步传递等待结果。 |
+
+fence 的选择由数据流决定：shared producer 写入接 TMA 读取时使用 async proxy fence，barrier 初始化接远端使用时发布初始化，descriptor 修改接硬件读取时使用 tensormap 发布协议。
+
+## TMA store：shared → global 使用 bulk group
+
+### store 指令和参数
+
+`SM90_TMA_STORE_2D::copy` 发出：
+
+```ptx
+cp.async.bulk.tensor.2d.global.shared::cta.bulk_group
+    [tensor_map, {coord0, coord1}], [src_smem];
+```
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `global.shared::cta` | 目标 global，源为当前 CTA shared。 |
+| `[tensor_map, {coord0, coord1}]` | 描述**目标 global tensor**的 descriptor，以及目标起始元素坐标。 |
+| `[src_smem]` | shared 源 box 的起点，CuTe 转为 32 位 shared 地址；要求 128 字节对齐，并与 descriptor 的 shared 布局规则一致。 |
+| `bulk_group` | 使用发起线程的 bulk async-group 跟踪完成，不接收 mbarrier 地址。 |
+
+真实封装参数顺序是 `copy(desc_ptr, smem_ptr, crd0, crd1)`；1D～5D 变体仍然只改变坐标数量。
+
+边界规则也要按方向区分：load 起点可以包含负坐标，越界位置按填充策略处理；store 要求各起始坐标非负，写入范围限于目标 tensor 的有效区域。本例所有坐标均在范围内。
+
+每个 descriptor 保存一个 global tensor 基地址。输入和输出位于两块 allocation 时，分别准备对应 descriptor，或按更新协议切换其中的基地址。
+
+### `cp.async.bulk.commit_group`：提交本线程发起的工作
+
+```ptx
+cp.async.bulk.commit_group;
+```
+
+CuTe 的 `tma_store_arrive()` 和 `tma_desc_commit_group()` 都发出这条指令。
+
+- **没有操作数。** 对这里的 store 协议，它把当前线程先前发起、尚未提交的 bulk-group 操作加入一个新 group。
+- group 是 **per-thread（每线程）** 的，归属于发起并提交这些操作的线程。
+- 一次 commit 可以包含多条 store；group 内各条异步访问独立推进，通过 group wait 统一确认相应完成条件。
+- **`tma_store_arrive()` 的实际操作是提交 bulk group**，对应 `cp.async.bulk.commit_group`。
+
+发起 store、commit 和 wait 由同一个 leader 负责。例如线程 0 发起并提交 store，线程 0 随后等待自己的 group，再通过线程间同步向其他线程传递结果。
+
+tensor load 的 **descriptor 读取结束**还可以由 bulk group 单独跟踪，供后续修改 descriptor 使用；load 的数据搬运完成由 mbarrier 跟踪。后文会解释 `tma_desc_commit_group` / `tma_desc_wait_group` 的作用。
+
+### `.read` 等待和完整等待
+
+```ptx
+cp.async.bulk.wait_group.read N;
+cp.async.bulk.wait_group N;
+```
+
+| 参数 / 变体 | 含义 |
+| --- | --- |
+| `N` | 编译期非负整数常量，表示允许最新的至多 N 个已提交 group 尚未达到相应完成条件。其余更早的 group 必须达到该条件，group 数量由 commit 次数确定。 |
+| `.read N` | 等待更早 group 完成源读取。对 TMA store 来说，可以在这之后复用其 shared 源。 |
+| 不带 `.read` 的 `N` | 等待更早 group 的读、写均完成，且写入对执行 wait 的线程可见。 |
+| `N = 0` | 要求此前提交的所有 group 满足对应条件。 |
+
+CuTe 的 `tma_store_wait<Count>()` 发出 **`cp.async.bulk.wait_group.read Count`**，模板参数通过 `"n"` 绑定为立即数。它确认较早 group 的源读取结束，使这些 group 使用的 shared 源可以进入复用流程。需要 global 输出时，发起线程使用完整 wait 确认写入完成，再向其他读取线程传递可见性。
+
+例如已提交 `G0`、`G1`、`G2` 三组后，`.read 1` 可以允许最新的 `G2` 仍在读取源，而要求更早的 `G0`、`G1` 读完。只有 `.read 0` 才能据此释放所有这些 group 使用的 shared 源。
+
+如果同一 kernel 内接着读取 global 输出，应等待完整写入；其他线程读取时还需要适当的线程间同步来传递可见性。`.read` 与完整 wait 的语法可见 [CCCL：`cp.async.bulk.wait_group`](https://nvidia.github.io/cccl/unstable/libcudacxx/ptx/instructions/cp_async_bulk_wait_group.html)，完成条件由 [PTX 指令语义](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-wait-group) 定义。
+
+### store 的完整调用顺序
+
+1. producer 线程通过普通 store 写 shared buffer。
+2. 每个写入线程执行 `fence.proxy.async.shared::cta`。
+3. producer 与 leader 做适当同步；如果整个 CTA 参与，可用 `__syncthreads()`。
+4. leader 发起一条或多条 TMA store。
+5. 同一 leader 执行 `cp.async.bulk.commit_group`。
+6. 复用 shared 源之前，leader 等待相应 `.read` 完成；同 kernel 需要 global 结果时，等待完整写入。
+7. 若其他线程要覆盖 shared 源或读取 global 结果，再通过适当同步把 leader 的等待结果传给它们。
+
+## 一个从 descriptor 到 load / store 的 2D 示例
+
+下面示例只处理一个 tile：从 row-major `float[64][128]` 的 `(x=32, y=16)` 位置读取宽 32、高 8 的区域，每个元素加 1，再写到另一块同形状 global tensor 的同一位置。
+
+关闭 swizzle；一个 CTA、128 个线程；只有线程 0 登记 expected bytes 和发起 TMA。代码直接使用 arch 层函数，便于把调用与前面的 PTX 对齐。
+
+### host 构造 descriptor
+
+以下代码块与下一节 kernel 放在同一个 `.cu` 文件中即可编译。这里不包含内存分配和 `main`；调用方需要准备两块设备缓冲区。
 
 ```cpp
 #include <cuda.h>
-#include <cudaTypedefs.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <stdexcept>
+#include <string>
+#include <cute/arch/copy_sm90_tma.hpp>
 
-constexpr uint64_t GMEM_WIDTH  = 4096;
-constexpr uint64_t GMEM_HEIGHT = 4096;
-constexpr uint32_t SMEM_WIDTH  = 64;
-constexpr uint32_t SMEM_HEIGHT = 64;
+constexpr int kGlobalWidth = 128;
+constexpr int kGlobalHeight = 64;
+constexpr int kTileWidth = 32;
+constexpr int kTileHeight = 8;
+constexpr uint32_t kTileBytes = kTileWidth * kTileHeight * sizeof(float);
 
 /**
- * @brief 为一个 2D row-major int tensor 创建 TMA tensor map。
- *
- * @param tensor_ptr global memory 指针，要求满足 TMA descriptor 的对齐约束。
- * @return 可以传给 kernel 的 `CUtensorMap`。
+ * @brief 为 row-major float[64][128] 编码宽 32、高 8 的 tiled tensor map。
+ * @param device_ptr 借用的设备数据指针；对应 allocation 在传输结束前必须有效。
+ * @return host 端构造的 descriptor，随后以 grid-constant kernel 参数传入。
  */
-CUtensorMap make_tensor_map(int* tensor_ptr) {
-    CUtensorMap tensor_map{};
+CUtensorMap make_tensor_map(float* device_ptr) {
+    alignas(64) CUtensorMap tensor_map{};
+    uint64_t global_dim[2] = {kGlobalWidth, kGlobalHeight};
+    uint64_t global_strides[1] = {kGlobalWidth * sizeof(float)};
+    uint32_t box_dim[2] = {kTileWidth, kTileHeight};
+    uint32_t element_strides[2] = {1, 1};
 
-    // TMA 文档习惯把最快变化维度放在前面。
-    // 对 row-major int[GMEM_HEIGHT][GMEM_WIDTH] 来说，x 是第 0 维。
-    constexpr uint32_t rank = 2;
-    uint64_t global_dim[rank] = {
-        GMEM_WIDTH,
-        GMEM_HEIGHT,
-    };
-
-    // `global_strides` 的单位是字节，不是元素个数。
-    // rank=2 时只需要 rank-1 个 stride，因为第 0 维 stride 隐含为 1 个元素。
-    uint64_t global_strides[rank - 1] = {
-        GMEM_WIDTH * sizeof(int),
-    };
-
-    // `box_dim` 描述一次 TMA 指令搬到 shared memory 的 tile 大小。
-    uint32_t box_dim[rank] = {
-        SMEM_WIDTH,
-        SMEM_HEIGHT,
-    };
-
-    // `element_strides` 表示 box 内每一维的采样步长。
-    // `{1, 1}` 表示每个元素都搬，不做稀疏采样。
-    uint32_t element_strides[rank] = {1, 1};
-
-    auto encode_tiled = get_cuTensorMapEncodeTiled();
-    CUresult result = encode_tiled(
-        &tensor_map,
-        CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT32,
-        rank,
-        tensor_ptr,
-        global_dim,
-        global_strides,
-        box_dim,
-        element_strides,
-        CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-        CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
-        CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-
-    // 真实代码里要检查 result，这里只突出 descriptor 字段。
+    CUresult result = cuTensorMapEncodeTiled(
+        &tensor_map, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, 2, device_ptr,
+        global_dim, global_strides, box_dim, element_strides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    if (result != CUDA_SUCCESS) {
+        throw std::runtime_error(
+            "cuTensorMapEncodeTiled 失败，CUresult=" +
+            std::to_string(static_cast<int>(result)));
+    }
     return tensor_map;
 }
 ```
 
-这样前面的名词就能和 API 参数直接对上：
+输入输出分别调用 `make_tensor_map`，因为 descriptor 内包含各自的 global 基地址。这里 host 选择 `L2_PROMOTION_NONE`；当前 CuTe 普通构造路径默认选择 `L2_128B`，这不改变本例的同步协议。
 
-| 名词 | CUDA 代码里的变量 / 参数 | 注意点 |
-| --- | --- | --- |
-| base address | `tensor_ptr` | global memory 基地址，TMA 要求对齐。 |
-| rank | `rank` | tensor 维度，bulk-tensor TMA 支持 1D 到 5D。 |
-| global shape | `global_dim` | 单位是元素个数。 |
-| global stride | `global_strides` | 单位是字节；不包含第 0 维 stride。 |
-| box shape | `box_dim` | 一条 TMA 指令搬到 shared memory 的 tile shape。 |
-| element stride | `element_strides` | box 内每一维采样步长。 |
-| interleave | `CU_TENSOR_MAP_INTERLEAVE_NONE` | 常规 GEMM 路径通常不用 interleave。 |
-| swizzle | `CU_TENSOR_MAP_SWIZZLE_NONE` / `CU_TENSOR_MAP_SWIZZLE_128B` | 决定 TMA 写入 shared memory 时是否做 swizzle。 |
-| L2 promotion | `CU_TENSOR_MAP_L2_PROMOTION_NONE` | L2 hint。CuTe 常规路径默认 128 字节 promotion。 |
-| OOB fill | `CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE` | 越界填充策略。 |
-
-如果要启用 128 字节 swizzle，CUDA 代码里改的是 `cuTensorMapEncodeTiled` 的 swizzle 参数：
-
-```cpp
-CUresult result = encode_tiled(
-    &tensor_map,
-    CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_INT32,
-    rank,
-    tensor_ptr,
-    global_dim,
-    global_strides,
-    box_dim,
-    element_strides,
-    CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-    CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
-    CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
-    CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-```
-
-CuTe 做的事情，本质上就是把这些数组和枚举从 `Tensor` / `Layout` 里推导出来。源码里的真实函数名是 `make_tma_copy_desc`，在 `cute/atom/copy_traits_sm90_tma.hpp`。下面是裁剪后的关键片段，不是一个新造 API。
+### kernel 发起 load，等待读取，修改后发起 store
 
 ```cpp
 /**
- * @brief 从 CuTe GMEM tensor、TMA basis 和 SMEM swizzle 构造 `TmaDescriptor`。
- *
- * @tparam TmaInternalType descriptor 中使用的元素类型。
- * @tparam GEngine GMEM tensor 的 engine 类型。
- * @tparam GLayout GMEM tensor 的 layout 类型。
- * @tparam TShape `tma_gbasis` 的 shape 类型。
- * @tparam TStride `tma_gbasis` 的 stride 类型。
- * @tparam B SMEM swizzle 的位宽编码。
- * @tparam M SMEM swizzle 的 base 编码。
- * @tparam S SMEM swizzle 的 shift 编码。
- * @param gtensor 原始 GMEM tensor，对应 CUDA 示例里的 `tensor_ptr + global_dim + global_strides`。
- * @param tma_gbasis TMA 维度到 GMEM 逻辑维度的映射，用来推导 `global_dim` 和 `box_dim`。
- * @param swizzle 从 SMEM layout 中抽出的 swizzle，对应 `CUtensorMapSwizzle`。
- * @param num_multicast multicast CTA 数，用来调整每个 CTA 实际接收的 SMEM box。
- * @return CuTe TMA copy traits 需要的 descriptor 和辅助 stride 信息。
+ * @brief 单 CTA 将一个 32 x 8 tile 加 1 后写到输出 tensor。
+ * @param input_map 输入 global tensor 的 descriptor，借用其设备缓冲区。
+ * @param output_map 输出 global tensor 的 descriptor，借用另一设备缓冲区。
+ * @param tile_x 列方向起始元素坐标；调用方保证整个 tile 在范围内。
+ * @param tile_y 行方向起始元素坐标；调用方保证整个 tile 在范围内。
+ * @details 固定以 <<<1, 128>>> 发射；所有线程参与 CTA 同步和 shared 消费。
  */
-template <class TmaInternalType,
-          class GEngine, class GLayout,
-          class TShape, class TStride,
-          int B, int M, int S>
-CUTE_HOST_RTC
-auto make_tma_copy_desc(Tensor<GEngine,GLayout> const& gtensor,
-                        Layout<TShape,TStride>  const& tma_gbasis,
-                        Swizzle<B,M,S>          const& swizzle,
-                        uint32_t                       num_multicast) {
-    constexpr int tma_dim = decltype(rank(tma_gbasis))::value;
+__global__ void tmaTileAddOneKernel(
+    const __grid_constant__ CUtensorMap input_map,
+    const __grid_constant__ CUtensorMap output_map,
+    int tile_x,
+    int tile_y) {
+    __shared__ alignas(128) float tile[kTileHeight][kTileWidth];
+    __shared__ alignas(8) uint64_t ready_barrier;
 
-    Tensor gtensor_T = recast<TmaInternalType>(gtensor);
-    void* gmem_address = (void*) raw_pointer_cast(gtensor_T.data());
+    if (threadIdx.x == 0) {
+        cute::initialize_barrier(ready_barrier, 1);
+        // 发布初始化到 async proxy；函数名虽是 store fence，指令适用于此处。
+        cute::tma_store_fence();
+    }
+    __syncthreads();  // 全体线程在使用 barrier 前看到初始化。
 
-    cute::array<uint64_t, 5> gmem_prob_shape  = {1,1,1,1,1};
-    cute::array<uint64_t, 5> gmem_prob_stride = {0,0,0,0,0};
-    fill_tma_gmem_shape_stride(gtensor_T, stride(tma_gbasis),
-                               gmem_prob_shape, gmem_prob_stride);
-
-    // CUDA tensor map 不存第 0 维 stride，因此 CuTe 要求第 0 维是元素连续维。
-    assert(gmem_prob_stride[0] == 1 &&
-           "Majorness of smem doesn't match majorness of gmem");
-
-    // CUDA tensor map 的 global stride 单位是字节。
-    for (uint64_t& stride : gmem_prob_stride) {
-        stride = (stride * sizeof_bits_v<TmaInternalType>) / 8;
+    if (threadIdx.x == 0) {
+        // 同时登记 1024 expected bytes，并完成唯一的一次 arrival。
+        cute::set_barrier_transaction_bytes(ready_barrier, kTileBytes);
+        cute::SM90_TMA_LOAD_2D::copy(
+            &input_map, &ready_barrier,
+            static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+            tile, tile_x, tile_y);
     }
 
-    cute::array<uint32_t, 5> smem_box_shape  = {1,1,1,1,1};
-    cute::array<uint32_t, 5> smem_box_stride = {1,1,1,1,1};
-    for_each(make_seq<tma_dim>{}, [&](auto i) {
-        smem_box_shape[i] *= size<i>(tma_gbasis);
-    });
+    // 等待 phase 0 完成；所有读取 shared 的线程都执行 acquire wait。
+    cute::wait_barrier(ready_barrier, 0);
+    for (int idx = threadIdx.x; idx < kTileWidth * kTileHeight;
+         idx += blockDim.x) {
+        tile[idx / kTileWidth][idx % kTileWidth] += 1.0f;
+    }
 
-    TmaDescriptor tma_desc{};
+    // 每个写入线程先 fence，然后 leader 等待全体 producer 就绪。
+    cute::tma_store_fence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        cute::SM90_TMA_STORE_2D::copy(
+            &output_map, tile, tile_x, tile_y);
+        cute::tma_store_arrive();  // 将本线程发起的 store 提交为 bulk group。
 
-    CUtensorMapDataType tma_format =
-        TMA::to_CUtensorMapDataType<TmaInternalType>();
-    CUtensorMapInterleave tma_interleave =
-        CU_TENSOR_MAP_INTERLEAVE_NONE;
-    CUtensorMapL2promotion tma_l2Promotion =
-        CU_TENSOR_MAP_L2_PROMOTION_L2_128B;
-    CUtensorMapFloatOOBfill tma_oobFill =
-        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE;
-
-    TMA::SmemSwizzleBits swizzle_bits = get_tma_swizzle_bits(swizzle);
-    TMA::SmemSwizzleBase swizzle_base = get_tma_swizzle_base(swizzle);
-    CUtensorMapSwizzle smem_swizzle =
-        TMA::to_CUtensorMapSwizzle(swizzle_bits, swizzle_base);
-
-    CUresult result = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
-        &tma_desc,
-        tma_format,
-        tma_dim,
-        gmem_address,
-        gmem_prob_shape.data(),
-        gmem_prob_stride.data() + 1,  // 第 0 维 stride 隐含为 1。
-        smem_box_shape.data(),
-        smem_box_stride.data(),
-        tma_interleave,
-        smem_swizzle,
-        tma_l2Promotion,
-        tma_oobFill);
+        // 本例选择完整完成等待；CuTe tma_store_wait<0>() 只会等待 .read。
+        asm volatile("cp.async.bulk.wait_group 0;" ::: "memory");
+    }
+    __syncthreads();  // 保持整个 CTA 的 shared 生命周期至 leader 等待完成。
 }
 ```
 
-这段代码里有两个很重要的约束：
+本例使用一个 shared stage 和一轮 load，等待 phase 0 后完成消费与 store。若改成流水线，需为每个 stage 跟踪 phase，并通过消费者释放协议安排复用。
 
-- `gmem_address` 必须 16 字节对齐。
-- 第 0 维必须是 contiguous 维度，`gmem_prob_stride[0] == 1`。
+发射侧调用示意如下：
 
-这就是为什么 CuTe 的 TMA 不是“任意 layout 都能直接 TMA”。它会尽量根据 SMEM layout 找最大 contiguous vector，但最终必须符合硬件 tensor map 的限制。
-
-## GMMA swizzle layout 和 TMA swizzle 的关系
-
-TMA 把数据写入 shared memory，GMMA 再从 shared memory 读取。两边能接上，靠的是同一套 **shared-memory 地址约定**。这一节只追一条线：
-
-```text
-比特单位 atom
-  -> upcast 成元素单位 atom
-  -> make_tensor 绑定真实 shared-memory pointer
-  -> TMA 和 GMMA 都从这个 tensor 里提取同一个 swizzle 约定
+```cpp
+// 前置条件：已建立 CUDA context；d_input/d_output 为不同的设备 allocation。
+// 输出未覆盖的位置是否保留，由调用方自行初始化或定义。
+CUtensorMap input_map = make_tensor_map(d_input);
+CUtensorMap output_map = make_tensor_map(d_output);
+tmaTileAddOneKernel<<<1, 128>>>(input_map, output_map, 32, 16);
+cudaError_t launch_status = cudaGetLastError();
+if (launch_status != cudaSuccess) {
+    throw std::runtime_error(cudaGetErrorString(launch_status));
+}
+// 在 host 验证输出、释放 allocation 之前，需要等待所在 stream 完成并检查错误。
 ```
 
-先给出最重要的结论：
+编译上面的 host 构造和 kernel 定义：
 
-| 阶段 | 类型形态 | 坐标含义 | 线性偏移的单位 | `Swizzle` 看到的输入 |
+```shell
+nvcc -std=c++17 -arch=sm_90 \
+  -I/home/huangxy/Projects/cutlass/include \
+  -c tma_tile.cu -o tma_tile.o
+```
+
+链接调用这些函数的完整程序时还要链接 CUDA Driver API，例如添加 `-lcuda`。编译检查验证工具链能生成相应指令；设备端正确性需要在支持 TMA 的 GPU 上运行并比较输出。
+
+调用与硬件职责可以画成：
+
+```mermaid
+sequenceDiagram
+    participant H as "Host"
+    participant P as "Producer / 线程 0"
+    participant T as "TMA 硬件"
+    participant C as "Consumer / CTA 线程"
+    H->>H: "编码输入和输出 descriptor"
+    H->>P: "发射 kernel，传入 descriptor"
+    P->>P: "初始化并发布 mbarrier"
+    P->>P: "arrive.expect_tx 登记 1024 字节"
+    P->>T: "发起 load：descriptor + 坐标 + shared + barrier"
+    T->>T: "生成地址，搬到 shared，通知 complete_tx"
+    C->>C: "wait phase 0 成功，读取并修改 tile"
+    C->>C: "各自 proxy fence，再 CTA 同步"
+    P->>T: "发起 store，commit bulk group"
+    P->>P: "等待 bulk group 完整完成"
+```
+
+图里 descriptor 只负责地址规则；mbarrier 跟踪 load 的完成；store 的 bulk group 则由发起线程自己提交和等待。
+
+## 线性 bulk copy：什么时候不需要 descriptor
+
+**`.tensor` 形式以 descriptor 和元素坐标描述传输区域；线性 bulk 形式以数据地址和字节长度描述连续区间。**
+
+### global → shared 的线性形式
+
+`SM90_BULK_COPY_G2S::copy(gmem_ptr, mbar_ptr, smem_ptr, load_bytes)` 发出：
+
+```ptx
+cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes
+    [dst_smem], [src_gmem], size_bytes, [mbar];
+```
+
+| 参数 | 类型 / 含义 |
+| --- | --- |
+| `dst_smem` | 32 位 shared 目标地址，16 字节对齐。 |
+| `src_gmem` | 64 位 global 数据地址，16 字节对齐；这里才是数据指针本身。 |
+| `size_bytes` | 32 位字节数，源码接口使用 `int32_t load_bytes`；合法传输长度为非负的 16 字节倍数。 |
+| `mbar` | shared barrier 地址，8 字节对齐；登记的 expected bytes 必须匹配 `size_bytes`。 |
+
+它按起点地址和字节长度异步复制一个连续区间，并通过 mbarrier 的字节计数确认完成。
+
+### shared → global 的线性形式
+
+`SM90_BULK_COPY_S2G::copy(smem_ptr, gmem_ptr, store_bytes)` 发出：
+
+```ptx
+cp.async.bulk.global.shared::cta.bulk_group
+    [dst_gmem], [src_smem], size_bytes;
+```
+
+`dst_gmem` 是 64 位 global 目标数据地址，`src_smem` 是 32 位 shared 源地址，`size_bytes` 是 32 位、16 字节倍数的传输长度。前后的 shared proxy fence、commit、wait 协议与 TMA store 相同。
+
+前面的 2D tile 在 global 中由八个带行间隔的区间组成，适合用 descriptor 表达逐行取数。线性 bulk copy 适用于源和目标都满足连续区间条件的传输。
+
+## multicast：一条 load 通知多个接收 CTA
+
+### 指令与 mask
+
+`SM90_TMA_LOAD_MULTICAST_2D::copy` 发出：
+
+```ptx
+cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.L2::cache_hint
+    [dst_smem], [tensor_map, {coord0, coord1}], [mbar], cta_mask, cache_policy;
+```
+
+除了普通 load 的 shared 地址、descriptor、两个元素坐标、barrier 和 cache policy，多了一个 **16 位 `cta_mask`**，由 C++ `uint16_t multicast_mask` 通过 `"h"` 传入。
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `multicast::cluster` | 把同一份 global 数据送到同一 cluster 内选定 CTA。 |
+| `cta_mask` | cluster 内接收 CTA 的位集合：bit `r` 置 1 表示选择 cluster rank 为 `r` 的 CTA。 |
+| `dst_smem` | 数据写到各接收 CTA shared 中**相同偏移**的位置。 |
+| `mbar` | 完成通知也到各接收 CTA shared 中**相同偏移**的 barrier。 |
+
+例如 `cta_mask = 0b0101` 选择 cluster rank 0 和 2。mask 宽度为 16 位，实际可选 rank 由本次 launch 的 cluster 大小决定；cluster 大小须满足设备和 launch 配置的要求。
+
+### 接收侧也要完整初始化和记账
+
+1. 每个接收 CTA 都准备对应 shared buffer 与 barrier，保证偏移匹配。
+2. 各 CTA 初始化并发布自己的 barrier；cluster 同步确保目标 CTA 已就绪。
+3. 每个接收 barrier 都登记本轮要收到的字节数，并完成其预期 arrival。
+4. 选定 producer 发起 multicast load。
+5. 每个接收 CTA 在自己的本地 barrier 上等待，成功后消费数据。
+6. 保证接收 CTA 和 shared 对象在远端访问结束前保持存活；退出前按协议同步。
+
+一条 1024 字节的 load 发给两个 CTA，每个 CTA 接收 1024 字节，各接收 barrier 分别登记 **1024 字节**。若同一轮包含多个分片，每个接收 barrier 登记自己实际收到的所有分片字节之和。
+
+CuTe 的 `num_multicast`、`cta_layout` 还可能影响逻辑 tile 的分片和 descriptor box 大小。**mask 决定接收集合；descriptor 决定这条物理指令搬多少数据。** 每条底层指令的事务量按其实际 box 计算，逻辑 tile 总量由各分片组合得到。
+
+### cluster 同步与地址辅助指令
+
+`cluster_sm90.hpp` 中相关操作为：
+
+```ptx
+barrier.cluster.arrive.aligned;
+barrier.cluster.arrive.relaxed.aligned;
+barrier.cluster.wait.aligned;
+mapa.shared::cluster.u32 remote_addr, local_addr, cta_rank;
+mov.u32 rank, %cluster_ctarank;
+```
+
+| 指令 / CuTe 封装 | 参数或修饰符的含义 |
+| --- | --- |
+| `cluster_arrive()` | 无操作数；默认 release，标记到达，不等待全 cluster。 |
+| `cluster_arrive_relaxed()` | 无操作数；`relaxed` 标记控制流到达，需要发布先前内存访问时，另行建立对应顺序。 |
+| `cluster_wait()` | 无操作数；默认 acquire，等待 cluster 的线程完成 arrival。 |
+| `cluster_sync()` | 依次调用普通 arrive 和 wait；`aligned` 要求同一 warp 的线程一致执行，调用处须满足 cluster 的集体同步协议。 |
+| `set_block_rank(local_addr, cta_rank)` | `local_addr` 是本 CTA 的 32 位 shared 地址，`cta_rank` 是目标 cluster rank；`mapa` 输出相同 shared 偏移对应的远端地址 `remote_addr`。 |
+| `block_rank_in_cluster()` | 输出 32 位 rank，来源是特殊寄存器 `%cluster_ctarank`。 |
+
+cluster barrier 协调线程；multicast load 的数据是否就绪仍由 mbarrier 完成协议决定。
+
+### `elect.sync`：在一个 warp 内选举发起线程
+
+同一头文件的 `elect_one_sync()` 使用：
+
+```ptx
+elect.sync leader_lane | is_leader, member_mask;
+```
+
+`member_mask` 是参与选举的 32 位 warp lane 集合，`leader_lane` 输出被选中线程的 lane id，`is_leader` 是仅在该线程上为真的 predicate。`.sync` 要求 mask 内线程共同执行选举。CuTe 封装使用 `0xffffffff`，返回是否被选中。
+
+这是**每 warp 选一个线程**。如果整个 CTA 的四个 warp 都选举并直接发起同一条 load，就可能发起四次；通常还要限制 `warp_idx == 0`。前面的教学 kernel 直接使用 `threadIdx.x == 0`，明确只有一个 CTA leader。
+
+### 远端 shared store 也能通知同一种 barrier
+
+`store_shared_remote(value, smem_addr, mbarrier_addr, dst_cta_rank)` 先用 `mapa` 映射远端地址，再发出：
+
+```ptx
+st.async.shared::cluster.mbarrier::complete_tx::bytes.u32
+    [remote_dst], value, [remote_mbar];
+```
+
+`remote_dst` 和 `remote_mbar` 是目标 CTA 的 32 位 cluster shared 地址，`value` 是要写入的 32 位值。这条远端异步 store 直接使用目标地址和数值，完成时向目标 barrier 贡献 4 字节的 complete-tx。目标 CTA 须保持存活，barrier 须先初始化、登记这 4 字节，并由参与线程完成协议规定的 arrival。
+
+## reduce-add：把 shared 数据归约到 global
+
+`SM90_TMA_REDUCE_ADD_2D::copy(desc_ptr, smem_ptr, crd0, crd1)` 发出：
+
+```ptx
+cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.bulk_group
+    [tensor_map, {coord0, coord1}], [src_smem];
+```
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `tensor_map` | 描述目标 global tensor；元素格式也来自 descriptor。 |
+| `coord0`、`coord1` | 目标 box 的起始元素坐标。 |
+| `src_smem` | 要加入目标的 shared 数据，布局与 descriptor 对应。 |
+| `reduce`、`add` | 对目标元素执行加法归约，而非普通覆盖写入。适用于多个贡献累加到同一输出。 |
+| `bulk_group` | 仍由发起线程 commit / wait；不接收 load 的 mbarrier 参数。 |
+
+1D～5D 变体只改变坐标数量。shared 源的 producer fence、同步和源复用规则与 TMA store 相同。
+
+归约的原子更新粒度是**单个目标元素**，各元素的更新独立推进。需要消费完整 tile 时，通过完成与同步协议确认整个输出就绪。descriptor 数据类型和 add 操作的组合须符合硬件要求。
+
+## 两种 prefetch：预取 descriptor 和预取数据
+
+### `prefetch.tensormap` 预取地址规则
+
+```ptx
+prefetch.tensormap [tensor_map];
+```
+
+CuTe 对应 `prefetch_tma_descriptor(TmaDescriptor const* desc_ptr)`。唯一参数是 descriptor 的 64 位 generic 地址；它预取 tensor map 元数据，不指定 tile 坐标，不把数据写入 shared。
+
+### `cp.async.bulk.prefetch.tensor` 预取 tensor 数据到 L2
+
+```ptx
+cp.async.bulk.prefetch.tensor.2d.L2.global
+    [tensor_map, {coord0, coord1}];
+```
+
+对应 `SM90_TMA_LOAD_2D::PREFETCH::copy(desc_ptr, crd0, crd1)`：descriptor 决定 box，两个 `.s32` 坐标选择起点，`L2.global` 指定将 global 数据预取到 L2。后续 load 从 global 搬到 shared，并使用自己的完成协议。
+
+线性 bulk prefetch 的指令为：
+
+```ptx
+cp.async.bulk.prefetch.L2.global [src_gmem], size_bytes;
+```
+
+它对应 `SM90_BULK_COPY_G2S::PREFETCH`，参数是 64 位 global 数据地址和 32 位字节数，地址和长度都满足 16 字节约束。
+
+**prefetch 是请求硬件提前缓存元数据或数据的性能提示。** 真正的 shared 数据传输由 load 发起并等待完成；修改后的 descriptor 通过 tensormap 发布协议交给硬件使用。缓存提示的实际执行由硬件决定。
+
+## 设备端修改 descriptor：tensormap fence 的用途
+
+前面的基本流程在 host 编码 descriptor，然后把稳定的 descriptor 传给 kernel。只有设备端更换 global 地址、shape 或 stride 等场景，才需要进一步理解这一组修改与发布指令。
+
+当前 CUTLASS 为这些封装使用 `CUTE_ARCH_DEVICE_MODIFIABLE_TMA_SM90_ENABLED` 门控：CUDA 12.3+，并在 Hopper 路径要求架构特定特性宏，通常以 `sm_90a` 编译。普通 TMA load/store 的 Hopper 编译目标为 `sm_90`；descriptor 修改封装按上述门控启用。
+
+### `tensormap.replace` 修改指定字段
+
+```ptx
+tensormap.replace.tile.global_address.global.b1024.b64
+    [global_desc], new_global_address;
+tensormap.replace.tile.global_address.shared::cta.b1024.b64
+    [shared_desc], new_global_address;
+tensormap.replace.tile.global_dim.shared::cta.b1024.b32
+    [shared_desc], dim_index, new_dim;
+tensormap.replace.tile.global_stride.shared::cta.b1024.b64
+    [shared_desc], stride_index, new_stride;
+```
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `global_desc` / `shared_desc` | 被修改的 descriptor 对象在 global / shared 中的地址。CuTe 对 shared 地址进行 shared-space 转换。 |
+| `new_global_address` | 64 位新 global 数据基地址。来源是 CuTe helper 的 `new_tensor_ptr`。 |
+| `dim_index`、`new_dim` | 立即数字段索引和 32 位新维度大小；CuTe 修改 dim 索引 0～4，大小单位为元素。 |
+| `stride_index`、`new_stride` | 立即数 global stride 字段索引和 64 位编码值；CuTe 修改字段索引 0～3，分别对应 tensor 第 1～4 维。第 0 维连续步幅不存储。 |
+| `tile` | 修改 tiled tensor map 的字段。 |
+| `b1024` | 被修改的 tensor map 对象总宽度为 1024 bit，即 128 字节。 |
+| 末尾 `b32` / `b64` | 新字段值的操作数位宽，分别为 32 位或 64 位；descriptor 对象整体为 1024 位。 |
+
+CuTe 对应 `tma_descriptor_replace_addr_in_global_mem`、`tma_descriptor_replace_addr_in_shared_mem` 和 `tma_descriptor_replace_dims_strides_in_shared_mem`。
+
+最后一个 helper 接收 `prob_shape[5]` 与 `prob_stride[5]`：shape 按维度顺序，stride 按 tensor 维度顺序保存字节步幅，修改时使用 `prob_stride[1..4]`。当前源码在 CUDA 12.5+ 直接传 byte stride；早期工具链传 `prob_stride[d] >> 4`，因为编码省略最低 4 位。**stride 操作数的编码方式由工具链版本决定。**
+
+### global 直接修改后的 release / acquire
+
+```ptx
+fence.proxy.tensormap::generic.release.gpu;
+fence.proxy.tensormap::generic.acquire.gpu [global_desc], 128;
+```
+
+分别对应 `tma_descriptor_fence_release()` 和 `tma_descriptor_fence_acquire(desc_ptr)`。
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `tensormap::generic` | 为 generic 侧写入与后续 tensormap 侧读取建立跨 proxy 发布协议。 |
+| `release` | 修改线程在字段更新之后发布这些 descriptor 写入；没有显式操作数。 |
+| `acquire` | 使用线程在读取 descriptor 之前接收对应发布；跨线程使用时，先由线程间通知建立与修改方 release 的同步关系。 |
+| `gpu` | 此发布协议的线程作用范围为 GPU。 |
+| `[global_desc]` | acquire 覆盖的 global descriptor generic 地址。 |
+| `128` | acquire 覆盖范围的立即数字节长度，覆盖完整 tensor map。 |
+
+直接修改的顺序是：确保旧使用结束 → 修改字段 → release → 必要的线程间发布 / 通知 → 使用线程 acquire → 新的 TMA 指令。
+
+### shared 暂存修改后的 copy + release
+
+```ptx
+tensormap.cp_fenceproxy.global.shared::cta.tensormap::generic.release.gpu.sync.aligned
+    [global_desc], [shared_desc], 128;
+```
+
+CuTe 对应 `tma_descriptor_cp_fence_release(gmem_desc_ptr, smem_desc)`。
+
+| 参数 / 修饰符 | 含义 |
+| --- | --- |
+| `[global_desc]` | 复制后的 global descriptor 目标，使用 global-space 地址。 |
+| `[shared_desc]` | 已修改的 shared descriptor 源，使用 shared-space 地址。 |
+| `128` | 固定复制 128 字节的完整 descriptor。 |
+| `global.shared::cta` | 描述符复制的目标和源空间。 |
+| `tensormap::generic.release.gpu` | 复制后建立 descriptor 的跨 proxy release 发布。 |
+| `sync.aligned` | **整个 warp 必须一致执行**该指令，调用处要求 warp 内线程对条件分支作出一致选择。 |
+
+之后使用方仍按协议执行 descriptor acquire。shared 暂存区从旧 descriptor 复制过来、字段修改线程到全 warp 发布之间的同步，也需要完整安排。
+
+`.sync.aligned` 的 warp 要求和固定长度见 [PTX：`tensormap.cp_fenceproxy`](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-tensormap-cp-fenceproxy)。这条发布指令由全 warp 协作执行，随后可由选定 leader 发起普通 TMA 传输。
+
+### 修改前还要确保硬件不再读取旧 descriptor
+
+CuTe 提供：
+
+- `tma_desc_commit_group()`：发出 `cp.async.bulk.commit_group`。
+- `tma_desc_wait_group()`：发出 `cp.async.bulk.wait_group.read 0`。
+
+这组调用用于确认先前指令的相关 descriptor 读取已经结束。对 store，`.read` 同时覆盖 shared 源读取；对 mbarrier-based tensor load，bulk-group 机制可以另外用于跟踪 descriptor 的读取结束，**但 load 的数据写入完成仍然要等 mbarrier**。这也是 CUTLASS 的 grouped GEMM mainloop 在切换 tensor map 时使用这两个 helper 的原因。
+
+两种完成阶段在 [当前 PTX 的 tensor copy 完成机制表](https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor) 中分别列出：descriptor 读取结束允许修改对应对象，load 数据完成允许消费 shared tile。新 descriptor 值的可见性由后续 release / acquire 协议建立。
+
+descriptor 更新的流程是：确认旧读取结束，修改字段，再通过 tensormap fence 发布新值。发布后的 descriptor 在字段保持稳定期间可以复用；下一次修改后重新执行发布协议。
+
+## CUDA 官方 API：用 cuda::ptx 调用指令
+
+CUDA 的 `<cuda/ptx>` 头文件提供 **PTX 指令的 C++ 封装**，接口位于 `cuda::ptx` 命名空间。函数根据参数类型选择指令变体，并在内部完成 shared 地址转换。调用方仍按前面讲过的协议安排 descriptor、mbarrier、fence 和等待。
+
+本节的签名依据本地 `cuda-13/include/cccl/cuda/__ptx/instructions/generated/` 下的头文件。在线接口索引见 [CUDA PTX API](https://nvidia.github.io/cccl/unstable/libcudacxx/ptx_api.html)。
+
+### 常用指令与函数对应
+
+下表用 `ptx` 作为 `cuda::ptx` 的别名。省略的实参在后面的示例中展开。
+
+| PTX 指令 | 官方 C++ 调用 | 用途 |
+| --- | --- | --- |
+| `mbarrier.init` | `ptx::mbarrier_init(&barrier, count)` | 初始化 barrier，`count` 是每个 phase 的 arrival 数。 |
+| `mbarrier.arrive.expect_tx` | `ptx::mbarrier_arrive_expect_tx(...)` | 完成一次 arrival，同时增加预期完成的字节数；返回状态 token。 |
+| `mbarrier.try_wait.parity` | `ptx::mbarrier_try_wait_parity(...)` | 检查指定 phase parity 是否完成，返回 `bool`。 |
+| `cp.async.bulk.tensor` | `ptx::cp_async_bulk_tensor(...)` | 用 descriptor 和坐标发起 tensor load 或 store。 |
+| `cp.async.bulk` | `ptx::cp_async_bulk(...)` | 用数据地址和字节数发起线性 bulk copy。 |
+| `fence.proxy.async.shared::cta` | `ptx::fence_proxy_async(ptx::space_shared)` | 建立当前线程在 CTA shared 上的 generic / async proxy 可见性。 |
+| `fence.mbarrier_init.release.cluster` | `ptx::fence_mbarrier_init(ptx::sem_release, ptx::scope_cluster)` | 发布 barrier 初始化，供 cluster 协议使用。 |
+| `cp.async.bulk.commit_group` | `ptx::cp_async_bulk_commit_group()` | 将本线程先前未提交的 bulk 操作组成一个 group。 |
+| `cp.async.bulk.wait_group 0` | `ptx::cp_async_bulk_wait_group(ptx::n32_t<0>{})` | 等待本线程已提交的所有 group 完整完成。 |
+| `cp.async.bulk.wait_group.read 0` | `ptx::cp_async_bulk_wait_group_read(ptx::n32_t<0>{})` | 等待本线程已提交的所有 group 读取完成，允许复用 shared 源。 |
+
+函数名后面的标签参数对应 PTX 修饰符：
+
+- `space_cluster`、`space_shared`、`space_global` 分别选择 `shared::cluster`、`shared::cta`、`global` 地址空间。copy 的前两个标签按**目标、源**排列。
+- `sem_release`、`sem_acquire` 选择 release / acquire 内存语义；`scope_cta`、`scope_cluster` 选择对应同步语义的线程范围。
+- `n32_t<N>{}` 将 `N` 编码为编译期立即数。wait-group 中的 `N` 表示允许保留多少个最新 group 尚未完成；`0` 表示全部等待完成。
+
+例如 load 使用 `space_cluster, space_global`，store 使用 `space_global, space_shared`。本例的 load 目标是当前 CTA 的 shared tile；`shared::cluster` 地址空间也包含当前 CTA 的 shared memory。
+
+### 一个 load → 计算 → store 示例
+
+沿用上文的 `make_tensor_map`：输入和输出都为 `float matrix[64][128]` 的 row-major 布局，descriptor 的 box 为 `32 × 8`，无 swizzle、无 interleave。下面一个 CTA 从 `(x=32, y=16)` 搬入 1024 字节，每个元素加一，再写回输出矩阵的同一坐标。
+
+descriptor 通过 `const __grid_constant__` kernel 参数传入，硬件读取的地址为 `&input_map` 和 `&output_map`。代码只展示设备端调用，输入、输出 allocation 及 descriptor 编码沿用上文。
+
+```cpp
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cuda/ptx>
+#include <cstdint>
+
+namespace ptx = cuda::ptx;
+
+/**
+ * @brief 用官方 PTX 封装搬入一个 tile、逐元素加一，再搬出。
+ * @param input_map 输入设备矩阵的 descriptor，形状为 64 × 128，box 为 32 × 8。
+ * @param output_map 输出设备矩阵的 descriptor，布局与输入相同，指向独立 allocation。
+ *
+ * 使用一个 CTA、128 个线程；线程按线性索引分担 tile 元素。
+ * descriptor 按值传入；调用方持有矩阵 allocation，保证其存活至 kernel 完成。
+ */
+__global__ void tmaTileAddOnePtxKernel(
+    const __grid_constant__ CUtensorMap input_map,
+    const __grid_constant__ CUtensorMap output_map) {
+    constexpr int tile_width = 32;
+    constexpr int tile_height = 8;
+    constexpr std::uint32_t tile_bytes =
+        tile_width * tile_height * sizeof(float);
+
+    __shared__ alignas(128) float tile[tile_height][tile_width];
+    __shared__ alignas(8) std::uint64_t ready_barrier;
+    const std::int32_t coords[2] = {32, 16};  // 元素坐标，顺序为 x、y。
+
+    if (threadIdx.x == 0) {
+        ptx::mbarrier_init(&ready_barrier, 1);
+        ptx::fence_proxy_async(ptx::space_shared);  // 发布初始化给 async proxy。
+    }
+    __syncthreads();  // 全体线程在使用 barrier 前看到初始化。
+
+    if (threadIdx.x == 0) {
+        // 登记 1024 字节并完成唯一一次 arrival；本例通过 parity 等待。
+        (void)ptx::mbarrier_arrive_expect_tx(
+            ptx::sem_release, ptx::scope_cta, ptx::space_shared,
+            &ready_barrier, tile_bytes);
+        ptx::cp_async_bulk_tensor(
+            ptx::space_cluster, ptx::space_global,
+            tile, &input_map, coords, &ready_barrier);
+    }
+
+    // 每个消费者都以 acquire 语义等待初始 phase 0 完成。
+    while (!ptx::mbarrier_try_wait_parity(
+        ptx::sem_acquire, ptx::scope_cta, &ready_barrier, 0u)) {
+    }
+    for (int idx = threadIdx.x; idx < tile_width * tile_height;
+         idx += blockDim.x) {
+        tile[idx / tile_width][idx % tile_width] += 1.0f;
+    }
+
+    // 各写入线程发布 shared 写入，CTA 同步后由 leader 发起 store。
+    ptx::fence_proxy_async(ptx::space_shared);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        ptx::cp_async_bulk_tensor(
+            ptx::space_global, ptx::space_shared,
+            &output_map, coords, tile);
+        ptx::cp_async_bulk_commit_group();
+        ptx::cp_async_bulk_wait_group(ptx::n32_t<0>{});
+    }
+    __syncthreads();  // 全体线程保留 shared 存储，直到 leader 等待完成。
+}
+```
+
+load 调用的实参依次是：目标空间、源空间、shared 目标指针、descriptor 指针、元素坐标数组、shared barrier 指针。数组长度 `2` 选择 2D 重载。store 的数据实参则是 descriptor 指针、坐标数组、shared 源指针，完成由随后同线程的 commit / wait 确认。
+
+这里传入 `tile` 和 `&ready_barrier` 这样的 C++ 指针，封装内部转换成 PTX 所需的 shared 地址。示例选择完整 store 等待；流水线只需确认 shared 源可以复用时，可以使用 `cp_async_bulk_wait_group_read`，global 输出的完整完成按前文的 bulk-group 协议处理。
+
+## 按场景判断需要什么
+
+| 场景 | descriptor | 发起参数 | 完成机制 | 主要的顺序要求 |
 | --- | --- | --- | --- | --- |
-| `_Atom_Bits` 原始类型 | `ComposedLayout<Swizzle, smem_ptr_flag_bits<1>, L_bits>` | 比特单位 atom 的逻辑坐标 | 比特 | 如果直接调用 layout，就是比特偏移 |
-| `upcast<Type>` 之后 | `ComposedLayout<Swizzle, smem_ptr_flag_bits<E>, L_Type>` | 元素坐标 | 元素 | 如果直接调用 layout，就是元素偏移 |
-| `make_tensor` 之后 | `swizzle_ptr<Swizzle, smem_ptr<Type*>>` 加普通 `L_Type` | 元素坐标 | 元素 | 真实 typed pointer 产生的字节地址 |
+| 连续 global → shared bulk copy | 不需要 | global 地址、shared 地址、字节数、barrier。 | mbarrier bytes + wait。 | 发布 barrier 初始化；消费和复用 stage 遵循协议。 |
+| 多维 global → shared tiled TMA | 需要 | descriptor、元素坐标、shared 地址、barrier、源码变体需要的 cache hint。 | mbarrier bytes + wait。 | 同上；坐标、box 和 shared layout 匹配。 |
+| multicast load | 需要 | tiled load 参数，再加接收 CTA mask。 | 各接收 CTA 的本地 mbarrier。 | cluster 初始化发布、目标存活、各接收侧正确登记。 |
+| shared → global store / reduce | tensor 形式需要，线性形式不需要 | descriptor + 坐标，或 global 地址 + 字节数；都带 shared 源地址。 | 同线程 bulk commit + wait。 | 普通 shared 写入先 proxy fence，再同步到发起线程。 |
+| descriptor prefetch | 需要 | descriptor 地址。 | tensor map 元数据的缓存提示。 | 修改后的 descriptor 先按 tensormap 协议发布。 |
+| tensor 数据 prefetch | 需要 | descriptor + 元素坐标。 | 缓存提示，不写 shared。 | 真正消费仍走 load 和完成协议。 |
+| 设备端修改 descriptor | 需要已有合法 descriptor | 被修改的字段值、descriptor 存放地址。 | 先确认旧读取结束，再发布新值。 | tensormap release / acquire；shared copy-release 需要全 warp 一致执行。 |
 
-这张表是读这一节的锚点。**`ComposedLayout` 本身不做单位转换；单位转换发生在 `upcast`，真实字节地址 swizzle 发生在 `make_tensor` 之后的 `swizzle_ptr`。**
+读一段 TMA 代码时，可以沿同一条线检查：**descriptor 定义了哪块 global 数据和哪种 box → 这一条指令给了什么坐标和 shared 起点 → 完成通知记到哪里 → 消费者等了哪个 phase → shared stage 什么时候允许覆盖。**
 
-### `ComposedLayout` 的组合逻辑
+## TMA 异步流水线：把搬运和消费放到不同 stage
 
-先看 `cute/layout_composed.hpp`。下面是带中文 Doxygen 注释的源码骨架：
+前面的例子使用一个 shared tile：load 完成，线程计算，计算结束后复用存储。为了让搬运和计算重叠，可以准备多个 **stage（共享内存槽位）**，让不同工作同时使用不同槽位。
 
-```cpp
-/**
- * @brief 表示非平凡可组合的 layout：LayoutA o Offset o LayoutB。
- *
- * @tparam LayoutA 最左侧函数，负责处理 `Offset + LayoutB(coord)` 的结果。
- * @tparam Offset 中间偏移项，GMMA atom 里通常是 `smem_ptr_flag_bits<...>`。
- * @tparam LayoutB 最右侧普通 layout，定义逻辑坐标域和基础线性偏移。
- *
- * @details
- * `ComposedLayout` 不理解偏移的物理单位。`layout_b()` 输出什么单位，
- * `layout_a()` 就会收到什么单位。单位语义由参与组合的 layout 类型约定。
- */
-template <class LayoutA, class Offset, class LayoutB>
-struct ComposedLayout : private cute::tuple<LayoutA, Offset, LayoutB>
-{
-  /**
-   * @brief 构造一个组合 layout。
-   *
-   * @param layoutA 最左侧函数对象，例如 `Swizzle<3,4,3>`。
-   * @param offset 中间偏移，例如 `smem_ptr_flag_bits<1>{}`。
-   * @param layoutB 最右侧普通 layout，例如
-   *        `Layout<Shape<_1024,_8>,Stride<_1,_1024>>`。
-   */
-  CUTE_HOST_DEVICE constexpr
-  ComposedLayout(LayoutA const& layoutA = {},
-                 Offset  const& offset  = {},
-                 LayoutB const& layoutB = {})
-      : cute::tuple<LayoutA, Offset, LayoutB>(layoutA, offset, layoutB)
-  {}
+以两个 stage 为例，每个 stage 都保存一个 `8 × 32` 的 float tile。参与执行的有三方：
 
-  /**
-   * @brief 返回最左侧函数对象。
-   *
-   * @return 例如 GMMA atom 里的 `Swizzle<3,4,3>`。
-   */
-  CUTE_HOST_DEVICE constexpr
-  decltype(auto)
-  layout_a() const;
+- **producer（生产者线程）** 选择可写 stage，登记本轮的传输字节数，并发出 TMA load。
+- **TMA 硬件**执行 global → shared 搬运，完成后通知指定的 mbarrier。
+- **consumer（消费者线程）** 等待数据就绪，读取 shared 并计算，读完后通知 producer 可以复用 stage。
 
-  /**
-   * @brief 返回中间 offset 对象，也就是偏移标签。
-   *
-   * @return 例如 GMMA atom 里的 `smem_ptr_flag_bits<1>`。
-   */
-  CUTE_HOST_DEVICE constexpr
-  decltype(auto)
-  offset() const;
+producer 和 consumer 可以由不同 warp 承担，形成 **warp specialization（warp 分工）**。线程角色、stage 数和搬运指令由调用方安排，pipeline 类负责协调这些 stage 的使用。
 
-  /**
-   * @brief 返回最右侧普通 layout。
-   *
-   * @return 例如 `Layout<Shape<_1024,_8>,Stride<_1,_1024>>`。
-   */
-  CUTE_HOST_DEVICE constexpr
-  decltype(auto)
-  layout_b() const;
+### 每个 stage 都有 full 和 empty 两个通知方向
 
-  /**
-   * @brief 返回逻辑坐标域的 shape。
-   *
-   * @return 直接返回 `layout_b().shape()`。
-   */
-  CUTE_HOST_DEVICE constexpr
-  decltype(auto)
-  shape() const {
-    return layout_b().shape();
-  }
+一个 stage 的使用过程是：
 
-  /**
-   * @brief 禁止直接查询 stride。
-   *
-   * @details
-   * 整个 `ComposedLayout` 不是普通线性 layout，尤其含有 `Swizzle`
-   * 这种非线性函数，所以没有普通意义上的 stride。
-   */
-  CUTE_HOST_DEVICE constexpr
-  decltype(auto)
-  stride() const = delete;
-
-  /**
-   * @brief 把逻辑坐标映射到组合后的线性 index。
-   *
-   * @tparam Coord 输入坐标类型。
-   * @param coord 逻辑坐标。如果含有 `_`，则走 slice 逻辑。
-   * @return 对普通坐标，返回 `layout_a()(offset() + layout_b()(coord))`。
-   */
-  template <class Coord>
-  CUTE_HOST_DEVICE constexpr
-  auto
-  operator()(Coord const& coord) const {
-    if constexpr (has_underscore<Coord>::value) {
-      return slice(coord, *this);
-    } else {
-      return layout_a()(offset() + layout_b()(coord));
-    }
-  }
-};
+```mermaid
+flowchart LR
+    E["可写<br>empty 等待成功"] --> P["producer 登记字节<br>发起 TMA"]
+    P --> T["TMA 正在写入"]
+    T --> F["数据就绪<br>full 等待成功"]
+    F --> C["consumer 读取并计算"]
+    C --> R["消费者读完<br>arrival 通知 empty"]
+    R --> E
 ```
 
-这一段源码说明了一件事：如果直接调用
+**full 表示本轮需要的数据已经到达，empty 表示上一轮消费者已经释放这块存储。** 两个方向各用一个 barrier，producer 等 empty，consumer 等 full。
 
-```cpp
-ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag,
-               Layout<Shape<_1024,_8>,Stride<_1,_1024>>>{}(x,y)
-```
+在 `PipelineTmaAsync` 中，每个 stage 配置：
 
-执行顺序就是：
-
-```text
-(x,y)
-  -> layout_b(x,y)
-  -> offset + layout_b(x,y)
-  -> layout_a(...)
-```
-
-`ComposedLayout` 不会自动把比特变成字节，也不会自动把元素偏移变成字节地址。后面所有单位变化，都来自更具体的 overload。
-
-### GMMA `_Atom_Bits` 是比特单位的占位类型
-
-`mma_traits_sm90_gmma.hpp` 里先定义 M/N-major 的比特单位 atom：
-
-```cpp
-/**
- * @brief SM90 GMMA 使用的 M/N-major shared-memory atom，内层单位是比特。
- *
- * @details
- * 这些类型还没有绑定具体元素类型。`Layout<...>` 输出的是比特偏移，
- * `smem_ptr_flag` 表示当前 pointer 位宽占位为 1 比特。
- *
- * `SW32` / `SW64` / `SW128` 名字里的数字是 swizzle 的字节规模，
- * 不是 `_Atom_Bits` 内层 shape 的单位。
- */
-using Layout_MN_INTER_Atom_Bits =
-    ComposedLayout<Swizzle<0,4,3>, smem_ptr_flag,
-                   Layout<Shape< _128,_8>,Stride<_1, _128>>>;
-using Layout_MN_SW32_Atom_Bits  =
-    ComposedLayout<Swizzle<1,4,3>, smem_ptr_flag,
-                   Layout<Shape< _256,_8>,Stride<_1, _256>>>;
-using Layout_MN_SW64_Atom_Bits  =
-    ComposedLayout<Swizzle<2,4,3>, smem_ptr_flag,
-                   Layout<Shape< _512,_8>,Stride<_1, _512>>>;
-using Layout_MN_SW128_Atom_Bits =
-    ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag,
-                   Layout<Shape<_1024,_8>,Stride<_1,_1024>>>;
-```
-
-以 `Layout_MN_SW128_Atom_Bits` 为例：
-
-```cpp
-Layout<Shape<_1024,_8>, Stride<_1,_1024>>
-```
-
-这是 `layout_b`。解释普通 `Layout` 时，先看逻辑坐标到线性偏移的映射：
-
-```cpp
-L_bits(x, y) = x + 1024 * y
-```
-
-这里每个量的单位要分清楚：
-
-- `(x,y)` 是比特单位 atom 的逻辑坐标，不是字节地址，也不是 half 元素下标。
-- `x` 的范围是 `0 <= x < 1024`，第一维每走一步增加 1 比特偏移。
-- `y` 的范围是 `0 <= y < 8`，第二维每走一步增加 1024 比特偏移。
-- `L_bits(x,y)` 的单位是 **比特**。
-
-所以 `_1024` 表示：
-
-```text
-1024 比特 = 128 字节
-```
-
-整个 atom 覆盖：
-
-```text
-1024 比特/row * 8 row = 8192 比特 = 1024 字节
-```
-
-`SW128` 名字里的 `128` 指 **128 字节 swizzle**。它和内层第一维宽度的关系是：
-
-| atom | `layout_b` 第一维 | 换成字节 | swizzle 名称 |
-| --- | ---: | ---: | --- |
-| `INTER` | 128 比特 | 16 字节 | 不启用 32/64/128 字节 swizzle |
-| `SW32` | 256 比特 | 32 字节 | 32 字节 swizzle |
-| `SW64` | 512 比特 | 64 字节 | 64 字节 swizzle |
-| `SW128` | 1024 比特 | 128 字节 | 128 字节 swizzle |
-
-K-major 版本只是把连续方向换到第二维：
-
-```cpp
-/**
- * @brief SM90 GMMA 使用的 K-major shared-memory atom，内层单位是比特。
- *
- * @details
- * 与 M/N-major 版本相比，连续的 `_1` stride 放在第二维，
- * 因此逻辑上是 K 方向连续。
- */
-using Layout_K_SW128_Atom_Bits =
-    ComposedLayout<Swizzle<3,4,3>, smem_ptr_flag,
-                   Layout<Shape<_8,_1024>,Stride<_1024,_1>>>;
-```
-
-它的 `layout_b` 映射是：
-
-```cpp
-L_bits(row, k_bit) = 1024 * row + k_bit
-```
-
-输出同样是比特偏移。
-
-### `smem_ptr_flag` 是占位标签，不是单位转换器
-
-`smem_ptr_flag` 来自 `cute/pointer_flagged.hpp`：
-
-```cpp
-/**
- * @brief 尚未绑定真实 shared-memory pointer 的位宽占位标签。
- *
- * @tparam Bits 当前占位 pointer 的元素位宽，单位是比特。
- *
- * @details
- * 这个类型数值上继承 `Int<0>`，所以参与 `offset() + layout_b(coord)`
- * 时值是 0。它真正的作用是让 `upcast` 和 `make_tensor` 命中特化 overload。
- */
-template <int Bits>
-struct smem_ptr_flag_bits : Int<0> {};
-
-/**
- * @brief `_Atom_Bits` 初始使用的 1 比特 pointer 占位。
- */
-using smem_ptr_flag = smem_ptr_flag_bits<1>;
-```
-
-因此，在原始 `_Atom_Bits` 阶段：
-
-```cpp
-offset() + layout_b()(coord)
-```
-
-只是：
-
-```cpp
-0 + 比特偏移
-```
-
-`smem_ptr_flag_bits<1>` 不会把比特偏移转成字节偏移。它只是把“当前还在 1 比特单位”这个信息留在类型里，等后面的 `upcast` / `make_tensor` 特化使用。
-
-### `Swizzle<3,4,3>` 的输入单位由调用阶段决定
-
-`Swizzle` 自己只是一个整数变换。源码核心逻辑在 `cute/swizzle.hpp`：
-
-```cpp
-/**
- * @brief 对输入偏移的两组比特执行 XOR swizzle。
- *
- * @tparam BBits 参与 XOR 的比特数。
- * @tparam MBase 保留的低位比特数，也是 `Z` 字段起点。
- * @tparam SShift `Y` 字段相对 `Z` 字段的位移。
- *
- * @details
- * `Swizzle` 不知道偏移的物理单位。调用方传入比特偏移，
- * 它就 swizzle 比特偏移；调用方传入字节地址，它就 swizzle 字节地址。
- */
-template <int BBits, int MBase, int SShift = BBits>
-struct Swizzle
-{
-  template <class Offset>
-  CUTE_HOST_DEVICE constexpr static
-  auto
-  apply(Offset const& offset)
-  {
-    return offset ^ shiftr(offset & yyy_msk{}, msk_sft{});
-  }
-};
-```
-
-所以必须区分两个阶段：
-
-- **直接调用 `_Atom_Bits` 的 `ComposedLayout`**：`layout_b` 输出比特偏移，`Swizzle<3,4,3>` 收到的是比特偏移。
-- **经过 `make_tensor` 绑定真实 pointer 后访问 tensor**：`Swizzle<3,4,3>` 挂在 `smem_ptr<Type*>` 上，收到的是字节地址。
-
-后面讲 `YYY ZZZ XXXX`、16 字节小块、128 字节行，都只针对第二种：**真实访存阶段的字节地址**。
-
-在真实访存阶段，我们的`Swizzle`接受了一个线性字节偏移。比如100，表示线性偏移了100字节。  
-把字节地址的低 10 个比特写成：
-
-```text
-YYY ZZZ XXXX
-```
-
-字段含义是：
-
-- `XXXX` 是最低 4 个比特，表示 16 字节小块内部的位置。
-- `ZZZ` 是接下来的 3 个比特，表示 128 字节行里的第几个 16 字节小块。
-- `YYY` 是再往上的 3 个比特，表示 1024 字节周期里的第几个 128 字节行。
-
-`Swizzle<3,4,3>` 做的是：
-
-```text
-physical_ZZZ = logical_ZZZ XOR YYY
-```
-
-
-低 4 个字节地址比特不动，所以 16 字节小块内部的字节顺序不变；
-比如线性偏移15，经过`Swizzle`后，值不改变，因为15写成二进制是`0000001111`。而最低的4个比特是不动的。
-
-### `sizeof_bits<Type>::value` 给出元素位宽
-
-GMMA 的元素单位 atom 不是手写的，而是从 `_Atom_Bits` `upcast` 出来：
-
-```cpp
-/**
- * @brief 把 M/N-major 比特单位 atom 转成 Type 元素单位 atom。
- *
- * @tparam Type shared memory 中真实存放的元素类型。
- *
- * @details
- * `sizeof_bits<Type>::value` 是一个元素占多少比特。
- * `upcast` 会把 `layout_b` 的偏移单位从比特换成 Type 元素。
- */
-template <class Type>
-using Layout_MN_SW128_Atom =
-    decltype(upcast<sizeof_bits<Type>::value>(
-        Layout_MN_SW128_Atom_Bits{}));
-```
-
-`sizeof_bits` 在 CuTe 中转发到 CUTLASS：
-
-```cpp
-/**
- * @brief 返回类型 `T` 的元素位宽，单位是比特。
- *
- * @tparam T 元素类型，例如 `half_t`、`float`、FP8 类型等。
- */
-template <class T>
-struct sizeof_bits : cutlass::sizeof_bits<T> {};
-
-namespace cutlass {
-
-/**
- * @brief 常规类型的默认位宽实现。
- *
- * @tparam T 元素类型。
- */
-template <typename T>
-struct sizeof_bits {
-  static constexpr int value = int(sizeof(T) * 8);
-};
-
-}  // namespace cutlass
-```
-
-常见类型：
-
-| 类型 | `sizeof_bits<Type>::value` |
-| --- | ---: |
-| 8 比特元素 | 8 |
-| `half_t` | 16 |
-| 32 比特元素 | 32 |
-
-### `upcast` 把 `layout_b` 从比特单位改成元素单位
-
-`pointer_flagged.hpp` 为带 `smem_ptr_flag_bits` 的 `ComposedLayout` 提供了专门的 `upcast`：
-
-```cpp
-/**
- * @brief 保留 pointer flag 的 `ComposedLayout` upcast。
- *
- * @tparam N 新单位包含多少个旧单位。对 `_Atom_Bits` 来说，
- *         `N = sizeof_bits<Type>::value`。
- * @tparam SwizzleFn 最左侧 swizzle 类型，例如 `Swizzle<3,4,3>`。
- * @tparam B 当前 pointer flag 的位宽，单位是比特。
- * @tparam Layout 最右侧普通 layout。
- * @param layout 输入的 flagged `ComposedLayout`。
- * @return swizzle 不变、pointer flag 变成 `B*N`、`layout_b` 被 upcast 后的新 layout。
- */
-template <int N, class SwizzleFn, int B, class Layout>
-CUTE_HOST_DEVICE constexpr
-auto
-upcast(ComposedLayout<SwizzleFn,
-                      smem_ptr_flag_bits<B>,
-                      Layout> const& layout)
-{
-  return composition(layout.layout_a(),
-                     smem_ptr_flag_bits<B*N>{},
-                     upcast<N>(layout.layout_b()));
-}
-```
-
-其中最右侧普通 `Layout` 的 `upcast<N>` 规则来自 `cute/layout.hpp`：
-
-```cpp
-/**
- * @brief 把普通 layout 的偏移单位扩大 N 倍。
- *
- * @tparam N 新单位包含的旧单位数。
- * @param shape 原 layout 的 shape。
- * @param stride 原 layout 的 stride。
- * @return 新 layout。stride 为 1 的连续方向会缩短 shape，
- *         其他静态 stride 通常会除以 N。
- */
-template <int N, class Shape, class Stride>
-CUTE_HOST_DEVICE constexpr
-auto
-upcast(Shape const& shape, Stride const& stride);
-```
-
-以 FP16 的 `Layout_MN_SW128_Atom<half_t>` 为例，`N=16`：
-
-```cpp
-/**
- * @brief upcast 前：比特单位的 M/N-major SW128 atom。
- *
- * @details
- * `layout_b(x,y)` 的输出单位是比特。
- */
-using Before =
-    ComposedLayout<Swizzle<3,4,3>,
-                   smem_ptr_flag_bits<1>,
-                   Layout<Shape<_1024,_8>, Stride<_1,_1024>>>;
-
-/**
- * @brief upcast 后：half_t 元素单位的 M/N-major SW128 atom。
- *
- * @details
- * `layout_b(i,n)` 的输出单位是 half 元素。
- * 注意：如果直接调用这个 `ComposedLayout`，`Swizzle` 会看到元素偏移；
- * 真正的字节地址 swizzle 要等 `make_tensor` 把 swizzle 挂到 pointer 上。
- */
-using After =
-    ComposedLayout<Swizzle<3,4,3>,
-                   smem_ptr_flag_bits<16>,
-                   Layout<Shape<_64,_8>, Stride<_1,_64>>>;
-```
-
-此时：
-
-```cpp
-L_half(i, n) = i + 64 * n
-```
-
-输出单位是 `half_t` 元素。
-
-K-major 的 FP16 特化概念上可以这样理解：
-
-```cpp
-/**
- * @brief upcast 前：比特单位的 K-major SW128 atom。
- */
-using Layout_K_SW128_Atom_Bits =
-    ComposedLayout<Swizzle<3,4,3>,
-                   smem_ptr_flag_bits<1>,
-                   Layout<Shape<_8,_1024>, Stride<_1024,_1>>>;
-
-/**
- * @brief upcast 后：half_t 元素单位的 K-major SW128 atom。
- *
- * @details
- * 第一维每走一步跳过 64 个 half，第二维连续。
- */
-using Layout_K_SW128_Atom_half_t =
-    ComposedLayout<Swizzle<3,4,3>,
-                   smem_ptr_flag_bits<16>,
-                   Layout<Shape<_8,_64>, Stride<_64,_1>>>;
-```
-
-它的 `layout_b` 映射是：
-
-```cpp
-L_half(row, k) = 64 * row + k
-```
-
-输出单位是 `half_t` 元素。
-
-### `make_tensor` 把 swizzle 挂到 shared-memory pointer 上
-
-kernel 里常见代码是：
-
-```cpp
-Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-```
-
-如果 `SmemLayoutA` 是上面这种 `ComposedLayout<SwizzleFn, smem_ptr_flag_bits<B>, Layout>`，dense 路径命中的是这个 overload：
-
-```cpp
-/**
- * @brief 把 flagged `ComposedLayout` 绑定到真实 shared-memory pointer。
- *
- * @tparam Iterator shared-memory iterator 类型，例如 `smem_ptr<half_t*>`。
- * @tparam SwizzleFn swizzle 类型，例如 `Swizzle<3,4,3>`。
- * @tparam B layout 期待的元素位宽，单位是比特。
- * @tparam Layout 已经 upcast 到元素单位的普通 layout。
- * @param ptr 真实 shared-memory pointer，必须是 `smem_ptr`。
- * @param layout 带 `smem_ptr_flag_bits<B>` 的元素单位 layout。
- * @return 一个普通 tensor：engine 是 swizzled shared-memory pointer，
- *         layout 是 `layout.layout_b()`。
- */
-template <class Iterator, class SwizzleFn, int B, class Layout>
-CUTE_HOST_DEVICE constexpr
-auto
-make_tensor(Iterator const& ptr,
-            ComposedLayout<SwizzleFn,
-                           smem_ptr_flag_bits<B>,
-                           Layout> const& layout)
-{
-  static_assert(is_smem<Iterator>::value, "Expected smem.");
-  static_assert(B == sizeof_bits<iter_value_t<Iterator>>::value,
-                "Expected a B-bit pointer type.");
-
-  return make_tensor(make_smem_ptr(ptr.get(), layout.layout_a()),
-                     layout.layout_b());
-}
-```
-
-这里的关键是：
-
-```cpp
-make_smem_ptr(ptr.get(), layout.layout_a())
-```
-
-它会继续走 `pointer.hpp` / `pointer_swizzle.hpp`：
-
-```cpp
-/**
- * @brief 给 shared-memory pointer 挂上 swizzle。
- *
- * @tparam Iterator 原始 iterator 或 pointer 类型。
- * @tparam Swizzle swizzle 函数类型。
- * @param ptr 原始 shared-memory pointer。
- * @param sw swizzle 函数对象。
- * @return 带 swizzle 的 shared-memory pointer。
- */
-template <class Iterator, class Swizzle>
-CUTE_HOST_DEVICE constexpr
-auto
-make_smem_ptr(Iterator ptr, Swizzle sw)
-{
-  return make_swizzle_ptr(make_smem_ptr(ptr), sw);
-}
-
-/**
- * @brief 构造 position-dependent swizzle pointer。
- *
- * @tparam Iterator 已经带 `smem_ptr` 标签的 iterator。
- * @tparam SwizzleFn swizzle 函数类型。
- * @param ptr shared-memory iterator。
- * @param swizzle_fn swizzle 函数对象。
- * @return `swizzle_ptr<SwizzleFn, Iterator>`。
- */
-template <class Iterator, class SwizzleFn>
-CUTE_HOST_DEVICE constexpr
-swizzle_ptr<SwizzleFn,Iterator>
-make_swizzle_ptr(Iterator ptr, SwizzleFn swizzle_fn) {
-  return {ptr};
-}
-
-/**
- * @brief `Swizzle<0,M,S>` 不做地址变换，可以直接退化成原 pointer。
- */
-template <class Iterator, int M, int S>
-CUTE_HOST_DEVICE constexpr
-Iterator
-make_swizzle_ptr(Iterator ptr, Swizzle<0,M,S>) {
-  return ptr;
-}
-```
-
-`swizzle_ptr` 的访问逻辑是：
-
-```cpp
-/**
- * @brief shared-memory 的 position-dependent swizzle pointer。
- *
- * @tparam SwizzleFn swizzle 函数类型。
- * @tparam Iterator 底层 pointer / iterator 类型。
- *
- * @details
- * `operator[]` 先做 typed pointer 加法，再对得到的真实 pointer 地址应用 swizzle。
- */
-template <class SwizzleFn, class Iterator>
-struct swizzle_ptr : iter_adaptor<Iterator, swizzle_ptr<SwizzleFn,Iterator>>
-{
-  template <class T>
-  CUTE_HOST_DEVICE constexpr static
-  T* apply_swizzle(T* ptr) {
-    return reinterpret_cast<T*>(
-        SwizzleFn::apply(reinterpret_cast<uintptr_t>(ptr)));
-  }
-
-  template <class Int>
-  CUTE_HOST_DEVICE constexpr
-  reference operator[](Int const& i) const {
-    return *apply_swizzle(this->get() + i);
-  }
-};
-```
-
-因此，`Tensor sA = make_tensor(...)` 之后，概念类型变成：
-
-```cpp
-/**
- * @brief 绑定真实 shared-memory pointer 后的概念形态。
- *
- * @details
- * `L_half` 输出 half 元素偏移；`swizzle_ptr` 对 typed pointer 加法后的
- * 字节地址执行 `Swizzle<3,4,3>`。
- */
-swizzle_ptr<Swizzle<3,4,3>, smem_ptr<half_t*>> o L_half
-```
-
-这时访问 `sA(i,n)` 的单位链路是：
-
-```text
-(i,n)
-  -> L_half(i,n) = i + 64n          // 单位：half 元素
-  -> ptr + L_half(i,n)              // typed pointer 加法，换成字节地址
-  -> Swizzle<3,4,3>(字节地址)       // 单位：字节地址
-  -> dereference
-```
-
-所以“比特 swizzle 最后变成元素偏移 swizzle”的准确说法是：
-
-- `_Atom_Bits` 用比特单位定义一个元素无关的 GMMA atom。
-- `upcast<sizeof_bits<Type>::value>` 把 `layout_b` 改成元素单位。
-- `make_tensor` 不再把 `Swizzle` 当普通 layout 函数调用，而是把它挂到 typed shared-memory pointer 上。
-- typed pointer 加法把元素偏移换成字节地址，`swizzle_ptr` 再对这个字节地址做 swizzle。
-
-
-### 从 FP16 SW128 看最终元素偏移公式
-
-以 `Layout_MN_SW128_Atom<half_t>` 为例：
-
-```cpp
-L_half(i, n) = i + 64 * n
-```
-
-`half_t` 是 2 字节，所以 typed pointer 加法对应的字节偏移是：
-
-```text
-字节偏移 = 2 * (i + 64 * n)
-```
-
-为了看清相对变化，先假设 shared-memory base 的低 10 个比特为 0。真实源码对 **绝对字节地址** 做 XOR；如果 base 没有这个对齐，要把 base 的低位一起带进计算。
-
-这时字节地址的低 10 个比特可以拆成：
-
-```text
-YYY ZZZ XXXX
-```
-
-对于 FP16：
-
-- `YYY = n`，表示第几个 128 字节行。
-- `ZZZ = i / 8`，因为 8 个 half 正好是 16 字节。
-- `XXXX = 2 * (i % 8)`，表示 16 字节小块内部的字节位置。
-
-`Swizzle<3,4,3>` 做 `ZZZ ^= YYY`，所以从 FP16 元素偏移视角看，等价于：
-
-```cpp
-physical_half_offset =
-    64 * n
-  + 8 * ((i / 8) ^ n)
-  + (i % 8);
-```
-
-例如 `n = 5`、`i = 27`：
-
-- 逻辑 half 元素偏移是 `27 + 64 * 5 = 347`。
-- 逻辑字节偏移是 `347 * 2 = 694`。
-- `i / 8 = 3`，`i % 8 = 3`。
-- swizzle 后的 16 字节小块列号是 `3 XOR 5 = 6`。
-- 物理 half 元素偏移是 `64 * 5 + 8 * 6 + 3 = 371`。
-- 物理字节偏移是 `371 * 2 = 742`。
-
-两种视角是同一件事：
-
-```cpp
-// 字节地址视角
-694 字节 -> 742 字节
-
-// FP16 元素偏移视角
-347 -> 371
-```
-
-### 同一个 layout 如何同时服务 TMA 和 GMMA
-
-经过 `make_tensor` 后，`sA` / `sB` 同时携带两件信息：
-
-- `layout_b`：元素坐标如何变成元素偏移。
-- `swizzle_ptr`：元素偏移对应的 shared-memory pointer 如何做 swizzle。
-
-TMA descriptor 会从同一个 swizzle 类型里提取 `CUtensorMapSwizzle`：
-
-```cpp
-/**
- * @brief 从 CuTe swizzle 类型提取 TMA descriptor 需要的 swizzle 枚举。
- *
- * @details
- * 对 `Swizzle<B,4,3>`，B=0/1/2/3 分别对应
- * NONE / 32 字节 / 64 字节 / 128 字节 swizzle。
- */
-TMA::SmemSwizzleBits swizzle_bits = get_tma_swizzle_bits(swizzle);
-TMA::SmemSwizzleBase swizzle_base = get_tma_swizzle_base(swizzle);
-CUtensorMapSwizzle smem_swizzle =
-    TMA::to_CUtensorMapSwizzle(swizzle_bits, swizzle_base);
-```
-
-GMMA descriptor 也从同一个 `swizzle_ptr` 里识别 `Swizzle<B,4,3>`，把它解释成 GMMA layout type：
-
-| `B` | CuTe atom 名称 | TMA swizzle | GMMA layout type |
-| ---: | --- | --- | --- |
-| 0 | `INTER` | `NONE` | `INTERLEAVE` |
-| 1 | `SW32` | 32 字节 | `B32` |
-| 2 | `SW64` | 64 字节 | `B64` |
-| 3 | `SW128` | 128 字节 | `B128` |
-
-这不是“TMA swizzle 一次，GMMA 再 swizzle 一次”。更准确地说：
-
-- TMA 按这套 shared-memory 地址约定写入。
-- GMMA 按同一套 shared-memory 地址约定读取。
-
-如果两边不一致，GMMA 读到的矩阵元素排列就是错的，而不只是 bank conflict 变多。
-
-M/N-major 与 K-major 的区别不在 `Swizzle<3,4,3>`，而在 `layout_b` 的连续方向：
-
-| atom | 元素单位 `layout_b` 连续方向 | 对应 GMMA major |
-| --- | --- | --- |
-| `Layout_MN_SW*_Atom<Type>` | mode 0，即 A 的 M 或 B 的 N 方向 | `GMMA::Major::MN` |
-| `Layout_K_SW*_Atom<Type>` | mode 1，即 K 方向 | `GMMA::Major::K` |
-
-所以 `Layout_MN_SW128_Atom<Type>` 和 `Layout_K_SW128_Atom<Type>` 可以得到同一个 `CU_TENSOR_MAP_SWIZZLE_128B`，但它们的元素坐标到元素偏移的方向不同，GMMA 解释 operand 的 major 也不同。
-
-## 从教程示例看 CuTe TMA 的使用线路
-
-`examples/cute/tutorial/hopper/wgmma_tma_sm90.cu` 里有一个 `gemm_tn` 示例。这里的 `SW128` 不是单独的 TMA 选项，而是一份从 host 侧 SMEM layout 一直传到 TMA descriptor、再传到 WGMMA descriptor 的共同约定。先给出结论：
-
-- **它主要服务 WGMMA 从 shared memory 读取 A/B operand 的高吞吐布局**。TMA 负责把逻辑矩阵元素按同一规则写到这个布局里，保证 WGMMA 读到正确的元素。
-- **它不是在解决 TMA 发起时的传统 bank conflict。** 这个示例里只有 elected 的一个线程调用 `copy(...)`；TMA 随后由独立硬件异步执行 global-to-shared 搬运，并不存在 32 个线程各自执行 `ld.shared` / `st.shared` 而争用 bank 的访问形态。
-- **不使用 swizzle 仍然可以是正确、合法的 WGMMA layout。** `Swizzle<0,4,3>` 在 CuTe 中映射为 `LayoutType::INTERLEAVE`；只要 TMA 和 WGMMA 一起使用这个 layout，结果不会因为“没有 swizzle”而错误。官方示例选择 `SW128` 是性能布局选择，不能简单改写成“不 swizzle 必然 bank conflict”。
-
-下面先把完整调用链对应到源码，再回头解释这个结论为什么成立。
-
-### 完整源码注释版：`SharedStorage`、`gemm_device`、`gemm_tn`
-
-先把关键源码完整放在这里。下面是学习注释版：保留原始变量名、控制流和 CuTe API 调用，只补中文 Doxygen 注释和行内解释。后面再拆 `make_tma_atom`、`get_tma_tensor`、`tma_partition`、barrier 和 pipeline 时，都可以回到这段代码里对照。
-
-```cpp
-/**
- * @brief `gemm_device` 使用的动态 shared memory 布局。
- *
- * @tparam ElementA A operand 的元素类型，例如 `half_t`。
- * @tparam ElementB B operand 的元素类型，例如 `half_t`。
- * @tparam SmemLayoutA A 在 shared memory 中的 CuTe layout，形状是 `(BLK_M, BLK_K, PIPE)`。
- * @tparam SmemLayoutB B 在 shared memory 中的 CuTe layout，形状是 `(BLK_N, BLK_K, PIPE)`。
- *
- * @details
- * 这个结构体会被放进 kernel 的 dynamic shared memory。
- *
- * - `A` / `B` 是 TMA 写入、GMMA 读取的 shared memory staging buffer。
- * - `tma_barrier` 是 TMA producer barrier，等 TMA load 写完 shared memory。
- * - `mma_barrier` 是 MMA consumer barrier，通知 TMA producer 某个 pipe 已经消费完。
- */
-template <class ElementA,
-          class ElementB,
-          class SmemLayoutA,  // (M,K,P)
-          class SmemLayoutB>  // (N,K,P)
-struct SharedStorage
-{
-  // A 的 shared memory buffer。它本身只是连续分配的一段原始 shared memory；
-  // `ArrayEngine` 并不会把元素预先存成 swizzle 顺序。
-  // `cosize_v<SmemLayoutA>` 是 layout 覆盖的元素个数，`alignas(128)` 让 A 的起始地址
-  // 满足 TMA / GMMA 的常用对齐要求。真正的逻辑坐标 -> 物理字节地址关系，发生在稍后
-  // `make_tensor(..., SmemLayoutA{})` 把这个 buffer 解释成 tensor 时。
-  alignas(128) cute::ArrayEngine<ElementA, cosize_v<SmemLayoutA>> A;
-
-  // B 同理；它和 A 是两个独立的 raw buffer，各自再绑定自己的 SMEM layout。
-  alignas(128) cute::ArrayEngine<ElementB, cosize_v<SmemLayoutB>> B;
-
-  // 每个 pipeline stage 一个 TMA transaction barrier。
-  // `size<2>(SmemLayoutA{})` 对应第三维 PIPE 数。
-  uint64_t tma_barrier[size<2>(SmemLayoutA{})];
-
-  // 每个 pipeline stage 一个 MMA consumer barrier。
-  // A/B 的 PIPE 数必须一致，所以这里用 `SmemLayoutA` 的 PIPE 数即可。
-  uint64_t mma_barrier[size<2>(SmemLayoutA{})];
-};
-
-/**
- * @brief SM90 TMA + WGMMA 的 device kernel。
- *
- * @tparam ProblemShape GEMM 问题形状类型，运行时值是 `(M, N, K)`。
- * @tparam CtaTiler CTA tile 形状类型，运行时值是 `(BLK_M, BLK_N, BLK_K)`。
- * @tparam TA A operand 元素类型。
- * @tparam SmemLayoutA A 的 shared memory layout 类型，形状 `(BLK_M, BLK_K, PIPE)`。
- * @tparam TmaA A 的 TMA atom / descriptor 类型。
- * @tparam TB B operand 元素类型。
- * @tparam SmemLayoutB B 的 shared memory layout 类型，形状 `(BLK_N, BLK_K, PIPE)`。
- * @tparam TmaB B 的 TMA atom / descriptor 类型。
- * @tparam TC C operand 元素类型。
- * @tparam CStride C 的 GMEM stride 类型。
- * @tparam TiledMma CuTe tiled MMA 对象类型，描述 WGMMA tile 和线程布局。
- * @tparam Alpha alpha 标量类型。
- * @tparam Beta beta 标量类型。
- *
- * @param shape_MNK GEMM 问题形状 `(M,N,K)`。
- * @param cta_tiler CTA tile 形状 `(BLK_M,BLK_N,BLK_K)`。
- * @param A A 的 GMEM 指针。这里真正的 TMA 描述已经在 `tma_a` 里。
- * @param tma_a A 的 TMA atom，作为 grid constant 传入，内部持有 tensor map descriptor。
- * @param B B 的 GMEM 指针。这里真正的 TMA 描述已经在 `tma_b` 里。
- * @param tma_b B 的 TMA atom，作为 grid constant 传入。
- * @param C C 的 GMEM 指针，用 epilogue 写回。
- * @param dC C 的 stride layout，和 `(M,N)` congruent。
- * @param mma WGMMA tiled MMA 对象。
- * @param alpha epilogue 中 `C = alpha * accum + beta * C` 的 alpha。
- * @param beta epilogue 中 `C = alpha * accum + beta * C` 的 beta。
- */
-template <class ProblemShape, class CtaTiler,
-          class TA, class SmemLayoutA, class TmaA,
-          class TB, class SmemLayoutB, class TmaB,
-          class TC, class CStride, class TiledMma,
-          class Alpha, class Beta>
-__global__ static
-__launch_bounds__(decltype(size(TiledMma{}))::value)
-void
-gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
-            TA const* A, CUTLASS_GRID_CONSTANT TmaA const tma_a,
-            TB const* B, CUTLASS_GRID_CONSTANT TmaB const tma_b,
-            TC      * C, CStride dC, TiledMma mma,
-            Alpha alpha, Beta beta)
-{
-  // `shape_MNK` 必须是三维问题形状：(M,N,K)。
-  CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});
-
-  // `cta_tiler` 必须是三维 CTA tile 形状：(BLK_M,BLK_N,BLK_K)。
-  CUTE_STATIC_ASSERT_V(rank(cta_tiler) == Int<3>{});
-
-  // TMA / WGMMA 这类 SMEM layout 通常要静态可知，方便编译期生成 descriptor 和检查。
-  static_assert(is_static<SmemLayoutA>::value);
-  static_assert(is_static<SmemLayoutB>::value);
-
-  // A 的 shared memory layout 第 0 维必须对应 BLK_M。
-  CUTE_STATIC_ASSERT_V(size<0>(SmemLayoutA{}) == size<0>(cta_tiler));
-
-  // B 的 shared memory layout 第 0 维必须对应 BLK_N。
-  CUTE_STATIC_ASSERT_V(size<0>(SmemLayoutB{}) == size<1>(cta_tiler));
-
-  // A 的 shared memory layout 第 1 维必须对应 BLK_K。
-  CUTE_STATIC_ASSERT_V(size<1>(SmemLayoutA{}) == size<2>(cta_tiler));
-
-  // B 的 shared memory layout 第 1 维必须对应 BLK_K。
-  CUTE_STATIC_ASSERT_V(size<1>(SmemLayoutB{}) == size<2>(cta_tiler));
-
-  // C 的 stride layout 要能描述 `(M,N)` 这个二维矩阵。
-  CUTE_STATIC_ASSERT_V(congruent(select<0,1>(shape_MNK), dC));
-
-  // 把动态问题形状拆成 M/N/K 三个运行时整数。
-  auto [M, N, K] = shape_MNK;
-
-  // `get_tma_tensor` 生成的是 TMA coordinate tensor，不是普通 GMEM data tensor。
-  // 它使用 host 侧 `make_tma_atom` 保存下来的 TMA stride 信息。
-  Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                   // (M,K) TMA Tensor
-
-  // B 同理，逻辑上是 `(N,K)` 的 TMA coordinate tensor。
-  Tensor mB = tma_b.get_tma_tensor(make_shape(N,K));                   // (N,K) TMA Tensor
-
-  // C 不走 TMA，这里是普通 GMEM tensor，epilogue 会直接写回 C。
-  Tensor mC = make_tensor(make_gmem_ptr(C), make_shape(M,N), dC);      // (M,N)
-
-  // 当前 CTA 的逻辑坐标。x 对应 M tile，y 对应 N tile，K 方向用 `_` 保留成 tile 序列。
-  auto cta_coord = make_coord(blockIdx.x, blockIdx.y, _);              // (m,n,k)
-
-  // 从完整 A coordinate tensor 切出当前 CTA 的 A tile。
-  // Step<_1, X, _1> 表示使用 cta_tiler 的 M 和 K 维，跳过 N 维。
-  Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});  // (BLK_M,BLK_K,k)
-
-  // 从完整 B coordinate tensor 切出当前 CTA 的 B tile。
-  // Step<X, _1, _1> 表示使用 cta_tiler 的 N 和 K 维，跳过 M 维。
-  Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});  // (BLK_N,BLK_K,k)
-
-  // 从完整 C data tensor 切出当前 CTA 要写回的 C tile。
-  // Step<_1,_1,X> 表示使用 M 和 N 维，跳过 K 维。
-  Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1,_1, X>{});  // (BLK_M,BLK_N)
-
-  // 声明 dynamic shared memory 的原始字节入口。
-  extern __shared__ char shared_memory[];
-
-  // 复用上面的 `SharedStorage` 模板，把这段 dynamic shared memory 解释成 A/B buffer + barriers。
-  using SharedStorage = SharedStorage<TA, TB, SmemLayoutA, SmemLayoutB>;
-  SharedStorage& smem = *reinterpret_cast<SharedStorage*>(shared_memory);
-
-  // A 的 shared memory tensor，形状是 `(BLK_M,BLK_K,PIPE)`。
-  // 此处是 SW128 真正挂到 raw buffer 上的第一处：SmemLayoutA 中有
-  // `Swizzle<3,4,3> + smem_ptr_flag_bits<sizeof_bits<TA>>` 时，make_tensor 的
-  // flagged-layout 特化会创建 swizzle_ptr。之后 `sA(i,k,pipe)` 先得到元素偏移，
-  // 再在真实字节地址上执行 XOR swizzle。
-  Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-
-  // B 同理。注意 A/B buffer 的声明形式没有区别；K-major、SW128 等语义全在 layout 类型中。
-  Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
-
-  // TMA 专用 partitioner：
-  // - `Int<0>{}` 和 `Layout<_1>{}` 表示当前示例不做 multicast。
-  // - `group_modes<0,2>` 把 `(BLK_M,BLK_K,PIPE)` 变成 `((BLK_M,BLK_K),PIPE)`。
-  // - TMA 负责第 0 个 grouped mode，也就是一整个 `(BLK_M,BLK_K)` tile。
-  auto [tAgA, tAsA] = tma_partition(tma_a, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sA),
-                                    group_modes<0,2>(gA));            // (TMA,k), (TMA,PIPE)
-
-  // B 的 TMA partition 同理，只是空间 tile 是 `(BLK_N,BLK_K)`。
-  auto [tBgB, tBsB] = tma_partition(tma_b, Int<0>{}, Layout<_1>{},
-                                    group_modes<0,2>(sB),
-                                    group_modes<0,2>(gB));            // (TMA,k), (TMA,PIPE)
-
-  // 每个 pipe 中会发起两次 TMA load：一次搬 A stage，一次搬 B stage。
-  // transaction barrier 要知道这两次 TMA 总共会写多少字节。
-  constexpr int tma_transaction_bytes =
-      sizeof(make_tensor_like(tensor<0>(tAsA))) +
-      sizeof(make_tensor_like(tensor<0>(tBsB)));
-
-  // PIPE 数来自 `tAsA` 的第 1 维，也就是 shared memory pipeline stage 数。
-  auto K_PIPE_MAX = size<1>(tAsA);
-
-  // K 方向总共有多少个 tile 要搬。`tAgA` 的第 1 维就是 k tile 序列。
-  int k_tile_count = size<1>(tAgA);
-
-  // 当前要从 GMEM/TMA coordinate tensor 读取的 k tile 编号。
-  int k_tile = 0;
-
-  // 每个 warp 内一致的 warp id，用来只让 warp 0 发起 TMA / 初始化 barrier。
-  int warp_idx = cutlass::canonical_warp_idx_sync();
-
-  // 每个 warp 选一个 lane。最终只有 `(warp_idx == 0 && lane_predicate)` 的线程做 producer 工作。
-  int lane_predicate = cute::elect_one_sync();
-
-  // producer barrier：TMA 写 shared memory，消费者要等它完成。
-  uint64_t* producer_mbar = smem.tma_barrier;
-
-  // consumer barrier：WGMMA 消费 shared memory，生产者要等它释放 pipe。
-  uint64_t* consumer_mbar = smem.mma_barrier;
-
-  // transaction barrier 会同时跟踪 arrive count 和 TMA transaction bytes。
-  using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;
-
-  // 普通 cluster barrier 只跟踪 arrive count / phase，用来表示 MMA 消费完成。
-  using ConsumerBarType = cutlass::arch::ClusterBarrier;
-
-  // 每个 pipe 各初始化一对 producer / consumer barrier。
-  CUTE_UNROLL
-  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
-    if ((warp_idx == 0) && lane_predicate) {
-      // 只有一个 elected TMA producer 会 arrive，所以 producer arrive count 是 1。
-      ProducerBarType::init(&producer_mbar[pipe], 1);
-
-      // 一个 WGMMA warpgroup 有 128 个线程，全部消费完才释放 pipe。
-      ConsumerBarType::init(&consumer_mbar[pipe], 128);
-    }
-  }
-
-  // barrier 初始化发生在 shared memory 中，需要 cluster 范围同步后才能安全使用。
-  cluster_sync();
-
-  // 预取阶段：先把所有 pipe 填满。
-  // 这一步让后面的 mainloop 一开始就有数据可算。
-  CUTE_UNROLL
-  for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe)
-  {
-    if ((warp_idx == 0) && lane_predicate)
-    {
-      // 先告诉 transaction barrier：这个 phase 要等多少 TMA 字节完成。
-      // 这个调用同时执行 arrive，所以 producer arrival count 也会减 1。
-      ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                            tma_transaction_bytes);
-
-      // 发起 A 的 TMA load：从第 `k_tile` 个 K tile 搬到 shared memory 第 `pipe` 个 stage。
-      // 这不是每个线程各做一次 `st.shared`。TMA descriptor 已经从 host 侧 sA layout
-      // 取得 SW128 信息，TMA 硬件据此把逻辑 A 元素写到对应的物理 shared-memory 位置。
-      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-
-      // 发起 B 的 TMA load。其 SW128 规则同样来自 sB layout；A/B 共用同一个 producer
-      // barrier，所以 bytes 要加总。
-      copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
-    }
-
-    // 这个 k tile 已经发起 TMA 了，从剩余 tile 计数中扣掉。
-    --k_tile_count;
-
-    // 下一次预取 / 主循环发起下一个 K tile。
-    ++k_tile;
-  }
-
-  // 当前线程在 WGMMA tiled MMA 中的逻辑切片。
-  ThrMMA thr_mma = mma.get_thread_slice(threadIdx.x);
-
-  // WGMMA 从 shared memory A 读取的 descriptor tensor。这里没有把 A 搬进寄存器；
-  // partition 保留了 sA 的 layout / swizzle 类型，供后续生成 GMMA descriptor。
-  Tensor tCsA = thr_mma.partition_A(sA);                               // (MMA,MMA_M,MMA_K,PIPE)
-
-  // WGMMA 从 shared memory B 读取的 descriptor tensor。
-  Tensor tCsB = thr_mma.partition_B(sB);                               // (MMA,MMA_N,MMA_K,PIPE)
-
-  // 当前线程负责的 C accumulator / output tile。
-  Tensor tCgC = thr_mma.partition_C(gC);                               // (MMA,MMA_M,MMA_N)
-
-  // 创建 accumulator fragment，并清零。
-  Tensor tCrC = thr_mma.make_fragment_C(tCgC);                         // (MMA,MMA_M,MMA_N)
-  clear(tCrC);
-
-  // 在 SM90 SS WGMMA 路线中，A/B fragment 实际上是 GMMA descriptor view，不是传统寄存器
-  // fragment。make_gmma_desc 会检查 sA/sB 的 swizzle 类型：B=3 时把 descriptor 的
-  // layout type 编为 B128；GMMA 据此解释 shared memory 中的物理地址。
-  Tensor tCrA = thr_mma.make_fragment_A(tCsA);                         // (MMA,MMA_M,MMA_K,PIPE)
-  Tensor tCrB = thr_mma.make_fragment_B(tCsB);                         // (MMA,MMA_N,MMA_K,PIPE)
-
-  // TMA producer 的环形 pipe 状态：记录下一次写哪个 pipe，以及 barrier phase。
-  auto write_state = cutlass::PipelineState<K_PIPE_MAX>();
-
-  // MMA consumer 的环形 pipe 状态：记录下一次读哪个 pipe，以及 barrier phase。
-  auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();
-
-  // 主循环会继续跑到已经预取的 pipe 都被消费完。
-  // `k_tile_count > -K_PIPE_MAX` 是为了在没有新 tile 后，继续 drain pipeline。
-  CUTE_NO_UNROLL
-  while (k_tile_count > -K_PIPE_MAX)
-  {
-    // consumer 选择当前要读取的 shared-memory pipe。
-    int read_pipe = read_state.index();
-
-    // 等这个 pipe 对应的 TMA load 完成。
-    // `read_state.phase()` 是 mbarrier parity phase，每绕环一圈翻转。
-    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
-
-    // 开始一个 warpgroup MMA batch。
-    warpgroup_arrive();
-
-    // 对当前 pipe 的 A/B descriptor 执行 WGMMA，累加到 tCrC。
-    gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
-
-    // 提交 warpgroup MMA batch。
-    warpgroup_commit_batch();
-
-    // 等当前 warpgroup 所有 MMA 完成，保证这个 pipe 的 shared memory 已经被消费。
-    warpgroup_wait<0>();
-
-    // 通知 producer：当前 `read_pipe` 已经消费完，可以复用。
-    ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
-
-    // consumer 环形状态前进到下一个 pipe；必要时 phase 翻转。
-    ++read_state;
-
-    // 如果还有新的 K tile，就让 elected TMA producer 继续填充 write pipe。
-    if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0))
-    {
-      // producer 选择当前要写入的 shared-memory pipe。
-      int pipe = write_state.index();
-
-      // 等 consumer 释放这个 pipe，避免 TMA 覆盖还没被 WGMMA 消费完的数据。
-      ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
-
-      // 给这个 producer barrier phase 设置新的 expected transaction bytes。
-      ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                            tma_transaction_bytes);
-
-      // 发起下一块 A tile 的 TMA load。
-      copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-
-      // 发起下一块 B tile 的 TMA load。
-      copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
-
-      // producer 环形状态前进到下一个 pipe；必要时 phase 翻转。
-      ++write_state;
-    }
-
-    // 这一轮主循环消耗 / 尝试发起了一个 K tile。
-    --k_tile_count;
-    ++k_tile;
-  }
-
-  // epilogue：把 accumulator 写回 C。
-  // 示例里是 unpredicated，实际通用 kernel 需要处理边界 tile。
-  axpby(alpha, tCrC, beta, tCgC);
-}
-
-/**
- * @brief Host 侧配置并启动 TN GEMM。
- *
- * @tparam TA A operand 元素类型。
- * @tparam TB B operand 元素类型。
- * @tparam TC C operand 元素类型。
- * @tparam Alpha alpha 标量类型。
- * @tparam Beta beta 标量类型。
- *
- * @param m GEMM 的 M 维大小。
- * @param n GEMM 的 N 维大小。
- * @param k GEMM 的 K 维大小。
- * @param alpha epilogue 的 alpha。
- * @param A A 的 device 指针。
- * @param ldA A 的 leading dimension。TN 路线里 A 的 K 方向 stride 为 1。
- * @param B B 的 device 指针。
- * @param ldB B 的 leading dimension。TN 路线里 B 的 K 方向 stride 为 1。
- * @param beta epilogue 的 beta。
- * @param C C 的 device 指针。
- * @param ldC C 的 leading dimension。
- * @param stream CUDA stream。
- */
-template <class TA, class TB, class TC,
-          class Alpha, class Beta>
-void
-gemm_tn(int m, int n, int k,
-        Alpha alpha,
-        TA const* A, int ldA,
-        TB const* B, int ldB,
-        Beta beta,
-        TC      * C, int ldC,
-        cudaStream_t stream = 0)
-{
-  // 把传入的运行时尺寸转成 CuTe 后续会使用的局部变量。
-  auto M = int(m);
-  auto N = int(n);
-  auto K = int(k);
-
-  // GEMM 问题形状，后续 kernel 中会拆成 `(M,N,K)`。
-  auto prob_shape = make_shape(M, N, K);
-
-  // TN 路线：A 按 `(M,K)` 看，K 方向 stride 为 1，M 方向 stride 是 ldA。
-  auto dA = make_stride(ldA, Int<1>{});                      // (dM, dK)
-
-  // TN 路线：B 按 `(N,K)` 看，K 方向 stride 为 1，N 方向 stride 是 ldB。
-  auto dB = make_stride(ldB, Int<1>{});                      // (dN, dK)
-
-  // C 按 `(M,N)` 看，M 方向 stride 为 1，N 方向 stride 是 ldC。
-  auto dC = make_stride(Int<1>{}, ldC);                      // (dM, dN)
-
-  // CTA tile 的 M 维。
-  auto bM = Int<128>{};
-
-  // CTA tile 的 N 维。
-  auto bN = Int<128>{};
-
-  // CTA tile 的 K 维，每个 mainloop step 消费一个 BLK_K。
-  auto bK = Int<64>{};
-
-  // CTA tiler 是 `(BLK_M, BLK_N, BLK_K)`，同时用于 local_tile 和 launch grid 计算。
-  auto cta_tiler = make_shape(bM, bN, bK);
-
-  // shared memory pipeline stage 数。
-  auto bP = Int<3>{};
-
-  // TN 路线里 A/B 都是 K-major shared-memory layout。
-  // `Layout_K_SW128_Atom<T>` 同时包含：K-major 的元素线性化规则，以及
-  // `Swizzle<3,4,3>` 的 128 字节地址 swizzle。tile_to_shape 把 atom 重复扩展到
-  // `(BLK_M|BLK_N, BLK_K, PIPE)`；这个具体类型会一路传给 SharedStorage、TMA 和 GMMA。
-  auto sA = tile_to_shape(GMMA::Layout_K_SW128_Atom<TA>{},
-                          make_shape(bM,bK,bP));
-  auto sB = tile_to_shape(GMMA::Layout_K_SW128_Atom<TB>{},
-                          make_shape(bN,bK,bP));
-
-  // WGMMA atom 也声明 A/B 都是 Major::K，必须和上面的 SMEM layout 的连续维度一致。
-  // `Major::K` 只说明 GMMA 以 K-major 解释 operand；SW128 还是由 sA/sB 这个 tensor
-  // layout 生成的 GMMA descriptor 中的 B128 layout type 表达。
-  TiledMMA tiled_mma =
-      make_tiled_mma(SM90_64x64x16_F16F16F16_SS<
-          GMMA::Major::K,
-          GMMA::Major::K>{});
-
-  // Host 侧创建普通 GMEM data tensor，用来让 `make_tma_atom` 检查 shape/stride 并编码 descriptor。
-  Tensor mA = make_tensor(A, make_shape(M,K), dA);
-  Tensor mB = make_tensor(B, make_shape(N,K), dB);
-
-  // 为 A 创建 TMA atom：
-  // - `SM90_TMA_LOAD{}` 选择 global -> shared TMA load。
-  // - `mA` 提供 GMEM base/shape/stride。
-  // - `sA(_,_,0)` 只取一个 pipe 的 SMEM layout，用来描述一次 TMA 的 box；
-  //   make_tma_atom 同时从这个 layout 提取 `Swizzle<3,4,3>`，写进 tensor map descriptor
-  //   的 `CU_TENSOR_MAP_SWIZZLE_128B` 字段。
-  // - `make_shape(bM,bK)` 描述 CTA-local A tile。
-  Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                                 make_shape(bM,bK));
-
-  // B 的 TMA atom 同理，只是 CTA-local tile 是 `(bN,bK)`。
-  Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0),
-                                 make_shape(bN,bK));
-
-  // 一个 CTA 使用的线程数由 tiled_mma 决定。
-  dim3 dimBlock(size(tiled_mma));
-
-  // 每个 cluster 里 x 方向放 2 个 CTA；这个示例不在 y/z 方向组 cluster。
-  // 这和 SW128、也和 TMA multicast 无关：kernel 中使用了 cluster_sync()，而本例的
-  // tma_partition 明确传入 `Int<0>{}, Layout<_1>{}`，所以两个 CTA 不会 multicast A/B。
-  dim3 dimCluster(2, 1, 1);
-
-  // gridDim 仍然是 CTA 个数，但 cluster launch 要求能按 dimCluster 整 cluster 分组。
-  dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
-               round_up(size(ceil_div(n, bN)), dimCluster.y));
-
-  // dynamic shared memory 字节数，包含 A/B staging buffer 和每个 pipe 的 barrier。
-  int smemBytes = sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>);
-
-  // 实例化模板 kernel，类型全部来自上面构造出的 CuTe 对象。
-  auto* kernel_ptr =
-      &gemm_device<decltype(prob_shape), decltype(cta_tiler),
-                   TA, decltype(sA), decltype(tmaA),
-                   TB, decltype(sB), decltype(tmaB),
-                   TC, decltype(dC), decltype(tiled_mma),
-                   decltype(alpha), decltype(beta)>;
-
-  // 告诉 CUDA runtime 这个 kernel 需要的动态 shared memory 上限。
-  CUTE_CHECK_ERROR(cudaFuncSetAttribute(
-      kernel_ptr,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      smemBytes));
-
-  // CUTLASS cluster launch 参数。
-  cutlass::ClusterLaunchParams params = {
-      dimGrid,
-      dimBlock,
-      dimCluster,
-      smemBytes
-  };
-
-  // 用 cluster launch 启动 kernel，并把 TMA atom 作为 kernel 参数传入。
-  cutlass::Status status =
-      cutlass::launch_kernel_on_cluster(
-          params,
-          reinterpret_cast<void const*>(kernel_ptr),
-          prob_shape, cta_tiler,
-          A, tmaA,
-          B, tmaB,
-          C, dC, tiled_mma,
-          alpha, beta);
-
-  // 检查 CUDA launch 错误。
-  CUTE_CHECK_LAST();
-
-  // 检查 CUTLASS cluster launcher 返回的状态。
-  if (status != cutlass::Status::kSuccess) {
-    std::cerr << "Error: Failed at kernel Launch" << std::endl;
-  }
-}
-```
-
-#### 在这份源码里，`SW128` 到底在哪里生效
-
-`SharedStorage` 的 `A` / `B` 成员只是 raw shared-memory buffer，**没有一个“把数组物理重排一遍”的初始化动作**。`SW128` 是同一个 layout 类型在两个硬件接口上的共同解释：TMA 写入时用 tensor map 的 swizzle 字段，WGMMA 读取时用 GMMA descriptor 的 layout type 字段。
-
-| 源码位置 | 发生的事 | `SW128` 在这里的含义 |
-| --- | --- | --- |
-| host `gemm_tn` 的 `sA` / `sB` | 选择 `GMMA::Layout_K_SW128_Atom<T>` 并 `tile_to_shape`。 | 产生一个 K-major、带 `Swizzle<3,4,3>` 的 SMEM layout 类型；此时还没有读写任何内存。 |
-| `make_tma_atom(..., sA(_,_,0), ...)` | 从单个 pipe 的 SMEM layout 构造 tensor map。 | `get_tma_swizzle_bits` 把 `B=3` 转成 `CU_TENSOR_MAP_SWIZZLE_128B`。TMA 于是知道逻辑矩阵坐标应写到哪一个物理 shared-memory 地址。 |
-| device `SharedStorage::A/B` | 为每个 pipe 预留实际字节空间。 | buffer 连续、128 字节对齐；它不认识行、列，也不认识 swizzle。 |
-| device `make_tensor(make_smem_ptr(...), SmemLayoutA{})` | 给 raw buffer 加 CuTe view。 | flagged `ComposedLayout` 特化把 `Swizzle<3,4,3>` 绑定到 pointer；普通 C++ 访问 `sA(i,k,pipe)` 时，元素偏移先换成字节地址，再在该字节地址上做 swizzle。 |
-| `copy(tma_a.with(...), ..., tAsA(...))` | 提交一次 TMA load。 | 由 TMA 硬件按 tensor map 的 `SWIZZLE_128B` 写入；不是 32 个 CUDA 线程分别做 `st.shared`。 |
-| `make_fragment_A/B` 与 `gemm(...)` | 构造并使用 WGMMA SMEM descriptor。 | `make_gmma_desc` 从 pointer 的 `Swizzle<3,4,3>` 识别出 `LayoutType::B128`；WGMMA 以 B128 的规则解释同一片 shared memory。 |
-
-所以数据路径应当读成：
-
-```text
-逻辑 A(i,k)
-  ├─ TMA descriptor: SWIZZLE_128B，把它写到物理 shared-memory 地址 P(i,k)
-  └─ GMMA descriptor: B128，从同一个物理地址 P(i,k) 取回 A(i,k)
-```
-
-TMA 和 WGMMA 使用的是同一条地址规则，才会既正确又高效。只改其中一端不是“性能稍差”，而是两端会对同一块字节作不同解释，计算结果会错。
-
-#### 不用 swizzle 会不会真的产生 bank conflict
-
-不能从这份源码推出“会”。相反，CuTe 明确把无 swizzle 定义成一种可用的 GMMA layout：
-
-```cpp
-/**
- * @brief GMMA layout 类型由 SMEM pointer 上的 swizzle 参数 B 决定。
- *
- * @details
- * `B == 0` 是无地址 XOR 的 INTERLEAVE layout；`B == 3` 才是 128 字节 swizzle 的
- * B128 layout。二者都属于 GMMA descriptor 支持的 layout type。
- */
-switch (B) {
-  case 0: return LayoutType::INTERLEAVE;
-  case 1: return LayoutType::B32;
-  case 2: return LayoutType::B64;
-  case 3: return LayoutType::B128;
-}
-```
-
-上面的逻辑来自 `mma_traits_sm90_gmma.hpp` 的 `layout_type`。同一个文件也预先定义了 `Layout_K_INTER_Atom_Bits = ComposedLayout<Swizzle<0,4,3>, ...>`，因此无 swizzle 并不是绕过 GMMA 约束的“非法普通 layout”。
-
-传统 bank conflict 的图景是：一个 warp 的很多线程在同一条 `ld.shared` 或 `st.shared` 指令中访问同一个 bank 的不同地址，硬件不得不把请求拆成多次完成。这里的 A/B 路径不同：
-
-- **TMA 写入阶段**：一个 elected 线程只负责提交 `copy(...)`；随后 TMA 单元异步完成 global-to-shared 转移。它不是 32 个 lane 的 shared store，所以不应把 `SW128` 解释为“给 TMA store 消除 warp bank conflict”。
-- **WGMMA 读取阶段**：A/B 不是线程逐元素 `ld.shared` 到寄存器，而是通过 SMEM descriptor 被一个 128-thread warpgroup 的 WGMMA 指令消费。`B128` 的价值在于改变这条 operand 供数路径看到的 shared-memory 地址分布，避免某些规则的地址别名 / bank 压力，并匹配硬件支持的 B128 descriptor 格式。
-- **是否出现、出现多少内部冲突**：取决于元素类型、GMMA shape、major、布局和硬件的内部访问模式。C++ 源码没有暴露 WGMMA 内部每个 bank 的 lane 映射；因此不能把 `SW128` 简化成“无 swizzle 时必然 N 路 bank conflict”。最终应以同形状的吞吐量和 profiler 结果验证。
-
-一个有意义且保持正确性的对照实验是只把 layout atom 换成 `INTERLEAVE`：
-
-```cpp
-/**
- * @brief 无 swizzle 的正确性 / 性能对照版本。
- *
- * @details
- * 不要手工修改 TMA descriptor。make_tma_atom 仍然从 sA/sB 自动推导：
- * `Swizzle<0,4,3>` 会得到 TMA 的 `SWIZZLE_NONE`，GMMA 则得到 `INTERLEAVE`。
- */
-auto sA = tile_to_shape(GMMA::Layout_K_INTER_Atom<TA>{},
-                        make_shape(bM, bK, bP));
-auto sB = tile_to_shape(GMMA::Layout_K_INTER_Atom<TB>{},
-                        make_shape(bN, bK, bP));
-
-// `GMMA::Major::K` 不变；make_tma_atom(tma, ..., sA/sB, ...) 也不必改。
-```
-
-这样 host 的 `make_tma_atom` 和 device 的 `make_fragment_A/B` 都从同一个 `sA` / `sB` 类型出发，TMA / WGMMA 的布局约定会一起切换，结果应仍然正确。比较这个版本和 `SW128` 版本的 GEMM 吞吐量，才能回答某个具体 shape 下 `SW128` 带来的实际收益；只看 TMA 提交那一行并不能判断 bank conflict。
-
-这里有一个容易卡住的小点：源码里的
-`using SharedStorage = SharedStorage<TA, TB, SmemLayoutA, SmemLayoutB>;`
-是在函数作用域里创建一个**同名类型别名**。等号右边先查到外层的类模板 `SharedStorage<...>`，等号左边的新名字再在函数作用域里遮住外层模板名。所以后面的
-`SharedStorage& smem = ...` 指的是已经实例化好的具体 shared-memory storage 类型。
-
-### Host 侧：创建 GMEM tensor 和 TMA atom
-
-Host 侧先把裸指针包装成 CuTe tensor，再用 `make_tma_atom` 创建 TMA copy atom。
-
-```cpp
-/**
- * @brief 为 A/B 构造 GMEM tensor，并根据 GMEM tensor、SMEM layout 和 CTA tile 创建 TMA atom。
- *
- * @param A A 矩阵的 global memory 指针。
- * @param B B 矩阵的 global memory 指针。
- * @param dA A 的 stride layout。
- * @param dB B 的 stride layout。
- * @param sA A 在 shared memory 中的 layout，包含 pipeline mode。
- * @param sB B 在 shared memory 中的 layout，包含 pipeline mode。
- * @return `tmaA` / `tmaB` 是只含 descriptor 的 non-executable TMA atom。
- */
-Tensor mA = make_tensor(A, make_shape(M,K), dA);
-Tensor mB = make_tensor(B, make_shape(N,K), dB);
-
-Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                               make_shape(bM,bK));
-Copy_Atom tmaB = make_tma_atom(SM90_TMA_LOAD{}, mB, sB(_,_,0),
-                               make_shape(bN,bK));
-```
-
-几个细节：
-
-- `mA` / `mB` 是完整 GMEM tensor，不是当前 CTA 的 tile。
-- `sA(_,_,0)` 只取一个 pipeline stage 的 SMEM layout，因为 descriptor 描述的是“一次 TMA 写入一个 stage 的 box”。
-- `make_shape(bM,bK)` 是 CTA tile shape，告诉 CuTe 一个 CTA 在 A 上取 `(bM,bK)`。
-- `SM90_TMA_LOAD{}` 说明这是 GMEM 到 SMEM 的 TMA load。
-
-### Host 侧：cluster launch
-
-TMA multicast 和 cluster-level barrier 都依赖 SM90 cluster launch。示例里用 CUTLASS 的封装：
-
-```cpp
-/**
- * @brief 使用 CUDA cluster launch 启动 kernel。
- *
- * @details
- * `dimCluster(2, 1, 1)` 表示一个 cluster 中 x 方向有 2 个 CTA。
- * `dimGrid` 通常要按 cluster 维度 round up，保证 grid 可以按 cluster 分组。
- */
-int smem_size = int(sizeof(SharedStorage<TA, TB, decltype(sA), decltype(sB)>));
-dim3 dimBlock(size(tiled_mma));
-dim3 dimCluster(2, 1, 1);
-dim3 dimGrid(round_up(size(ceil_div(m, bM)), dimCluster.x),
-             round_up(size(ceil_div(n, bN)), dimCluster.y));
-
-cutlass::ClusterLaunchParams params = {
-    dimGrid,
-    dimBlock,
-    dimCluster,
-    smem_size
-};
-
-cutlass::Status status = cutlass::launch_kernel_on_cluster(
-    params, kernel_ptr,
-    prob_shape, cta_tiler,
-    A, tmaA,
-    B, tmaB,
-    C, dC, tiled_mma,
-    alpha, beta);
-```
-
-这里的 `ceil_div(m, bM)` 先算出 M 方向需要多少个 CTA tile：
-
-$$
-\text{tile\_m} = \left\lceil \frac{m}{bM} \right\rceil
-$$
-
-外层的 `round_up(..., dimCluster.x)` 是为了 **cluster launch 的整 cluster 分组**。`dimGrid` 传给 CUDA 的仍然是 CTA grid 维度，不是 cluster grid 维度；但当 `dimCluster(2,1,1)` 时，CUDA 会把 x 方向每 2 个 CTA 组成一个 cluster。
-
-因此 `dimGrid.x` 最好是 `dimCluster.x` 的整数倍：
-
-```text
-tile_m = 5
-dimCluster.x = 2
-
-如果 dimGrid.x = 5:
-  最后一个 cluster 只有 1 个 CTA，不是完整 cluster。
-
-round_up(5, 2) = 6:
-  一共 6 个 CTA，可以组成 3 个完整 cluster。
-```
-
-这行代码可以拆成：
-
-```cpp
-int cta_tiles_m = size(ceil_div(m, bM));
-int cta_tiles_n = size(ceil_div(n, bN));
-
-// gridDim 是 CTA 数，但 cluster launch 希望它能被 clusterDim 整除。
-dim3 dimGrid(round_up(cta_tiles_m, dimCluster.x),
-             round_up(cta_tiles_n, dimCluster.y));
-```
-
-这样做可能会多 launch 一些 **padding CTA**。例如真实只需要 5 个 M tile，却 launch 了 6 个 CTA。通用 kernel 里应该对这些 padding CTA 做边界保护；这个 CuTe tutorial 的 epilogue 写着 `unpredicated`，更偏向演示 TMA / WGMMA 主流程，通常假设问题规模和 tile / cluster 形状配合得比较好。
-
-注意这里把 `tmaA` / `tmaB` 作为 kernel 参数传入。它们里面带着已经在 host 侧编码好的 tensor map descriptor。
-
-### Kernel 侧：TMA tensor、CTA tile 和 partition
-
-进入 kernel 后，第一步不是直接拿裸指针算地址，而是用 TMA atom 生成 TMA 坐标 tensor：
-
-```cpp
-/**
- * @brief 在 kernel 内为 TMA atom 创建坐标 tensor，并切出当前 CTA 的 tile。
- *
- * @details
- * `get_tma_tensor` 返回的是 TMA 坐标空间里的 tensor。
- * `local_tile` 再根据 CTA tiler 和 CTA 坐标切出当前 CTA 负责的 tile。
- */
-Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));
-Tensor mB = tma_b.get_tma_tensor(make_shape(N,K));
-
-Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});
-Tensor gB = local_tile(mB, cta_tiler, cta_coord, Step< X,_1,_1>{});
-
-Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()), SmemLayoutA{});
-Tensor sB = make_tensor(make_smem_ptr(smem.B.begin()), SmemLayoutB{});
-```
-
-这段和 SM80 `sgemm_sm80.cu` 看起来很像，但 `mA` 的语义已经变了。
-
-SM80 里是：
-
-```cpp
-Tensor mA = make_tensor(make_gmem_ptr(A), select<0,2>(shape_MNK), dA); // (M,K)
-Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});    // (BLK_M,BLK_K,k)
-```
-
-这个 `mA` 是 **global memory data tensor**，里面的元素访问会走 global pointer。
-
-TMA 里是：
-
-```cpp
-Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                     // (M,K)
-Tensor gA = local_tile(mA, cta_tiler, cta_coord, Step<_1, X,_1>{});    // (BLK_M,BLK_K,k)
-```
-
-这个 `mA` 是 **TMA coordinate tensor**，不是直接读数据的 tensor。源码里的 `get_tma_tensor` 是：
-
-```cpp
-/**
- * @brief 根据完整 GMEM shape 生成 TMA 坐标 tensor。
- *
- * @tparam GShape 完整 GMEM tensor 的 shape 类型，例如 `(M,K)`。
- * @param g_shape 完整 GMEM tensor 的 shape。
- * @return 一个 coordinate tensor，layout 使用 descriptor 构造时保存的 TMA stride。
- */
-template <class GShape>
-CUTE_HOST_DEVICE constexpr
-auto get_tma_tensor(GShape const& g_shape) const {
-    static_assert(is_congruent<decltype(g_shape),
-                               decltype(aux_params_.g_stride_)>::value);
-    return make_coord_tensor(make_layout(g_shape, aux_params_.g_stride_));
-}
-```
-
-所以 `get_tma_tensor(make_shape(M,K))` 做的是：
-
-```text
-完整逻辑形状:      (M, K)
-descriptor stride: aux_params_.g_stride_
-返回 tensor:       (M, K) 里的每个点能生成 TMA 指令需要的 tensor coordinate
-```
-
-它和 SM80 的 `make_tensor(make_gmem_ptr(A), ...)` 的区别是：
-
-| 路线 | `mA` 表示什么 | `gA = local_tile(...)` 表示什么 |
-| --- | --- | --- |
-| SM80 cp.async | global memory 数据 tensor | 当前 CTA 要搬的数据地址 tile：`(BLK_M,BLK_K,k)`。 |
-| SM90 TMA | TMA 坐标 tensor | 当前 CTA 要交给 TMA 指令的坐标 tile：`(BLK_M,BLK_K,k)`。 |
-
-接下来用 `tma_partition` 把 GMEM tile 和 SMEM tile 变成 TMA copy 能接受的形状：
-
-```cpp
-/**
- * @brief 把 A/B 的 GMEM tile 和 SMEM tile 重排成 TMA copy 的 src/dst tensor。
- *
- * @details
- * `group_modes<0,2>` 会把 M/K 或 N/K 的 tile mode 合成 TMA mode，
- * 保留 pipeline / k tile 这类剩余 mode。返回的 tensor 形状大致是：
- *
- * - `tAgA`: `(TMA, k)`，第 0 维由一条或多条 TMA 指令覆盖。
- * - `tAsA`: `(TMA, PIPE)`，第 1 维是 shared-memory pipeline stage。
- */
-auto [tAgA, tAsA] = tma_partition(
-    tma_a, Int<0>{}, Layout<_1>{},
-    group_modes<0,2>(sA),
-    group_modes<0,2>(gA));
-
-auto [tBgB, tBsB] = tma_partition(
-    tma_b, Int<0>{}, Layout<_1>{},
-    group_modes<0,2>(sB),
-    group_modes<0,2>(gB));
-```
-
-这里的 Tensor 形状可以按下面理解：
-
-| 变量 | group 前形状 | group 后形状 | 含义 |
+| 对象 | 类型 | 跟踪什么 | 谁等待 / 谁通知 |
 | --- | --- | --- | --- |
-| `gA` | `(BLK_M, BLK_K, k)` | `((BLK_M, BLK_K), k)` | 把一个 CTA 的 A tile 合成 TMA 要覆盖的主 mode，剩下的 `k` 是第几个 K tile。 |
-| `sA` | `(BLK_M, BLK_K, PIPE)` | `((BLK_M, BLK_K), PIPE)` | 把一个 shared-memory stage 的 A tile 合成 TMA 写入主 mode，剩下的 `PIPE` 是 pipeline stage。 |
-| `gB` | `(BLK_N, BLK_K, k)` | `((BLK_N, BLK_K), k)` | B tile 同理。 |
-| `sB` | `(BLK_N, BLK_K, PIPE)` | `((BLK_N, BLK_K), PIPE)` | B 的 shared-memory stage。 |
+| shared tile | 调用方定义的 shared 数组或 Tensor | 实际搬运的数据。 | TMA 写入，consumer 读取。 |
+| full barrier | `ClusterTransactionBarrier` | producer arrival 和本轮异步传输字节。 | consumer 等待；producer 登记，TMA 通知完成字节。 |
+| empty barrier | `ClusterBarrier` | consumer 的释放 arrival。 | producer 等待；consumer 读完后到达。 |
 
-为什么要 `group_modes<0,2>`？
+两组 barrier 分别经历自己的 phase。数据就绪后，consumer 开始读取；消费者释放后，producer 才能覆盖同一个 stage。
 
-因为对 TMA 来说，`(BLK_M, BLK_K)` 或 `(BLK_N, BLK_K)` 是 **一块 tensor tile**，不是线程级 copy 里的两个独立 per-thread mode。TMA 指令负责把这一整块 tile 搬进 shared memory，所以 CuTe 先把 tile 的两个空间维度合成一个 “TMA tile mode”。
+### 两个 stage 怎样重叠执行
 
-再看 SM80 的 partition：
+下面是一种可能的执行进度，实际时序由线程与硬件决定：
 
-```cpp
-ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
-Tensor tAgA = thr_copy_a.partition_S(gA); // (CPY,CPY_M,CPY_K,k)
-Tensor tAsA = thr_copy_a.partition_D(sA); // (CPY,CPY_M,CPY_K,PIPE)
-```
-
-SM80 是每个线程都有自己的 `ThrCopy`，所以 `tAgA` / `tAsA` 里会出现：
-
-```text
-CPY, CPY_M, CPY_K
-```
-
-这些 mode 描述“当前线程负责搬哪几个元素”。
-
-TMA 的 partition 是：
-
-```cpp
-auto [tAgA, tAsA] = tma_partition(...);
-```
-
-TMA 通常由一个 elected lane 发起，硬件搬整块 tile，所以 **没有 per-thread 的 `CPY_M/CPY_K` 切分**。`tAgA` / `tAsA` 的第 0 维变成 TMA 指令关心的主 mode：
-
-```text
-tAgA: (TMA, k)
-tAsA: (TMA, PIPE)
-```
-
-更细一点说，`tma_partition` 会根据 SMEM layout 反推出最大的 contiguous vector，再把 mode-0 切成 TMA 指令可以发出的 `(TMA, TMA_Iter)` 形态；示例注释里把它简写成 `(TMA,k)` 和 `(TMA,PIPE)`。
-
-所以两条路线可以对照成：
-
-| 步骤 | SM80 `sgemm_sm80.cu` | SM90 TMA tutorial |
+| 执行进度 | stage 0 | stage 1 |
 | --- | --- | --- |
-| 完整 A tensor | `make_tensor(make_gmem_ptr(A), (M,K), dA)` | `tma_a.get_tma_tensor((M,K))` |
-| CTA A tile | `local_tile(...) -> (BLK_M,BLK_K,k)` | `local_tile(...) -> (BLK_M,BLK_K,k)` |
-| copy 切分 | `thr_copy.partition_S/D` | `group_modes<0,2>` 后 `tma_partition` |
-| source tensor | `(CPY,CPY_M,CPY_K,k)` | `(TMA,k)` |
-| dest tensor | `(CPY,CPY_M,CPY_K,PIPE)` | `(TMA,PIPE)` |
-| 发起者 | 每个线程发自己的 `cp.async` | 一个 elected lane 发整块 TMA |
+| 开始 | TMA 搬入 tile 0。 | 可写。 |
+| producer 继续推进 | tile 0 搬运中或已经就绪。 | TMA 搬入 tile 1。 |
+| consumer 读取 tile 0 | consumer 计算 tile 0。 | TMA 搬入 tile 1，可以与计算重叠。 |
+| consumer 释放 stage 0 | producer 可以搬入 tile 2。 | consumer 等待或计算 tile 1。 |
+| consumer 释放 stage 1 | consumer 等待或计算 tile 2。 | producer 可以搬入 tile 3。 |
 
-### Kernel 侧：transaction bytes
+stage 越多，producer 可以提前准备的 tile 越多，同时也占用更多 shared memory。producer 追上尚未释放的 stage 时会等待；consumer 追上尚未完成的搬运时也会等待。
 
-TMA load 完成后会通知 mbarrier。这个通知不是“完成了一个 bool”，而是按 bytes 减少 transaction count。
+## ClusterBarrier：把一个 mbarrier 封装成对象
 
-示例里计算一次 pipe 需要等待的总字节数：
+`cutlass::arch::ClusterBarrier` 位于 [`barrier.h`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/arch/barrier.h#L342)。下面摘录本地源码并添加中文注释；静态实现省略架构条件分支、未支持架构的后备路径和 `synclog_emit_*` 调试记录，保留地址转换、谓词和 PTX 操作。
+
+### 成员存储和成员方法
+
+先看类里保存什么，以及成员调用怎样找到 barrier 地址：
 
 ```cpp
-/**
- * @brief 计算一个 pipeline stage 中 A/B 两次 TMA load 总共会写入多少字节。
- *
- * @details
- * `tensor<0>(tAsA)` 取出 TMA mode 对应的一个 stage，`make_tensor_like`
- * 生成同形状的值 tensor，`sizeof` 得到该 stage 的写入字节数。
- */
-constexpr int tma_transaction_bytes =
-    sizeof(make_tensor_like(tensor<0>(tAsA))) +
-    sizeof(make_tensor_like(tensor<0>(tBsB)));
+struct ClusterBarrier {
+  using ValueType = uint64_t;  // 硬件 mbarrier 使用 64 位存储。
+
+protected:
+  ValueType barrier_;         // 放在 shared 中，存储要求 8 字节对齐。
+
+public:
+  CUTLASS_DEVICE
+  ClusterBarrier() = delete;  // shared 存储通过 init() 显式初始化。
+
+  CUTLASS_DEVICE
+  void init(uint32_t arrive_count) const {
+    // arrive_count：每轮期望收到的 arrival 次数。
+    ClusterBarrier::init(&this->barrier_, arrive_count);
+  }
+
+  CUTLASS_DEVICE
+  bool test_wait(uint32_t phase, uint32_t pred=true) const {
+    return ClusterBarrier::test_wait(&this->barrier_, phase, pred);
+  }
+
+  CUTLASS_DEVICE
+  bool try_wait(uint32_t phase) const {
+    return ClusterBarrier::try_wait(&this->barrier_, phase);
+  }
+
+  CUTLASS_DEVICE
+  void wait(uint32_t phase) const {
+    ClusterBarrier::wait(&this->barrier_, phase);
+  }
+
+  CUTLASS_DEVICE
+  void arrive() const {
+    // 通知当前 CTA 的 barrier。
+    ClusterBarrier::arrive(&this->barrier_);
+  }
+
+  CUTLASS_DEVICE
+  void arrive(uint32_t cta_id, uint32_t pred = true) const {
+    // cta_id：目标 CTA 在 cluster 中的 rank；pred：选择发送通知的线程。
+    ClusterBarrier::arrive(&this->barrier_, cta_id, pred);
+  }
+
+  // 静态方法的实现分段摘录如下。
+};
 ```
 
-后面调用：
+所有成员方法都把 `&this->barrier_` 传给对应静态方法。因此，**对象的核心是一份 shared 中的 64 位硬件状态**。静态版本接收 `ValueType const* smem_ptr`，也能直接操作已有 shared 地址。成员方法的 `const` 修饰约束普通 C++ 写入，内部 PTX 则更新地址处的硬件 barrier 状态。
+
+### 初始化、本地 arrival 和失效
+
+下面三段是类内静态方法。指针转换后，操作数直接对应前面介绍的 PTX：
 
 ```cpp
-ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                      tma_transaction_bytes);
-```
+CUTLASS_HOST_DEVICE
+static void init(ValueType const* smem_ptr, uint32_t arrive_count) {
+  CUTLASS_ASSERT(arrive_count != 0 && "Arrive count must be non-zero");
+  // smem_ptr 指向 shared 存储；PTX 接收 32 位 shared 地址。
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "mbarrier.init.shared::cta.b64 [%1], %0; \n"
+      "}"
+      :
+      : "r"(arrive_count), "r"(smem_addr)
+      : "memory");
+}
 
-含义是：
+CUTLASS_HOST_DEVICE
+static void arrive(ValueType const* smem_ptr) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "mbarrier.arrive.shared::cta.b64 _, [%0];\n\t"
+      "}"
+      :
+      : "r"(smem_addr)
+      : "memory");  // _ 丢弃 PTX 的状态 token，C++ 接口返回 void。
+}
 
-- arrival count 减 1，表示“生产者已经把这一阶段的 TMA 操作发布出去了”。
-- expected transaction count 增加 `tma_transaction_bytes`，表示“这个 barrier 还要等这么多 TMA 写入字节完成”。
-
-只有 arrival count 到 0 且 transaction count 也到 0，这个 barrier phase 才完成。
-
-### Kernel 侧：发起 TMA copy
-
-`make_tma_atom` 返回的是 non-executable atom。发起 TMA 前要用 `.with(...)` 绑定 mbarrier：
-
-```cpp
-/**
- * @brief 绑定 mbarrier 后发起 A/B 的 TMA load。
- *
- * @details
- * `tma_a.with(producer_mbar[pipe])` 会生成 executable TMA load traits。
- * `copy(...)` 最终展开到 `cp.async.bulk.tensor.*.shared::cluster.global...`。
- */
-ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                      tma_transaction_bytes);
-copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
-```
-
-这里不是所有线程都发 TMA。示例用：
-
-```cpp
-if ((warp_idx == 0) && lane_predicate) {
-    // only one elected thread issues TMA
+CUTLASS_HOST_DEVICE
+static void invalidate(ValueType const* smem_ptr) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "mbarrier.inval.shared::cta.b64 [%0]; \n\t"
+      "}"
+      :
+      : "r"(smem_addr)
+      : "memory");
 }
 ```
 
-`warp_idx == 0` 选第 0 个 warp，`cute::elect_one_sync()` 再从这个 warp 里选一个 lane。最终只有一个线程发起 TMA 指令。
+`init` 设置初始 phase 为 0，`arrive_count` 按**实际执行的 arrival 次数**配置：128 个 consumer 各到达一次，设为 128；一个代表线程确认全体读完后到达一次，设为 1。`invalidate` 在所有使用完成后结束 barrier 的有效生命周期。
 
-## `make_tma_copy` 和 `make_tma_atom`
-
-CuTe 有两条相近线路：
-
-- `make_tma_copy`：构造 CTA-collective `TiledCopy`，更像完整的 tiled copy 对象。
-- `make_tma_atom`：构造实验性的 `Copy_Atom`，再配合 `tma_partition` 使用。教程示例用的是这一条。
-
-先用 SM80 的写法做参照。`sgemm_sm80.cu` 里 host 侧创建的是线程级 copy 对象：
+初始化发布另有独立函数，便于批量初始化多个 barrier 后统一执行一次 fence：
 
 ```cpp
-/**
- * @brief SM80 cp.async 的 tiled copy：描述每个线程如何搬一小片数据。
- *
- * @details
- * `Thr layout` 描述线程如何铺在 tile 上。
- * `Val layout` 描述每个线程一次搬几个值。
- */
-TiledCopy copyA = make_tiled_copy(
-    Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, cute::half_t>{},
-    Layout<Shape<_16,_8>,Stride<_8,_1>>{},  // 16x8 个线程，K-major 排布。
-    Layout<Shape< _1,_8>>{});               // 每个线程搬 1x8 个值。
+CUTLASS_DEVICE
+void fence_barrier_init() {
+  asm volatile(
+      "{\n\t"
+      "fence.mbarrier_init.release.cluster; \n"
+      "}"
+      ::
+      : "memory");
+}
 ```
 
-这个对象的核心是 **thread layout + value layout**。所以 kernel 里要：
+调用方还要安排相应范围的线程会合，例如 CTA 内的 `__syncthreads()`，或 cluster 的 arrive / wait，保证使用者开始操作时初始化已经完成并发布。
+
+### test_wait、try_wait 和 wait 的执行差别
+
+这三个接口都接收待完成轮次的 `phase` parity，取 0 或 1。先看返回 `bool` 的两个版本：
 
 ```cpp
-ThrCopy thr_copy_a = copy_a.get_slice(threadIdx.x);
-Tensor tAgA = thr_copy_a.partition_S(gA);  // (CPY,CPY_M,CPY_K,k)
-Tensor tAsA = thr_copy_a.partition_D(sA);  // (CPY,CPY_M,CPY_K,PIPE)
+CUTLASS_HOST_DEVICE
+static bool test_wait(ValueType const* smem_ptr, uint32_t phase, uint32_t pred) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  uint32_t waitComplete;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1; \n\t"
+      ".reg .pred P2; \n\t"
+      "setp.eq.u32 P2, %3, 1;\n\t"
+      "@P2 mbarrier.test_wait.parity.shared::cta.b64 P1, [%1], %2; \n\t"
+      "selp.b32 %0, 1, 0, P1; \n\t"
+      "}"
+      : "=r"(waitComplete)
+      : "r"(smem_addr), "r"(phase), "r"(pred)
+      : "memory");
+  return static_cast<bool>(waitComplete);
+}
+
+CUTLASS_HOST_DEVICE
+static bool try_wait(ValueType const* smem_ptr, uint32_t phase) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  uint32_t waitComplete;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred P1; \n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2; \n\t"
+      "selp.b32 %0, 1, 0, P1; \n\t"
+      "}"
+      : "=r"(waitComplete)
+      : "r"(smem_addr), "r"(phase)
+      : "memory");
+  return static_cast<bool>(waitComplete);
+}
 ```
 
-TMA 的 host 侧对象不是这样。TMA 不关心“每个线程搬几个元素”，它关心的是：
+`test_wait` 使用默认 `pred=1` 执行一次完成测试；源码中的 `P2` 控制指令执行。`try_wait` 的指令可以短暂挂起线程，再返回完成结果。二者都用 `selp.b32` 把 PTX predicate 转成整数 0/1，再转换为 C++ `bool`。
 
-- global tensor 的 base / shape / stride 怎么编码进 tensor map。
-- shared-memory tile 的 box shape 和 swizzle 是什么。
-- 一个 CTA tile 对应 global tensor 的哪一块。
-- 如果 multicast，cluster 中几个 CTA 共享同一个 TMA load。
-
-所以 `make_tma_atom` 里没有 thread layout / value layout，它的输入是：
+`wait` 则把 try-wait 放进 PTX 循环，直到完成才返回：
 
 ```cpp
-Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                               make_shape(bM,bK));
+CUTLASS_HOST_DEVICE
+static void wait(ValueType const* smem_ptr, uint32_t phase) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  // 单次 try-wait 的超时参数；超时后继续循环等待。
+  uint32_t ticks = 0x989680;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred       P1; \n\t"
+      "LAB_WAIT: \n\t"
+      "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1, %2; \n\t"
+      "@P1 bra DONE; \n\t"
+      "bra     LAB_WAIT; \n\t"
+      "DONE: \n\t"
+      "}"
+      :
+      : "r"(smem_addr), "r"(phase), "r"(ticks)
+      : "memory");
+}
 ```
 
-把这行按语义拆开：
+`wait(0)` 等待 phase 0 完成；成功时硬件已切到下一 phase。`ticks` 限制一次尝试的挂起时长，外层循环持续重试。
 
-| 实参 | 语义 | 对应 CUDA TMA descriptor 字段 |
+### 跨 CTA arrival 怎样找到目标 barrier
+
+成员重载 `arrive(cta_id, pred)` 转发到下面的实现：
+
+```cpp
+CUTLASS_HOST_DEVICE
+static void arrive(ValueType const* smem_ptr, uint32_t cta_id, uint32_t pred) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  if (pred) {
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        // 当前 shared 偏移 + 目标 CTA rank → 目标 cluster 地址。
+        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32];\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id)
+        : "memory");
+  }
+}
+```
+
+`cta_id` 是目标 CTA 在 cluster 中的 rank，`pred` 选择实际发送通知的线程，示例中使用 0/1。目标 CTA 在对应 shared 偏移处要有已初始化且仍然存活的 barrier。等待者操作本地 barrier，其他 CTA 发来的 arrival 参与其完成条件。
+
+## ClusterTransactionBarrier：增加传输字节的记账接口
+
+[`ClusterTransactionBarrier`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/arch/barrier.h#L546) 继承 `ClusterBarrier`，继续使用基类的 `barrier_`。transaction count 保存在这份硬件状态中，下面接口的 transaction 单位都是**字节**。
+
+### 成员方法怎样复用 barrier_
+
+```cpp
+struct ClusterTransactionBarrier : public ClusterBarrier {
+  // 复用基类存储，没有新增 C++ 数据成员。
+  CUTLASS_DEVICE
+  ClusterTransactionBarrier() = delete;
+
+  CUTLASS_DEVICE
+  void arrive_and_expect_tx(uint32_t transaction_bytes) const {
+    // 完成一次 arrival，同时增加待完成字节。
+    ClusterTransactionBarrier::arrive_and_expect_tx(&this->barrier_, transaction_bytes);
+  }
+
+  CUTLASS_DEVICE
+  void arrive_and_expect_tx(uint32_t transaction_bytes,
+                           uint32_t cta_id, uint32_t pred = 1u) const {
+    ClusterTransactionBarrier::arrive_and_expect_tx(
+        &this->barrier_, transaction_bytes, cta_id, pred);
+  }
+
+  CUTLASS_DEVICE
+  void expect_transaction(uint32_t transaction_bytes) const {
+    // 增加待完成字节，arrival 计数保持原值。
+    ClusterTransactionBarrier::expect_transaction(&this->barrier_, transaction_bytes);
+  }
+
+  CUTLASS_DEVICE
+  void complete_transaction(uint32_t transaction_bytes, uint32_t pred = 1) const {
+    // 本地完成通知也显式传入当前 CTA rank。
+    uint32_t cta_rank = cute::block_rank_in_cluster();
+    ClusterTransactionBarrier::complete_transaction(
+        &this->barrier_, cta_rank, transaction_bytes, pred);
+  }
+
+  CUTLASS_DEVICE
+  void complete_transaction(uint32_t dst_cta_id,
+                            uint32_t transaction_bytes, uint32_t pred) const {
+    // 此重载的目标 rank 排在字节数前面。
+    ClusterTransactionBarrier::complete_transaction(
+        &this->barrier_, dst_cta_id, transaction_bytes, pred);
+  }
+
+  // 静态实现见下文；已弃用的旧接口省略。
+};
+```
+
+它同时继承 `init`、`arrive` 和等待接口。每轮完成条件由 arrival 和 transaction 两项记账共同决定。
+
+### 字节登记和完成对应哪些指令
+
+```cpp
+CUTLASS_HOST_DEVICE
+static void arrive_and_expect_tx(ValueType const* smem_ptr, uint32_t transaction_bytes) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%1], %0; \n\t"
+      "}"
+      :
+      : "r"(transaction_bytes), "r"(smem_addr)
+      : "memory");
+}
+
+CUTLASS_HOST_DEVICE
+static void expect_transaction(ValueType const* smem_ptr, uint32_t transaction_bytes) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      "mbarrier.expect_tx.shared::cta.b64 [%1], %0; \n\t"
+      "}"
+      :
+      : "r"(transaction_bytes), "r"(smem_addr)
+      : "memory");
+}
+
+CUTLASS_HOST_DEVICE
+static void complete_transaction(
+    ValueType const* smem_ptr, uint32_t dst_cta_id,
+    uint32_t transaction_bytes, uint32_t pred = 1) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  // set_block_rank 内部通过 mapa.shared::cluster 构造目标地址。
+  smem_addr = cute::set_block_rank(smem_addr, dst_cta_id);
+  asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      "setp.eq.u32 p, %2, 1;\n\t"
+      "@p mbarrier.complete_tx.shared::cluster.relaxed.cluster.b64   [%1], %0;"
+      "}"
+      :
+      : "r"(transaction_bytes), "r"(smem_addr), "r"(pred)
+      : "memory");
+}
+```
+
+前两个接口分别执行“arrival + 增加待完成字节”和“增加待完成字节”。第三个接口报告 `transaction_bytes` 字节已经完成，`pred=1` 执行通知；arrival 计数保持原值。它通过 `dst_cta_id` 选择接收通知的 CTA，本地成员版本传入当前 CTA rank。
+
+远端的 `arrive_and_expect_tx` 同样先构造目标地址，再在目标 barrier 上完成 arrival 和字节登记：
+
+```cpp
+CUTLASS_HOST_DEVICE
+static void arrive_and_expect_tx(
+    ValueType const* smem_ptr, uint32_t transaction_bytes,
+    uint32_t cta_id, uint32_t pred) {
+  uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+  asm volatile(
+      "{\n\t"
+      ".reg .pred p;\n\t"
+      ".reg .b32 remAddr32;\n\t"
+      "setp.eq.u32 p, %2, 1;\n\t"
+      "@p mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+      "@p mbarrier.arrive.expect_tx.shared::cluster.b64  _, [remAddr32], %3;\n\t"
+      "}"
+      :
+      : "r"(smem_addr), "r"(cta_id), "r"(pred), "r"(transaction_bytes)
+      : "memory");
+}
+```
+
+`transaction_bytes` 是字节数，`cta_id` 是目标 rank，`pred` 使用 0/1 选择发送者。注意远端 arrival 的字节数排在 rank 前面，远端 complete 的 rank 排在字节数前面，成员重载保留了这一顺序。
+
+### 用一个 tile 串起调用顺序
+
+一个 leader 搬运一个 1024 字节 tile 时：
+
+1. `init(1)` 把每轮需要的 arrival 数设为 1，随后发布初始化并安排线程会合。
+2. `arrive_and_expect_tx(1024)` 执行唯一一次 arrival，同时登记 1024 字节。
+3. TMA load 绑定该 barrier，搬运完成后由硬件执行对应的 complete-tx 通知。
+4. `wait(0)` 成功，consumer 可以读取 tile。
+
+常规 TMA load 中，**软件登记预期字节，TMA 硬件通知完成字节**。`complete_transaction` 用于软件显式报告完成的协议，以及模拟硬件通知的测试。源码中的 `reset_bytes`、`arrive_and_reset_bytes` 和 `commit` 是已弃用的旧名字，对应现在的 `expect_transaction`、`arrive_and_expect_tx` 和 `complete_transaction`。
+
+## pipeline 的角色、状态和 Token
+
+下面开始读取 [`sm90_pipeline.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/pipeline/sm90_pipeline.hpp)。先明确三种对象各自保存什么：
+
+| 对象 | 保存的内容 | 所在位置 |
 | --- | --- | --- |
-| `SM90_TMA_LOAD{}` | 选择 GMEM -> SMEM 的 TMA load 指令族。 | 后续会走 `cp.async.bulk.tensor.*.shared::cluster.global...`。 |
-| `mA` | 完整 GMEM tensor，形状 `(M,K)`，带 stride `dA`。 | base address、globalDim、globalStrides、元素类型。 |
-| `sA(_,_,0)` | 一个 pipeline stage 的 SMEM layout，形状 `(BLK_M,BLK_K)`。 | boxDim、elementStrides、shared-memory swizzle。 |
-| `make_shape(bM,bK)` | 一个 CTA 在 A 上负责的 tile shape。 | TMA box 对应的 CTA-local tile。 |
-| 默认 `Int<1>{}` | 不做 multicast。 | multicast size 为 1。 |
+| `SharedStorage` | 每个 stage 的 full / empty 硬件 barrier。 | CTA 的 shared memory。 |
+| `PipelineState` | 当前线程的 stage 索引、phase parity 和推进次数。 | 线程自己的局部状态，通常在寄存器中。 |
+| `ProducerToken` / `ConsumerToken` | 一次 barrier 测试的 `WaitAgain` / `WaitDone` 结果。 | 线程自己的临时值。 |
 
-模板参数不用手写，大多由这几个实参推导出来：
+pipeline 对象保存 shared barrier 的指针和当前线程的配置。不同线程通过各自的 pipeline 对象访问同一组 barrier。
 
-| 模板参数 | 在示例里由谁推导 | 含义 |
+### ThreadCategory：当前线程参与哪一侧
+
+三个 pipeline 类分别定义自己的 `ThreadCategory` 枚举，取值的含义相同：
+
+```cpp
+// PipelineTmaAsync 类内的角色定义。
+enum class ThreadCategory {
+    NonParticipant,   // 主循环中不承担 producer / consumer 操作。
+    Producer,         // 获取可写 stage，执行 producer 侧操作。
+    Consumer,         // 等待数据就绪，消费后释放 stage。
+    ProducerConsumer  // 同一线程按调用方安排承担两侧职责。
+};
+```
+
+`role` 用于描述当前线程和调试检查；线程分工仍由 kernel 的分支安排。`is_leader` 则是 `PipelineTmaAsync` 的另一项配置，标识负责字节登记的 producer leader。
+
+### BarrierStatus 和 ArrivalToken
+
+先把 Token 的定义放在一起看。下面节选保留成员、构造关系和后面用到的比较运算符，省略修饰宏：
+
+```cpp
+enum class BarrierStatus : uint32_t {
+    WaitAgain = 0u,  // 本次测试尚未确认完成，需要后续等待。
+    WaitDone = 1u,   // 本次测试已经确认完成。
+};
+
+/** @brief 保存一次 barrier 测试的完成状态。 */
+class ArrivalToken {
+public:
+    /** @param barrier_status 本次测试得到的 WaitAgain 或 WaitDone。 */
+    ArrivalToken(BarrierStatus barrier_status)
+        : barrier_status_(barrier_status) {}
+
+    ArrivalToken() = delete;  // 构造时必须给出明确的等待结果。
+
+    /** @return 构造时保存的完成状态。 */
+    BarrierStatus get() const {
+        return barrier_status_;
+    }
+
+private:
+    BarrierStatus barrier_status_;  // 唯一的数据成员。
+
+    // acquire / wait 正是通过这两个操作符检查 token 的结果。
+    friend bool operator==(const ArrivalToken& left, const BarrierStatus& right) {
+        return left.get() == right;
+    }
+    friend bool operator!=(const ArrivalToken& left, const BarrierStatus& right) {
+        return left.get() != right;
+    }
+    // 省略反向比较和两个 ArrivalToken 之间的比较。
+};
+
+// 继承构造函数，用不同类型区分 producer 和 consumer 的等待结果。
+class ProducerToken : public ArrivalToken {
+    using ArrivalToken::ArrivalToken;
+};
+
+class ConsumerToken : public ArrivalToken {
+    using ArrivalToken::ArrivalToken;
+};
+```
+
+`barrier_status_` 是 Token 保存的全部信息，因此它是**等待结果的快照**。stage 和 phase 由配套的 `PipelineState` 提供；前面 PTX `mbarrier.arrive` 返回的 64 位状态 token 则由另一套接口处理。
+
+### try 和后续等待怎样配对
+
+看 `PipelineTmaAsync` 的 try 方法，就能看到 bool 结果怎样变成 Token。下面按 public 转发和 private 实现配对节选，省略修饰宏：
+
+```cpp
+// producer 测试 empty：这一块 shared 存储是否可以写入。
+ProducerToken producer_try_acquire(PipelineState state, uint32_t skip_wait = false) {
+    return producer_try_acquire(state.index(), state.phase(), skip_wait);
+}
+
+ProducerToken producer_try_acquire(
+    uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (skip_wait) {
+        return {BarrierStatus::WaitDone};  // 调用方已经保证获取条件满足。
+    }
+    bool barrier_status = empty_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};  // false→WaitAgain，true→WaitDone。
+}
+
+// consumer 测试 full：本轮数据是否已经可读。
+ConsumerToken consumer_try_wait(PipelineState state, uint32_t skip_wait = false) {
+    return consumer_try_wait(state.index(), state.phase(), skip_wait);
+}
+
+ConsumerToken consumer_try_wait(
+    uint32_t stage, uint32_t phase, uint32_t skip_wait) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (skip_wait) {
+        return {BarrierStatus::WaitDone};
+    }
+    bool barrier_status = full_barrier_ptr_[stage].try_wait(phase);
+    return {static_cast<BarrierStatus>(barrier_status)};
+}
+```
+
+`consumer_test_wait` 的同类实现使用 `full_barrier_ptr_[stage].test_wait(phase)` 取得结果。后续的 `consumer_wait(state, token)` 和 `producer_acquire(state, token)` 则确认对应 stage 可以使用。
+
+调用方式是：
+
+```cpp
+auto token = pipeline.consumer_try_wait(read_state);
+// 可以在这里安排独立于该 shared stage 的工作。
+pipeline.consumer_wait(read_state, token);
+// 现在读取 read_state.index() 对应的 shared tile。
+```
+
+token 为 `WaitAgain` 时，后续 wait 阻塞到完成；为 `WaitDone` 时，后续 wait 省去重复等待。两次调用使用**同一个 stage 和 phase**，中间保持 state 不变。
+
+producer 一侧也按这对调用安排。在 `PipelineTmaAsync` 中，即使 token 已经是 `WaitDone`，仍执行 `producer_acquire(state, token)`，因为这个函数还承担 full barrier 的 arrival 和字节登记。
+
+try/test 的 `skip_wait=1` 会直接返回 `WaitDone`。调用方必须已经通过其他有效协议满足相应等待条件，才能使用这个选项。
+
+## PipelineState：线程怎样沿 stage 环前进
+
+[`PipelineState<Stages>`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/pipeline/sm90_pipeline.hpp#L171) 是一个线程局部的循环游标。`Stages` 是编译期 stage 数，决定索引在哪个位置回绕；下面的 load 流水线使用正数个 stage。
+
+### index、phase 和 count
+
+先看完整的成员和主要操作。下面节选省略修饰宏和赋值运算符，保留源码中的推进分支：
+
+```cpp
+/**
+ * @brief 记录当前线程沿 stage 环推进的位置。
+ * @tparam Stages_ 编译期 stage 数；这里的 load pipeline 使用正数。
+ */
+template<uint32_t Stages_>
+struct PipelineState {
+    static constexpr uint32_t Stages = Stages_;
+
+    int index_ = 0;        // 下一次操作的 stage 下标，范围为 [0, Stages)。
+    uint32_t phase_ = 0;  // 传给 barrier wait 的 parity，取 0 或 1。
+    uint32_t count_ = 0;  // 当前游标累计推进的逻辑迭代数。
+
+    PipelineState() : index_{}, phase_{}, count_{} {}
+
+    /**
+     * @param index 起始 stage 下标。
+     * @param phase 起始等待 parity。
+     * @param count 起始逻辑迭代数。
+     */
+    PipelineState(int index, uint32_t phase, uint32_t count)
+        : index_(index), phase_(phase), count_(count) {}
+
+    int index() const { return index_; }
+    uint32_t phase() const { return phase_; }
+    uint32_t count() const { return count_; }
+
+    /** @brief 前进一个 stage；回绕时翻转等待 parity。 */
+    void operator++() {
+        if constexpr (Stages > 0) {
+            ++index_;
+            ++count_;
+            if (index_ == Stages) {
+                index_ = 0;
+                phase_ ^= 1;
+            }
+        }
+    }
+
+    PipelineState& operator+=(uint32_t num_iterations) {
+        return advance(num_iterations);
+    }
+
+    /**
+     * @param num_iterations 一次推进的逻辑迭代数。
+     * @return 更新后的当前游标引用。
+     */
+    PipelineState& advance(uint32_t num_iterations) {
+        if constexpr (Stages > 0) {
+            // 推进不足一圈，但当前位置加步数跨过了环边界。
+            if ((num_iterations < Stages) &&
+                (index_ + num_iterations) >= Stages) {
+                phase_ ^= 1;
+            }
+            // 推进至少一圈，跨过奇数次环边界时翻转 parity。
+            if ((num_iterations >= Stages) &&
+                (((index_ + num_iterations) / Stages) % 2) == 1) {
+                phase_ ^= 1;
+            }
+            index_ = (index_ + num_iterations) % Stages;
+            count_ += num_iterations;
+        }
+        return *this;
+    }
+
+    /**
+     * @param start_state 起始游标，按值传入。
+     * @param num_iterations 从起点推进的逻辑迭代数。
+     * @return 推进后的副本。
+     */
+    static PipelineState make_pipeline_state(
+        PipelineState start_state, uint32_t num_iterations) {
+        return start_state.advance(num_iterations);
+    }
+
+    // 省略逐成员复制的 operator=。
+};
+```
+
+默认构造得到 `(0, 0, 0)`；`++state` 只修改线程自己的三个成员。shared barrier 的推进由 arrival 和事务完成驱动，两者通过调用协议保持对应。
+
+### producer 和 consumer 的起始 phase
+
+producer 的起始状态由源码中的这个函数构造：
+
+```cpp
+/**
+ * @tparam Pipeline 提供编译期 Stages 的 pipeline 类型。
+ * @return 首次可获取 stage 0 的 producer 游标。
+ */
+template<class Pipeline>
+PipelineState<Pipeline::Stages> make_producer_start_state() {
+    constexpr int InitialProducerStage = 0;
+    // empty 初始化的硬件 parity 为 0；首次 wait(1) 立即成功。
+    constexpr uint32_t InitialProducerPhase = 1;
+    constexpr uint32_t InitialProducerCount = 0;
+    return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
+}
+```
+
+consumer 通常默认构造 read state，等待 full 的初始 phase 0。两侧的调用为：
+
+```cpp
+using Pipeline = cutlass::PipelineTmaAsync<2>;
+auto write_state = cutlass::make_producer_start_state<Pipeline>();
+Pipeline::PipelineState read_state;
+```
+
+这里要区分**硬件 barrier 当前的 phase**和**游标传给 wait 的 phase**。在这套逐轮复用的协议中，`wait(p)` 检查 parity 为 `p` 的轮次是否已经结束：硬件当前 parity 与 `p` 不同时，等待成功；两者相同时，就继续等这轮完成并翻转。
+
+初始化后，每个 stage 的 **full 和 empty 硬件 phase 都是 0**。两侧第一次等待的目的分别是：
+
+- **producer 首次写入直接取得可写 stage。** 初始存储可以使用，因此 producer 的游标从 phase 1 开始，对 empty 调用 `wait(1)`。empty 当前为 0，与等待参数 1 不同，立即成功。
+- **consumer 首次读取要等数据到达。** consumer 的游标从 phase 0 开始，对 full 调用 `wait(0)`。full 当前也为 0，等待要持续到 producer arrival 和 TMA 传输字节都完成，full 从 0 翻到 1 后才能成功。
+
+**producer 初始 phase 设为 1，就是为了让第一轮获取 stage 立即成功。** 后续绕回同一个 stage 时，它再等待 consumer 对上一轮数据的释放。
+
+### 两个 stage 的游标变化
+
+先只看 stage 0 的第一次使用，按各方实际执行的操作跟踪两个硬件 barrier。以下代码按执行方分段列出，初始化发布和线程会合沿用前文：
+
+```cpp
+// 初始化方：两个硬件 barrier 的初始 phase 都为 0。
+full_barrier_ptr_[0].init(1);     // 等待一个 producer arrival。
+empty_barrier_ptr_[0].init(128);  // 等待 128 个 consumer 的释放 arrival。
+
+// producer：第一次获取无需等待 consumer，初始存储已经可写。
+empty_barrier_ptr_[0].wait(1);  // 当前 empty phase 为 0，立即成功。
+full_barrier_ptr_[0].arrive_and_expect_tx(1024);
+// producer arrival 已完成；full 仍在 phase 0，等待 1024 字节搬运完成。
+// 随后发起 TMA load，把 stage 0 的 full barrier 作为完成通知目标。
+
+// consumer：等待首次数据就绪。
+full_barrier_ptr_[0].wait(0);
+// TMA 完成并通知 complete-tx 后，full phase 0 → 1，wait(0) 才成功。
+// 每个 consumer 读取自己的数据，读完后执行一次下面的 arrival。
+empty_barrier_ptr_[0].arrive();
+// 128 次释放 arrival 到齐后，empty phase 0 → 1。
+
+// producer 处理完 stage 1，再回到 stage 0 时，游标 phase 已翻成 0。
+empty_barrier_ptr_[0].wait(0);  // 等 empty 的第一轮释放完成，才允许再次写入。
+```
+
+这里 full 的两个完成条件有各自的执行者：**producer 在 acquire 中先执行 arrival 和 expect-tx；TMA 硬件在搬运完成后通知完成字节。** consumer 等这两项都满足。empty 则在 consumer 读完并收齐释放 arrival 后翻转。
+
+再把 stage 1 放回来，两个游标的变化如下。表中的“逻辑迭代”指各侧分别推进到哪个 tile；producer 和 consumer 在实际时间上可以处于不同迭代。
+
+| 逻辑迭代 | producer `(index, phase, count)` | consumer `(index, phase, count)` |
 | --- | --- | --- |
-| `CopyOp` | `SM90_TMA_LOAD{}` | TMA 操作类型。 |
-| `GEngine` / `GLayout` | `mA` | GMEM tensor 的指针 engine 和 layout。 |
-| `SLayout` | `sA(_,_,0)` | 单个 SMEM stage 的 layout。 |
-| `CTA_Tiler` | `make_shape(bM,bK)` | CTA tile shape。 |
-| `Cluster_Size` | 默认参数 | multicast cluster size。 |
-| `TmaInternalType` | 默认 `void` | 用 `GEngine::value_type` 作为 tensor map 元素类型。 |
+| tile 0 | `(0, 1, 0)` | `(0, 0, 0)` |
+| tile 1 | `(1, 1, 1)` | `(1, 0, 1)` |
+| tile 2 | `(0, 0, 2)` | `(0, 1, 2)` |
+| tile 3 | `(1, 0, 3)` | `(1, 1, 3)` |
+| tile 4 | `(0, 1, 4)` | `(0, 0, 4)` |
 
-### `make_tma_copy`
+读这张表时，把 phase 直接代入实际等待调用：
 
-完整重载：
+- **tile 0 / tile 1：** producer 分别对 stage 0 / 1 执行 `empty.wait(1)`，两个 stage 初始都可写；consumer 分别执行 `full.wait(0)`，等各自的首轮 TMA 完成。
+- **tile 2 / tile 3：** producer 绕回 stage 0 / 1，执行 `empty.wait(0)`，等 tile 0 / 1 的 consumer 释放存储；consumer 执行 `full.wait(1)`，等新一轮 TMA 使 full 从 1 翻到 0。
+- **tile 4：** producer 再次回到 stage 0，执行 `empty.wait(1)`，这次等待 tile 2 的消费释放使 empty 从 1 翻到 0；consumer 执行 `full.wait(0)`，等待 tile 4 的数据就绪。
 
-```cpp
-/**
- * @brief 构造 CuTe CTA-collective TMA tiled copy 对象。
- *
- * @tparam TmaInternalType descriptor 中使用的 TMA 元素类型，默认是 GMEM value type。
- * @tparam CopyOp TMA copy 操作，例如 `SM90_TMA_LOAD{}`。
- * @tparam GEngine GMEM tensor engine 类型。
- * @tparam GLayout GMEM tensor layout 类型。
- * @tparam SLayout SMEM layout 类型。
- * @tparam CTA_Tiler CTA tile shape / layout 类型。
- * @tparam Cluster_Size multicast cluster size 类型。
- *
- * @param copy_op TMA 操作：load、multicast load、store 或 im2col 变体。
- * @param gtensor 参与 TMA 的 global-memory tensor。
- * @param slayout 参与 TMA 的 shared-memory layout。
- * @param cta_tiler 每个 CTA 在 GMEM tensor 上切出的 tile。
- * @param cluster_size multicast 参与 CTA 数。非 multicast 通常是 `Int<1>{}`。
- * @return 可以进一步 partition 并由 `copy(...)` 发起的 TMA tiled copy 对象。
- */
-template <class TmaInternalType = void,
-          class CopyOp,
-          class GEngine, class GLayout,
-          class SLayout,
-          class CTA_Tiler,
-          class Cluster_Size>
-CUTE_HOST_RTC
-auto make_tma_copy(CopyOp const& copy_op,
-                   Tensor<GEngine,GLayout> const& gtensor,
-                   SLayout const& slayout,
-                   CTA_Tiler const& cta_tiler,
-                   Cluster_Size const& cluster_size);
-```
+因此，producer 的初始 1 解决首次获取，后续 0/1 的交替控制 stage 复用；consumer 从 0 开始，每一轮都等待对应 TMA 数据完成。
 
-常用重载：
+## PipelineTmaAsync：把 full、empty 和线程游标接起来
+
+[`PipelineTmaAsync<Stages>`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/pipeline/sm90_pipeline.hpp#L271) 为 TMA load 提供 producer / consumer 协调：producer 获取可写 stage 时登记事务，consumer 等待 TMA 完成后读取，并通过 empty barrier 释放 stage。
+
+### SharedStorage 和 Params
+
+把类型、shared 存储、配置和线程对象的私有成员放在一起看。下面按源码节选，省略修饰宏和随后单独展示的操作方法：
 
 ```cpp
 /**
- * @brief 使用 SMEM layout 的 product shape 作为 CTA tile，cluster size 默认为 1。
+ * @brief 协调 TMA producer 与 consumer 对 stage 的使用。
+ * @tparam Stages_ 编译期 stage 数。
  */
-template <class CopyOp, class GEngine, class GLayout, class SLayout>
-CUTE_HOST_RTC
-auto make_tma_copy(CopyOp const& copy_op,
-                   Tensor<GEngine,GLayout> const& gtensor,
-                   SLayout const& slayout);
+template<int Stages_>
+class PipelineTmaAsync {
+public:
+    using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+    using EmptyBarrier = cutlass::arch::ClusterBarrier;
+    using ProducerBarrierType = FullBarrier::ValueType;  // uint64_t。
+    using ConsumerBarrierType = EmptyBarrier::ValueType;
+    static constexpr uint32_t Stages = Stages_;
+    using PipelineState = cutlass::PipelineState<Stages>;
 
-/**
- * @brief 使用 SMEM layout 的 product shape 作为 CTA tile，但显式指定 multicast cluster size。
- */
-template <class CopyOp, class GEngine, class GLayout,
-          class SLayout, class Cluster_Size>
-CUTE_HOST_RTC
-auto make_tma_copy(CopyOp const& copy_op,
-                   Tensor<GEngine,GLayout> const& gtensor,
-                   SLayout const& slayout,
-                   Cluster_Size const& cluster_size);
+    /** @brief 放在 shared memory 中的两组硬件 barrier。 */
+    struct SharedStorage {
+        FullBarrier full_barrier_[Stages];    // consumer 等待数据就绪。
+        EmptyBarrier empty_barrier_[Stages];  // producer 等待存储释放。
+    };
+
+    // 省略前面已经展示的 ThreadCategory 枚举定义。
+
+    /** @brief 当前线程的配置，构造时复制进 params_。 */
+    struct Params {
+        uint32_t transaction_bytes = 0;  // 获取 stage 时登记的预期总字节数。
+        ThreadCategory role = ThreadCategory::NonParticipant;
+        uint32_t is_leader = 0;      // 当前线程是否负责 full 的 arrival + expect。
+        uint32_t num_consumers = 0;  // 每 CTA 的 consumer 线程数。
+        uint32_t num_producers = 1;  // full 每轮需要的 producer arrival 数。
+        int initializing_warp = 0;  // 执行 shared barrier 初始化的 warp。
+    };
+
+    // 构造函数和 producer / consumer 方法在后面分开节选。
+
+private:
+    uint32_t dst_blockid_ = 0;        // 当前线程发送 empty arrival 的目标 CTA。
+    uint32_t is_signaling_thread_ = 0;  // 当前线程是否承担该通知职责。
+    FullBarrier* full_barrier_ptr_ = nullptr;    // 指向 shared 中的 full 数组。
+    EmptyBarrier* empty_barrier_ptr_ = nullptr;  // 指向 shared 中的 empty 数组。
+    Params params_;  // 当前线程的配置副本；两个指针指向各线程共享的存储。
+
+    // 内部按 stage / phase 操作 barrier 的方法见后面。
+};
 ```
 
-`make_tma_copy` 内部做的事可以概括成四步：
+`SharedStorage` 保存两组 barrier，实际 tile 由调用方另外分配。多个线程对象的 `full_barrier_ptr_` / `empty_barrier_ptr_` 指向同一份 shared 存储，而 `params_`、通知目标和通知职责是各线程自己的成员。
 
-1. 从 `slayout` 拆出 swizzle 部分和非 swizzle layout。
-2. 对非 swizzle SMEM layout 求右逆，找到 shared memory 中最大的 contiguous vector。
-3. 把这个 vector 映射回 GMEM 维度，构造 TMA basis。
-4. 调 `cuTensorMapEncodeTiled` 编码 descriptor，再封装成 CuTe copy traits。
+`transaction_bytes` 是当前 stage 绑定到 full 的预期总字节数。多条 TMA 共用一个 full barrier 时，按它们通知的总字节数配置。
 
-如果用 `make_tma_copy` 这条路线，使用方式更接近 SM80 的 `TiledCopy`：
+例如 producer warp 有 32 个线程，但只有一个 leader 执行 `arrive_and_expect_tx`，那么 `num_producers=1`。单 CTA 中若 128 个 consumer 各自调用一次 release，`num_consumers=128`。
+
+每个线程都有自己的 `Params`，因此 `role` 和 `is_leader` 可以不同；关于 shared barrier 计数、传输字节和初始化 warp 的配置应与整个协议一致。
+
+### 构造时初始化，使用前会合
+
+默认的三个参数构造函数委托给带初始化开关的构造函数。先看它怎样保存 shared 地址和线程配置：
 
 ```cpp
 /**
- * @brief 用 `make_tma_copy` 构造一个完整 TMA tiled copy。
- *
- * @details
- * 这条路线会返回带 descriptor 的 tiled copy 对象。
- * 后续可以像普通 `TiledCopy` 一样 `get_slice`，再 partition source / destination。
+ * @tparam ClusterShape cluster 的编译期形状。
+ * @param storage CTA shared memory 中的 barrier 数组，借用其存储。
+ * @param params 当前线程配置，按值复制。
+ * @param cluster_shape 用于初始化 arrival 数和通知线程映射的 cluster 形状。
  */
-auto tmaA = make_tma_copy(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                          make_shape(bM,bK), Int<1>{});
+template<class ClusterShape>
+PipelineTmaAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape)
+    : PipelineTmaAsync(storage, params, cluster_shape,
+                       cute::true_type{}, cute::true_type{}) {}
+
+// 下两个类型参数分别选择是否初始化 barrier 和释放通知映射。
+template<class ClusterShape, class InitBarriers, class InitMasks>
+PipelineTmaAsync(SharedStorage& storage, Params params, ClusterShape cluster_shape,
+                 InitBarriers = {}, InitMasks = {})
+    : params_(params),
+      full_barrier_ptr_(&storage.full_barrier_[0]),
+      empty_barrier_ptr_(&storage.empty_barrier_[0]) {
+    int warp_idx = canonical_warp_idx_sync();
+    int thread_idx = threadIdx.x;
+    int lane_predicate = cute::elect_one_sync();
+
+    // 省略 InitBarriers / InitMasks 必须为 true_type 或 false_type 的 static_assert。
+    if constexpr (cute::is_same_v<InitBarriers, cute::true_type>) {
+        init_barriers(storage, params_, cluster_shape);
+    }
+
+    if constexpr (cute::is_same_v<InitMasks, cute::true_type>) {
+        // 此分支的完整通知分配逻辑在后面的 cluster 小节节选。
+        // 它设置 dst_blockid_ 和 is_signaling_thread_。
+    }
+}
 ```
 
-kernel 内大致是：
+`init_barriers` 的初始化计数和 fence 直接来自下面这段源码：
 
 ```cpp
-/**
- * @brief `make_tma_copy` 路线的分区方式。
- *
- * @param cta_idx_in_cluster 当前 CTA 在 cluster 内的 logical id。
- */
-auto cta_tma_a = tmaA.get_slice(cta_idx_in_cluster);
+template<class ClusterShape>
+static void init_barriers(
+    SharedStorage& storage, Params params, ClusterShape cluster_shape) {
+    int warp_idx = canonical_warp_idx_sync();
+    bool is_initializing_warp = (warp_idx == 0);
+    is_initializing_warp = (warp_idx == params.initializing_warp);
+    if (is_initializing_warp) {
+        uint32_t const producer_arv_cnt = params.num_producers;
+        uint32_t const num_consumer_warpgroups_per_cluster = cute::ceil_div(
+            params.num_consumers, static_cast<uint32_t>(NumThreadsPerWarpGroup));
 
-Tensor tAgA = cta_tma_a.partition_S(gA); // TMA source tensor
-Tensor tAsA = cta_tma_a.partition_D(sA); // TMA destination tensor
-
-copy(tmaA.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
+        // 单 CTA：每个 consumer 都向本地 empty 发送一次 arrival。
+        uint32_t multicast_consumer_arrival_count = params.num_consumers;
+        if (cute::size(cluster_shape) > 1) {
+            // 多 CTA：同行同列的每个 consumer warpgroup 各通知一次。
+            multicast_consumer_arrival_count =
+                (cute::size<0>(cluster_shape) + cute::size<1>(cluster_shape) - 1) *
+                num_consumer_warpgroups_per_cluster;
+        }
+        // 省略检查两个 arrival count 必须大于零的 CUTLASS_ASSERT。
+        cutlass::arch::detail::initialize_barrier_array_pair_aligned<
+            decltype(storage.full_barrier_), decltype(storage.empty_barrier_), Stages>(
+            storage.full_barrier_, storage.empty_barrier_,
+            producer_arv_cnt, multicast_consumer_arrival_count);
+    }
+    cutlass::arch::fence_barrier_init();  // 发布上述初始化。
+}
 ```
 
-这条路线和 `make_tma_atom + tma_partition` 的区别可以这样记：
+初始化数组的 helper 在指定 warp 内通过 `elect_one_sync()` 选出一个 lane 执行，因此该 warp 要一致进入初始化代码。构造函数还使用 warp 范围的选举操作，示例让所有线程在角色分支之前构造 pipeline。
 
-| 路线 | 分区入口 | 读起来像什么 |
+之后由调用方执行同步，保证各方开始使用时初始化已发布。**单 CTA 使用 `__syncthreads()`；跨 CTA 使用 cluster arrive / wait。** 文件末尾的 `pipeline_init_arrive_relaxed(cluster_size)` 和 `pipeline_init_wait(cluster_size)` 提供对应辅助函数。
+
+模板构造参数 `InitBarriers`、`InitMasks` 使用 `cute::true_type` / `cute::false_type` 控制上述分支，默认均开启。`InitBarriers=cute::false_type` 适用于其他路径已经完成 barrier 初始化的情况；`InitMasks=cute::false_type` 让当前对象跳过释放通知映射，例如该对象只承担 producer 职责。执行 `consumer_release` 的对象需要有正确配置的通知映射。
+
+### producer_acquire：等 empty，然后登记本轮 full
+
+源码把对外的 `PipelineState` 接口转发到内部的 stage / phase 接口。先看无 Token 版本：
+
+```cpp
+// public：调用方提供线程自己的游标。
+void producer_acquire(PipelineState state) {
+    producer_acquire(state.index(), state.phase());
+}
+
+// private：stage 直接索引 shared 中的两个 barrier 数组。
+void producer_acquire(uint32_t stage, uint32_t phase) {
+    empty_barrier_ptr_[stage].wait(phase);  // 确认上一轮 consumer 已释放。
+    if (params_.is_leader) {
+        full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
+    }
+    // 省略 #ifndef NDEBUG 下的角色及 leader 必须为 warp lane 0 的检查。
+}
+```
+
+带 Token 的版本只在需要时继续等待，leader 的登记步骤始终保留：
+
+```cpp
+void producer_acquire(PipelineState state, ProducerToken barrier_token) {
+    producer_acquire(state.index(), state.phase(), barrier_token);
+}
+
+void producer_acquire(
+    uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token != BarrierStatus::WaitDone) {
+        empty_barrier_ptr_[stage].wait(phase);
+    }
+    if (params_.is_leader) {
+        // token 已 WaitDone 时也执行，登记本轮要交给 TMA 的事务。
+        full_barrier_ptr_[stage].arrive_and_expect_tx(params_.transaction_bytes);
+    }
+    // 省略 #ifndef NDEBUG 下的角色和 leader 位置检查。
+}
+```
+
+acquire 返回时，该 stage 已经允许写入；leader 同时完成本轮 full 的 producer arrival，并登记预期传输字节。接着取出 TMA 的完成通知地址：
+
+```cpp
+ProducerBarrierType* producer_get_barrier(PipelineState state) {
+    return producer_get_barrier(state.index());
+}
+
+ProducerBarrierType* producer_get_barrier(uint32_t stage) {
+    // FullBarrier 的存储是 uint64_t，TMA 接收它的 shared 地址。
+    return reinterpret_cast<ProducerBarrierType*>(&full_barrier_ptr_[stage]);
+}
+```
+
+producer 发出搬运后显式执行 `++write_state`，去处理下一个 stage。pipeline 接口接收的 state 是值参数，游标推进由调用方安排。
+
+额外登记字节也沿用同一条转发链：
+
+```cpp
+void producer_expect_transaction(PipelineState state, uint32_t transaction_bytes) {
+    producer_expect_transaction(state.index(), transaction_bytes);
+}
+
+void producer_expect_transaction(uint32_t stage, uint32_t transaction_bytes) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (params_.is_leader) {
+        full_barrier_ptr_[stage].expect_transaction(transaction_bytes);
+    }
+}
+```
+
+这里的 `transaction_bytes` 是增量登记，应与额外操作的完成通知匹配，并在当前 phase 完成前安排好登记。
+
+### TMA 硬件完成 full，consumer 释放 empty
+
+一轮的关键调用可以逐项对应：
+
+| 操作 | 执行方 | 对 stage 的影响 |
 | --- | --- | --- |
-| `make_tma_copy` | `cta_tma.partition_S/D(...)` | 像 SM80 `TiledCopy` 的 TMA 版本。 |
-| `make_tma_atom` | `tma_partition(tma_atom, ..., stensor, gtensor)` | 显式调用 TMA 专用 partitioner。 |
+| `producer_acquire(write_state)` | producer；其中 leader 做事务登记。 | 等待 empty，并对 full 执行 arrival + expect-tx。 |
+| `producer_get_barrier(write_state)` | TMA 发起线程。 | 返回本 stage 的 full barrier 指针，作为 TMA 完成通知目标。 |
+| TMA load | 选定的发起线程。 | 启动异步搬运；硬件完成后通知 full 的 complete-tx。 |
+| `consumer_wait(read_state)` | consumer。 | 等待 full 的 arrival 和预期字节都完成，取得读取权限。 |
+| 读取 shared 并计算 | consumer 或其发起的计算硬件。 | 使用该 stage 数据。 |
+| `consumer_release(release_state)` | consumer 中承担通知职责的线程。 | 向 empty 执行 arrival，允许 producer 后续复用该 stage。 |
 
-教程示例选择 `make_tma_atom`，所以后面重点看 atom 路线。
-
-### `make_tma_atom`
-
-教程示例用的是这行：
+commit 的行为可以直接从编译条件看出来：
 
 ```cpp
-Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                               make_shape(bM,bK));
+void producer_commit(PipelineState state, uint32_t bytes) {
+    producer_commit(state.index(), bytes);
+}
+
+void producer_commit(uint32_t stage, uint32_t bytes) {
+#if CUTLASS_UNIT_TEST_PIPELINE
+    if (params_.is_leader) {
+        full_barrier_ptr_[stage].complete_transaction(bytes);
+        // 省略测试中向同行、同列其他 CTA 模拟完成字节通知的循环。
+    }
+#endif
+    // 常规构建没有上述测试代码；实际完成通知由 TMA 硬件执行。
+}
+
+// 另一个重载执行回调，传入当前 stage 的 full barrier 指针。
+template<class UserDefinedArriveOp>
+void producer_commit(PipelineState state, UserDefinedArriveOp&& user_defined_arrive_op) {
+    cute::forward<UserDefinedArriveOp>(user_defined_arrive_op)(
+        producer_get_barrier(state.index()));;
+}
 ```
 
-先把源码原型摆出来。`make_tma_atom` 在 `copy_traits_sm90_tma.hpp` 里，和 `tma_partition` 放在同一块实验性接口下面：
+full 的 arrival 已在 acquire 执行，完成字节由 TMA 报告。因此常规 TMA 路径省去字节版本 commit 的软件动作；回调重载则执行调用方提供的操作。
+
+### consumer_release 的调用时机
+
+先看等待和释放的实际实现：
+
+```cpp
+void consumer_wait(PipelineState state, ConsumerToken barrier_token) {
+    consumer_wait(state.index(), state.phase(), barrier_token);
+}
+
+void consumer_wait(uint32_t stage, uint32_t phase, ConsumerToken barrier_token) {
+    detail::pipeline_check_is_consumer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+        full_barrier_ptr_[stage].wait(phase);  // 等待指定轮次的数据完成。
+    }
+}
+
+void consumer_release(PipelineState state) {
+    consumer_release(state.index());  // 释放只需 stage；硬件管理当前 empty phase。
+}
+
+void consumer_release(uint32_t stage, uint32_t skip = false) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(
+        dst_blockid_, is_signaling_thread_ & (!skip));
+    // 省略 #ifndef NDEBUG 下的角色检查。
+}
+```
+
+release 使用构造时设置的 `dst_blockid_` 和 `is_signaling_thread_` 选择通知目标及通知线程。它执行的动作是 empty arrival，所以调用方在**所有需要保护的 shared 读取结束后**执行 release。
+
+- 标量 consumer 从 shared 读取到寄存器后，可以完成计算，再调用 release。
+- WGMMA consumer 发射异步计算后，通过 GMMA 的完成协议确认相关 stage 的 shared 读取结束，再调用 release。
+
+实际 mainloop 可以同时保存 read state 和 release state：read state 指向下一次发射计算的数据，release state 指向已经可以回收的较早 stage。两者分别前进；TMA producer 等待的是 release 侧最终通知的 empty barrier。
+
+这条调用关系可以在 [`sm90_mma_tma_gmma_ss_warpspecialized.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/gemm/collective/sm90_mma_tma_gmma_ss_warpspecialized.hpp#L530) 中看到：等待 full → 发射 GMMA → `warpgroup_wait<K_PIPE_MMAS>()` → 释放较早 stage。尾部再通过 `warpgroup_wait<0>()` 等待剩余计算并释放剩余 stage。
+
+### producer_tail：让最后一批 stage 完成释放
 
 ```cpp
 /**
- * @brief 构造一个 TMA Copy_Atom。
+ * @param state 最后一次发射并推进后的 producer 游标，按值传入。
+ */
+void producer_tail(PipelineState state) {
+    detail::pipeline_check_is_producer(params_.role);
+    for (int count = 0; count < Stages; ++count) {
+        empty_barrier_ptr_[state.index()].wait(state.phase());
+        ++state;  // 在副本上遍历整个 stage 环。
+    }
+}
+```
+
+`producer_tail(write_state)` 从当前游标出发，遍历 `Stages` 个 empty barrier，等待对应轮次的释放。参数按值传递，tail 内部的 `++state` 修改这个副本。
+
+它让 producer 等到 consumer 完成对所有 stage 的使用。cluster 中这还保证 producer CTA 的 shared barrier 存储持续存活，直到其他 CTA 的释放通知结束。首次尚未使用过的 stage 通过初始 phase 协议直接满足等待。
+
+### cluster 中的释放通知
+
+构造函数中 `InitMasks` 分支的源码如下，接在前面的构造节选中：
+
+```cpp
+if constexpr (cute::is_same_v<InitMasks, cute::true_type>) {
+    dim3 block_id = cute::block_id_in_cluster();
+    auto cluster_size = cute::size(cluster_shape);
+    if (cluster_size == 1) {
+        is_signaling_thread_ = true;  // 单 CTA：每个 consumer 都发送通知。
+        dst_blockid_ = 0;
+    } else {
+        // 多 CTA：将通知不同目标的工作分散到 warpgroup 中的代表线程。
+        if (params_.num_consumers % NumThreadsPerWarpGroup == 0) {
+            auto [is_signaling_thread, dst_blockid] = detail::spread_arrivals_to_warpgroup(
+                thread_idx % NumThreadsPerWarpGroup, warp_idx);
+            is_signaling_thread_ = is_signaling_thread;
+            dst_blockid_ = dst_blockid;
+        } else if (params_.num_consumers == 32) {
+            auto [is_signaling_thread, dst_blockid] =
+                detail::spread_arrivals_to_warp(thread_idx % 32);
+            is_signaling_thread_ = is_signaling_thread;
+            dst_blockid_ = dst_blockid;
+        } else {
+            is_signaling_thread_ = 0;
+            // 省略 #ifndef NDEBUG 下针对不支持的 consumer 数的 brkpt。
+        }
+        // 只保留 cluster 内有效目标，以及与当前 CTA 同行或同列的目标。
+        is_signaling_thread_ &= dst_blockid_ < cluster_size;
+        is_signaling_thread_ &= is_same_row_or_col(dst_blockid_, block_id, cluster_shape);
+    }
+}
+```
+
+两个 `spread_arrivals` helper 生成“这个线程是否通知、通知哪个 CTA”的映射；后面两行再按当前 cluster 的协作关系筛选目标。
+
+单 CTA 时，所有 consumer 都承担通知职责，每个 consumer release 一次，empty 的 arrival 数为 `num_consumers`。
+
+多 CTA 时，当前实现针对 GEMM 的 cluster 行、列协作分配通知：每个 CTA 的 consumer 向本 CTA，以及同一行或同一列的 CTA 发出释放通知。通知工作分散给 warp / warpgroup 中的代表线程。
+
+以 `3 × 1` cluster、每 CTA 128 个 consumer 为例，三个 CTA 位于同一行，因此每个 CTA 的 consumer 都需要通知 CTA0、CTA1、CTA2 的 `empty[stage]`。每个目标由该 CTA 中的一名代表线程发送一次 arrival；128 个 consumer 合计向三个目标各发送一次：
+
+| 发送通知的 consumer CTA | 通知的 `empty[stage]` |
+| --- | --- |
+| CTA0 | CTA0、CTA1、CTA2 各一次 |
+| CTA1 | CTA0、CTA1、CTA2 各一次 |
+| CTA2 | CTA0、CTA1、CTA2 各一次 |
+
+从 CTA0 的 `empty[stage]` 看，它每轮接收来自 CTA0、CTA1、CTA2 的三次 arrival；CTA1、CTA2 的 empty 也分别接收三次。**预期 arrival 数是 3**：计数对象是各 CTA 的 consumer warpgroup 所发的代表通知。128 个 consumer 中，只有负责目标 CTA 的代表线程执行 arrival。如果每 CTA 有两个 128 线程 consumer warpgroup，每个目标就要接收 `3 × 2 = 6` 次。源码中的计数公式是“同行或同列的 CTA 数 × 每 CTA 的 consumer warpgroup 数”；对 `3 × 1`，前一项为 `3 + 1 - 1 = 3`。每次 `consumer_release(stage)` 只通知参数指定的那个 stage。
+
+每个 CTA 的 producer 在**复用本 CTA 的这个 stage**时，等待本地 `empty[stage]` 收齐本轮通知。因此 CTA2 的 consumer 如果还在读取当前 stage，CTA0 和 CTA1 对该 stage 的复用都要等 CTA2 的释放。各 CTA 持有自己的 stage 游标和 barrier；其他 stage 可以继续流转，整个 cluster 无需在每个时刻保持相同的游标或 phase。这里约束的是每个 stage 的复用，CTA 的执行进度可以在时间上错开。
+
+当前通知线程分配支持 `num_consumers` 为 128 的倍数，或恰好为 32；其他多 CTA 配置需要另外检查支持路径。barrier 布局、cluster 形状、consumer 数和 TMA multicast 的接收关系共同构成完整协议。
+
+## 用双 stage 示例串起 PipelineTmaAsync
+
+下面继续使用上文编码的输入 descriptor：global 矩阵形状为 `64 × 128`，box 为 `32 × 8`，无 swizzle、无 interleave。读取从第 16 行开始的四个相邻 tile，consumer 将每个元素加一，用普通 global store 写入输出矩阵的对应位置。
+
+使用一个 CTA、160 个线程：warp 0 的 32 个线程为 producer，其余 128 个线程为 consumer。producer 的线程 0 是唯一 leader，负责事务登记和发出 TMA load；两个 stage 循环复用。
+
+```cpp
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <cute/arch/copy_sm90_tma.hpp>
+#include <cutlass/pipeline/sm90_pipeline.hpp>
+#include <cstdint>
+
+/**
+ * @brief 用两个 shared stage 重叠 TMA 搬运和 consumer 计算。
+ * @param input_map 输入设备矩阵的 descriptor：64 × 128 float，box 为 32 × 8。
+ * @param output 输出设备指针，借用调用方 allocation；64 × 128 row-major 布局。
  *
- * @details
- * 返回值里带有 TMA descriptor 和 `Copy_Traits`。
- * 这个 atom 仍然是 non-executable，kernel 内还要经过 `tma_partition`，
- * 并在发起 copy 前通过 `.with(mbarrier)` 绑定 transaction barrier。
+ * 一个 CTA、160 个线程；warp 0 生产，其余 128 个线程消费。
+ * 输入和输出 allocation 独立，并存活至 kernel 完成；输出只更新第 16～23 行。
+ */
+__global__ void tmaDoubleBufferedAddOneKernel(
+    const __grid_constant__ CUtensorMap input_map,
+    float* __restrict__ output) {
+    using Pipeline = cutlass::PipelineTmaAsync<2>;
+    constexpr int tile_width = 32;
+    constexpr int tile_height = 8;
+    constexpr int tile_count = 4;
+    constexpr int matrix_width = 128;
+    constexpr int first_row = 16;
+    constexpr int num_consumers = 128;
+    constexpr std::uint32_t tile_bytes = tile_width * tile_height * sizeof(float);
+
+    /** @brief 两组 barrier 和两个 row-major tile 的 shared 存储。 */
+    struct SharedStorage {
+        Pipeline::SharedStorage barriers;
+        alignas(128) float tiles[Pipeline::Stages][tile_height][tile_width];
+    };
+    // 与 CUTLASS kernel 一样，将原始 shared 存储映射为布局对象。
+    __shared__ alignas(128) unsigned char storage_bytes[sizeof(SharedStorage)];
+    auto& storage = *reinterpret_cast<SharedStorage*>(storage_bytes);
+
+    const int thread_id = static_cast<int>(threadIdx.x);
+    const bool is_producer = thread_id < 32;
+    const bool is_leader = thread_id == 0;
+    Pipeline::Params params;
+    params.role = is_producer ? Pipeline::ThreadCategory::Producer
+                              : Pipeline::ThreadCategory::Consumer;
+    params.is_leader = is_leader;
+    params.num_producers = 1;  // 每轮只有 leader 执行 full arrival。
+    params.num_consumers = num_consumers;
+    params.transaction_bytes = tile_bytes;
+
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
+    Pipeline pipeline(storage.barriers, params, ClusterShape{});
+    __syncthreads();  // 发布初始化后，让整个 CTA 开始使用 pipeline。
+
+    if (is_producer) {
+        auto write_state = cutlass::make_producer_start_state<Pipeline>();
+        for (int tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+            pipeline.producer_acquire(write_state);
+            if (is_leader) {
+                auto* full_barrier = pipeline.producer_get_barrier(write_state);
+                cute::SM90_TMA_LOAD_2D::copy(
+                    &input_map, full_barrier,
+                    static_cast<std::uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL),
+                    storage.tiles[write_state.index()],
+                    tile_idx * tile_width, first_row);
+            }
+            ++write_state;
+        }
+        pipeline.producer_tail(write_state);  // 等待最后一批 consumer 释放 stage。
+    } else {
+        Pipeline::PipelineState read_state;
+        const int consumer_id = thread_id - 32;
+        for (int tile_idx = 0; tile_idx < tile_count; ++tile_idx) {
+            auto token = pipeline.consumer_try_wait(read_state);
+            pipeline.consumer_wait(read_state, token);
+            const int stage = read_state.index();
+            for (int idx = consumer_id; idx < tile_width * tile_height;
+                 idx += num_consumers) {
+                const int row = idx / tile_width;
+                const int col = idx % tile_width;
+                const float value = storage.tiles[stage][row][col];
+                output[(first_row + row) * matrix_width + tile_idx * tile_width + col] =
+                    value + 1.0f;
+            }
+            // 当前线程的 shared 读取已结束；128 个 arrival 合起来释放 stage。
+            pipeline.consumer_release(read_state);
+            ++read_state;
+        }
+    }
+    __syncthreads();  // 所有参与者完成控制流后，统一结束 shared 存储的使用。
+}
+```
+
+本例中，每个 stage 的 full barrier 每轮登记 1024 字节，empty barrier 每轮等待 128 个 consumer arrival。producer 对 stage 0 发出 tile 0 后就可以处理 stage 1；再次回到 stage 0 时，acquire 会等它被 consumer 释放。
+
+consumer 的每个线程只需确认自己的 shared 读取完成，再发送自己的 arrival；empty 收齐全体 128 个 arrival 后，producer 才得到复用权限。循环中的两侧通过 full / empty 交换通知，初始化后的 stage 流转由这些 barrier 协调。
+
+示例保留 arch 层的 TMA 发射，便于把流水线控制流直接对应到 PTX。随后阅读 Copy Atom / Traits 时，可以把这里的 descriptor、坐标、shared stage 和 full barrier 对应到 CuTe 的 Tensor 与 copy 调用。
+
+## PipelineAsync、PipelineTransactionAsync 和 PipelineTmaAsync 的区别
+
+这三个类都使用 stage 环、full / empty barrier 和 `PipelineState`。它们的主要差别是：**full 等待什么完成，以及 producer 在哪个调用中提交 arrival 和事务字节。**
+
+| 项目 | `PipelineAsync` | `PipelineTransactionAsync` | `PipelineTmaAsync` |
+| --- | --- | --- | --- |
+| full barrier 类型 | `ClusterBarrier` | `ClusterTransactionBarrier` | `ClusterTransactionBarrier` |
+| empty barrier 类型 | `ClusterBarrier` | `ClusterBarrier` | `ClusterBarrier` |
+| acquire | 等待 empty。 | 等待 empty。 | 等待 empty；leader 同时 arrival + expect-tx。 |
+| 字节登记 | 使用 arrival 协议表达就绪。 | 显式调用 `producer_expect_transaction(state)`，读取 `Params::transaction_bytes`。 | acquire 自动登记；可调用 `producer_expect_transaction(state, bytes)` 追加。 |
+| 常规 commit | 向本地 full 执行 arrival。 | 向 `dst_blockid` 对应的 full 执行 arrival。 | `producer_commit(state, bytes)` 在常规 TMA 路径为空操作。 |
+| full 完成条件 | 配置的 producer arrival 全部到齐。 | producer arrival 到齐，异步事务字节全部完成。 | producer arrival 到齐，TMA 事务字节全部完成。 |
+| empty 通知目标 | `Params::dst_blockid`。 | `Params::dst_blockid`。 | 根据 cluster 行、列关系分配通知目标。 |
+| 典型用途 | 线程间交接由 producer 确认就绪的数据。 | 分开控制异步事务登记和 producer 就绪通知。 | 为固定传输字节的 TMA load 主循环组织 stage。 |
+
+### PipelineAsync：由 producer arrival 表达数据就绪
+
+先看它的 shared 存储定义，两组数组的元素类型都为 `ClusterBarrier`：
+
+```cpp
+// 位于 cutlass::PipelineDetail 命名空间中。
+template<int Stages>
+struct PipelineAsyncSharedStorage {
+    using FullBarrier = cutlass::arch::ClusterBarrier;
+    using EmptyBarrier = cutlass::arch::ClusterBarrier;
+    FullBarrier full_barrier_[Stages];
+    EmptyBarrier empty_barrier_[Stages];
+};
+```
+
+配置和关键操作的源码节选如下：
+
+```cpp
+// PipelineAsync 类内的配置。
+struct Params {
+    ThreadCategory role = ThreadCategory::NonParticipant;
+    uint32_t producer_arv_count = 1;  // full 每轮需要的 producer arrival 数。
+    uint32_t consumer_arv_count = 1;  // empty 每轮需要的 consumer arrival 数。
+    uint32_t dst_blockid = cute::block_rank_in_cluster();  // release 的目标 CTA。
+    int initializing_warp = 0;
+};
+
+void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+        empty_barrier_ptr_[stage].wait(phase);  // 获取可写槽位。
+    }
+}
+
+void producer_commit(uint32_t stage) {
+    detail::pipeline_check_is_producer(params_.role);
+    full_barrier_ptr_[stage].arrive();  // 普通 arrival 向本地 consumer 表达就绪。
+}
+
+void consumer_release(uint32_t stage) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(params_.dst_blockid);
+}
+```
+
+两种 arrival 数默认都是 1，`dst_blockid` 默认是当前 CTA 的 cluster rank。commit 通知本地 full，release 通知配置目标的 empty。
+
+它的 producer 流程是：
+
+```cpp
+pipeline.producer_acquire(write_state);
+// producer 完成自己负责的 shared 写入，并满足交接所需的可见性。
+pipeline.producer_commit(write_state);  // 本地 full.arrive()。
+++write_state;
+```
+
+consumer 等待 full，读取数据后 release。配置多少次 producer / consumer arrival，就需要相应参与方各自执行足够的通知。
+
+这里，producer 的 commit 表示其负责的数据已经可交给 consumer。使用异步写入时，调用方需要先完成相应的完成与可见性协议，再让这次 arrival 表达就绪。
+
+回调重载中最后一行就是普通 commit：
+
+```cpp
+template<class UserDefinedArriveOp>
+void producer_commit(PipelineState state, UserDefinedArriveOp&& user_defined_arrive_op) {
+    cute::forward<UserDefinedArriveOp>(user_defined_arrive_op)(
+        producer_get_barrier(state.index()));
+    producer_commit(state);  // 回调结束后，再发送本线程的 full arrival。
+}
+```
+
+### PipelineTransactionAsync：分别控制登记字节和提交 arrival
+
+`PipelineTransactionAsync` 把 full 换成事务 barrier，并在配置中增加字节数。先看相关成员定义：
+
+```cpp
+// PipelineTransactionAsync 类内的类型和存储定义。
+using FullBarrier = cutlass::arch::ClusterTransactionBarrier;
+using EmptyBarrier = cutlass::arch::ClusterBarrier;
+
+struct SharedStorage {
+    cute::array<FullBarrier, Stages> full_barrier_;
+    cute::array<EmptyBarrier, Stages> empty_barrier_;
+};
+
+struct Params {
+    ThreadCategory role = ThreadCategory::NonParticipant;
+    uint32_t transaction_bytes = 0;   // 显式 expect 时登记的字节数。
+    uint32_t producer_arv_count = 1;  // full 需要的 arrival 数。
+    uint32_t consumer_arv_count = 1;  // empty 需要的 arrival 数。
+    uint32_t dst_blockid = cute::block_rank_in_cluster();
+    int initializing_warp = 0;
+};
+```
+
+producer 将获取 stage、字节登记和 arrival 分开实现：
+
+```cpp
+void producer_acquire(uint32_t stage, uint32_t phase, ProducerToken barrier_token) {
+    detail::pipeline_check_is_producer(params_.role);
+    if (barrier_token == BarrierStatus::WaitAgain) {
+        empty_barrier_ptr_[stage].wait(phase);
+    }
+}
+
+void producer_expect_transaction(uint32_t stage) {
+    detail::pipeline_check_is_producer(params_.role);
+    // 由选定的一个 producer 线程调用，登记预期字节。
+    full_barrier_ptr_[stage].expect_transaction(params_.transaction_bytes);
+}
+
+void producer_commit(uint32_t stage) {
+    detail::pipeline_check_is_producer(params_.role);
+    // 每个参与 arrival 的 producer 线程都调用一次。
+    full_barrier_ptr_[stage].arrive(params_.dst_blockid);
+}
+
+void consumer_release(uint32_t stage, uint32_t skip = false) {
+    detail::pipeline_check_is_consumer(params_.role);
+    empty_barrier_ptr_[stage].arrive(params_.dst_blockid, (not skip));
+}
+```
+
+对应的对外调用顺序为：
+
+1. `producer_acquire(state)`：等待可写 stage。
+2. `producer_expect_transaction(state)`：由选定的一个线程登记预期字节。
+3. `producer_commit(state)`：执行 producer arrival。
+
+例如一个 producer warp 的协作流程可以写成：
+
+```cpp
+load_pipeline.producer_acquire(write_state);
+if (is_load_thread && need_tile) {
+    load_pipeline.producer_expect_transaction(write_state);
+    auto* full_barrier = load_pipeline.producer_get_barrier(write_state);
+    // 发起需要的 TMA load，完成通知绑定 full_barrier。
+}
+// 全部配置的 producer 各发送一次 arrival，完成本轮就绪登记。
+load_pipeline.producer_commit(write_state);
+++write_state;
+```
+
+字节登记在当前 phase 的最后一次 producer arrival 前安排完成。硬件的字节完成通知与 producer arrival 可以分别到达；两项满足后 consumer 的 full 等待才成功。
+
+这个拆分适合条件化加载：需要异步搬运时登记字节，由硬件报告完成；其他轮次按照调用方定义的数据来源完成 producer 工作并提交 arrival。consumer 的计算也要与这一轮实际准备的数据对应。
+
+**`PipelineTransactionAsync` 同样用于 TMA load。** CUTLASS 的 [`sm90_epilogue_tma_warpspecialized.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cutlass/epilogue/collective/sm90_epilogue_tma_warpspecialized.hpp#L488) 就使用它管理 epilogue 的加载：producer warp 获取 stage，选定线程按需发射 TMA 并登记字节，随后 producer 线程分别 commit。
+
+在这个实现中，`producer_commit` 的 full arrival 和 `consumer_release` 的 empty arrival 都使用显式配置的 `dst_blockid`，由调用方安排目标 CTA。
+
+### PipelineTmaAsync：在 acquire 中合并 arrival 和字节登记
+
+TMA mainloop 的每个 stage 往往需要固定的数据，比如 A tile 和 B tile。`PipelineTmaAsync` 把它们的总字节数放入 `Params::transaction_bytes`，leader 获取 stage 时一次完成 arrival 和 expect-tx，再发出实际搬运。
+
+这个协议的主线是：
+
+**acquire 等 empty 并登记 full → TMA 搬运并通知 full → consumer 等 full 并读取 → release 通知 empty → producer 复用。**
+
+三者的 empty 侧都表达 consumer 已释放 stage。TMA 版本进一步按 cluster 行、列关系分配释放通知，因此它适合 GEMM mainloop 中多 CTA 共享输入 tile 的协作。
+
+同一文件还提供 `PipelineTmaStore`：它用 bulk group 的 commit 和 `.read` wait 管理 shared → global store 源存储的复用。store 的完成协议沿用前面的 bulk-group 章节；这里展开的 full / empty 双向模型针对 load 与 consumer 的交接。
+
+把这些对象接起来后，阅读 mainloop 可以先检查：**谁持有 write / read / release state，acquire 在哪里登记字节，实际 TMA 绑定哪个 full barrier，consumer 在哪个完成点发送 empty arrival。** 这条控制流确定后，再展开 Copy Atom / Traits 中的 descriptor、坐标和张量划分。
+
+## 两条 TMA Copy 使用路径
+
+前面的流水线已经确定了 full / empty 的生命周期。现在把实际发射 TMA 的这一行，从 arch 接口提升到 CuTe Tensor 接口：
+
+```cpp
+copy(tma.with(full_barrier), source_partition, shared_partition);
+```
+
+这里的三个对象各自提供不同的信息：`tma` 提供 descriptor 和拷贝能力；`source_partition` 提供本次 TMA 的起始坐标；`shared_partition` 提供本次写入的 shared 地址。`.with(full_barrier)` 再绑定完成通知的目标。
+
+CuTe 提供两条构造与分区路径：
+
+| 使用路径 | host 端构造结果 | device 端分区方式 | 发射 |
+| --- | --- | --- | --- |
+| `make_tma_atom` | `Copy_Atom`，内部保存 TMA Traits。 | `tma_partition` 同时转换源、目标 Tensor。 | `copy(atom.with(barrier), src, dst)`。 |
+| `make_tma_copy` | `TiledCopy`，继承 Atom，并增加 tile 的逻辑参与者 / 元素映射。 | `get_slice` 获取逻辑参与者，再分别调用 `partition_S/D`。 | `copy(tiled_copy.with(barrier), src, dst)`。 |
+
+两条路径最终都通过 `detail::make_tma_copy_atom` 构造 descriptor 和 Atom。下面先分别说明如何使用，再展开实例化类型。
+
+新增源码主要位于：
+
+- [`copy_traits_sm90_tma.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_traits_sm90_tma.hpp)：TMA Traits、descriptor 构造、`make_tma_atom`、`make_tma_copy` 和 `tma_partition`。
+- [`copy_atom.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_atom.hpp)：`Copy_Atom`、`TiledCopy` 和 `ThrCopy`。
+- [`algorithm/copy.hpp`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/algorithm/copy.hpp)：`copy` 如何遍历分区并调用 Atom。
+
+### 两条路径共用的二维例子
+
+继续使用 row-major 的 `64 × 128` global 矩阵和 `8 × 32` shared tile。矩阵、tile 和用户传入的坐标统一按 **`(row, col)`** 表达，行优先存储由 stride 指定：
+
+```cpp
+#include <cute/tensor.hpp>
+#include <cute/atom/copy_traits_sm90_tma.hpp>
+#include <cutlass/arch/barrier.h>
+
+using namespace cute;
+
+// 所有 shape / stride 都是编译期常量，便于展开具体类型。
+// 逻辑维度始终为 (row, col)，行优先存储由 stride 表达。
+using GlobalShape = Shape<_64, _128>;
+using GlobalLayout = Layout<GlobalShape, Stride<_128, _1>>;
+
+// shared 中是 8 行、32 列，连续排列，无 swizzle。
+using TileShape = Shape<_8, _32>;
+using TileLayout = Layout<TileShape, Stride<_32, _1>>;
+
+/** @brief 两条示例 kernel 共用的一个 shared tile 和完成 barrier。 */
+struct TmaTileStorage {
+    alignas(128) float values[256];
+    alignas(16) uint64_t full_barrier;
+};
+```
+
+`GlobalLayout(row, col)` 给出元素偏移 `row * 128 + col`，`TileLayout(row, col)` 给出元素偏移 `row * 32 + col`。两者的第 0 维都是行、第 1 维都是列。
+
+本次只搬一个 tile：行 tile 编号为 2、列 tile 编号为 1，因此用户传入的 tile 坐标为 `(2, 1)`，矩阵起点为 `(row, col) = (16, 32)`，覆盖行 16～23、列 32～63。一个 tile 有 256 个 `float`，对应 1024 B。
+
+硬件 tensor map 的第 0 维描述连续元素，因此本例 TMA 坐标顺序为 `(col, row)`。**CuTe 的构造过程根据布局推导这层转换**：用户继续按 `(row, col)` 切分 Tensor，`get_tma_tensor` 自动将它映射为指令所需的坐标。下面分别标明逻辑坐标和 TMA 坐标。
+
+| 对象 | shape | stride 或坐标含义 |
+| --- | --- | --- |
+| global 数据 Tensor | `(64, 128)` | `(128, 1)`，单位为 `float` 元素。 |
+| shared 数据 Tensor | `(8, 32)` | `(32, 1)`，单位为 `float` 元素。 |
+| TMA 坐标 Tensor | `(64, 128)` | 输入逻辑坐标 `(row, col)`，产生 TMA 坐标 `(col, row)`。 |
+| 本次 global tile | `(8, 32)` | tile 内 `(r, c)` 对应 TMA 坐标 `(32 + c, 16 + r)`。 |
+
+下面代码是说明接口的示例，未编译运行。示例 kernel 的约定是一个 CTA、128 个线程，输出指向至少 256 个 `float` 的 device 存储；输入矩阵的 device 基址满足 16 B 对齐。每个 kernel 只搬一次，因此 barrier 只经历一轮 phase。
+
+## make_tma_atom：构造 Atom，再用 tma_partition
+
+### host 端构造
+
+`make_tma_atom` 接收完整的 global Tensor、一个 shared tile 的 layout，以及这个 tile 对应的 global 逻辑范围：
+
+```cpp
+/**
+ * @brief 为固定二维矩阵构造一个单 CTA TMA load Atom。
+ * @param input_device device 指针，借用只读输入矩阵，包含 64 × 128 个 float。
+ * @return 按值保存 descriptor 和坐标映射辅助信息的 Copy_Atom。
+ */
+auto make_example_tma_atom(float const* input_device) {
+    auto global_tensor =
+        make_tensor(make_gmem_ptr(input_device), GlobalLayout{});
+
+    return make_tma_atom(
+        SM90_TMA_LOAD{}, global_tensor, TileLayout{}, TileShape{}, Int<1>{});
+}
+```
+
+`global_tensor` 是对输入存储的视图。工厂读取它的基址、shape 和 stride 来编码 descriptor；返回对象保存这些编码结果，输入矩阵仍由调用方管理。
+
+[工厂源码](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_traits_sm90_tma.hpp#L1388)如下，增加中文注释：
+
+```cpp
+/**
+ * @brief 从 global Tensor 和 shared tile 布局构造 TMA Atom。
+ * @tparam TmaInternalType descriptor 使用的数据类型；void 时采用 global 元素类型。
+ * @tparam CopyOp 底层 TMA 操作，如 SM90_TMA_LOAD。
+ * @tparam GEngine global Tensor 的存储引擎类型。
+ * @tparam GLayout global Tensor 的逻辑布局类型。
+ * @tparam SLayout 一个 shared tile 的布局类型，可包含 swizzle。
+ * @tparam CTA_Tiler CTA tile 在 global 各逻辑维度上的范围或映射。
+ * @tparam Cluster_Size 构造时参与协作分块的 CTA 数类型，默认 Int<1>。
+ * @param copy_op 用于选择 Traits 和 arch 操作的对象。
+ * @param gtensor 完整 global Tensor，其基址属于 device 存储。
+ * @param slayout 一个 shared tile 的布局，不包含流水线 stage 维。
+ * @param cta_tiler 该 shared tile 对应的 global 逻辑 tile。
+ * @param cluster_size 协作分块的 CTA 数；单 CTA 使用 Int<1>。
+ * @return 内含 descriptor 和辅助映射的 Copy_Atom。
  */
 template <class TmaInternalType = void,
           class CopyOp,
@@ -2170,338 +2549,595 @@ template <class TmaInternalType = void,
           class Cluster_Size = Int<1>>
 CUTE_HOST_RTC
 auto make_tma_atom(CopyOp const& copy_op,
-                   Tensor<GEngine,GLayout> const& gtensor,
+                   Tensor<GEngine, GLayout> const& gtensor,
                    SLayout const& slayout,
                    CTA_Tiler const& cta_tiler,
-                   Cluster_Size const& cluster_size = {});
-```
+                   Cluster_Size const& cluster_size = {}) {
+    // global tile 内坐标 -> 原 global Tensor 的逻辑坐标。
+    auto cta_v_tile =
+        make_identity_layout(shape(gtensor)).compose(cta_tiler);
 
-源码主体很短，但信息量很大：
+    using TmaType = conditional_t<
+        is_same<void, TmaInternalType>::value,
+        typename GEngine::value_type, TmaInternalType>;
 
-```cpp
-/**
- * @brief 根据 GMEM tensor、单 stage SMEM layout 和 CTA tile 构造 TMA atom。
- *
- * @tparam TmaInternalType descriptor 内部使用的元素类型。默认 `void`
- *         表示使用 `GEngine::value_type`。
- * @tparam CopyOp TMA 操作类型，例如 `SM90_TMA_LOAD{}`。
- * @tparam GEngine GMEM tensor 的 engine 类型。
- * @tparam GLayout GMEM tensor 的 layout 类型。
- * @tparam SLayout 单个 TMA box 对应的 SMEM layout 类型。
- * @tparam CTA_Tiler CTA tile shape / tiler 类型。
- * @tparam Cluster_Size multicast 参与 CTA 数的类型，默认是 `Int<1>`。
- * @param copy_op TMA 操作对象。
- * @param gtensor 完整 GMEM tensor，用来提取 base、shape、stride。
- * @param slayout 单个 pipeline stage 的 SMEM layout，用来推导 box 和 swizzle。
- * @param cta_tiler 当前 CTA 在 GMEM tensor 上负责的 tile shape。
- * @param cluster_size multicast 参与 CTA 数。不传就是 1。
- * @return 带 TMA descriptor 的 `Copy_Atom`。
- */
-template <class TmaInternalType = void,
-          class CopyOp,
-          class GEngine, class GLayout,
-          class SLayout,
-          class CTA_Tiler,
-          class Cluster_Size = Int<1>>
-CUTE_HOST_RTC
-auto
-make_tma_atom(CopyOp                  const& copy_op,
-              Tensor<GEngine,GLayout> const& gtensor,
-              SLayout                 const& slayout,
-              CTA_Tiler               const& cta_tiler,
-              Cluster_Size            const& cluster_size = {})
-{
-  auto cta_v_tile =
-      make_identity_layout(shape(gtensor)).compose(cta_tiler);
-
-  using TmaType = conditional_t<
-      is_same<void, TmaInternalType>::value,
-      typename GEngine::value_type,
-      TmaInternalType>;
-
-  return detail::make_tma_copy_atom<TmaType>(
-      copy_op,
-      gtensor,
-      slayout,
-      size(cluster_size),
-      cta_v_tile);
+    return detail::make_tma_copy_atom<TmaType>(
+        copy_op, gtensor, slayout, size(cluster_size), cta_v_tile);
 }
 ```
 
-把教程里的调用和原型逐个对上：
+本例的模板参数与中间结果具体为：
 
-| 原型参数 | 示例实参 | 为什么这样写 |
+| 名称 | 本例类型或值 | 作用 |
 | --- | --- | --- |
-| `copy_op` | `SM90_TMA_LOAD{}` | A 是 GMEM 到 SMEM 的 load，不是 store，也不是 reduce。 |
-| `gtensor` | `mA` | host 侧的 `mA = make_tensor(A, make_shape(M,K), dA)` 是完整 A 矩阵，用来编码 descriptor 的 global shape / stride / base。 |
-| `slayout` | `sA(_,_,0)` | `sA` 有 pipeline 维度 `(BLK_M, BLK_K, PIPE)`；TMA descriptor 描述的是一次写入一个 stage 的 box，所以这里只取第 0 个 stage 的 `(BLK_M, BLK_K)` layout。 |
-| `cta_tiler` | `make_shape(bM,bK)` | 一个 CTA 每次从 A 上取 `(bM,bK)`，正好对应 A 的 GMEM 逻辑维度 `(M,K)`。B 的调用则是 `make_shape(bN,bK)`，对应 `(N,K)`。 |
-| `cluster_size` | 省略 | 默认是 `Int<1>{}`，表示不做 multicast；源码里传给 descriptor 的是 `size(cluster_size) = 1`。 |
-| `TmaInternalType` | 省略 | 默认 `void`，源码会退回到 `GEngine::value_type`，也就是 A tensor 的元素类型。 |
+| `CopyOp` | `SM90_TMA_LOAD` | 使用普通 global → shared load。 |
+| `GEngine` | `ViewEngine<gmem_ptr<float const*>>` | 对 device 输入存储的只读视图。 |
+| `GEngine::value_type` | `float` | 输入指针可为 `float const*`，逻辑元素类型仍为 `float`。 |
+| `GLayout` | `Layout<Shape<_64, _128>, Stride<_128, _1>>` | global 数据的行、列到元素地址的映射。 |
+| `SLayout` | `Layout<Shape<_8, _32>, Stride<_32, _1>>` | shared tile 的行、列到元素地址的映射。 |
+| `CTA_Tiler` | `Shape<_8, _32>` | CTA tile 的行、列范围。 |
+| `Cluster_Size` | `Int<1>` | 单 CTA。 |
+| `TmaType` | `float` | descriptor 使用 FP32。 |
+| `cta_v_tile` | `Layout<Shape<_8, _32>, Stride<E<0>, E<1>>>` | tile 的行、列维分别对应 global 的第 0、1 维。 |
 
-其中 `cta_v_tile` 也值得单独看一眼：
+`E<0>` 和 `E<1>` 是 CuTe 的坐标基：前者表示只改变第 0 个坐标，后者表示只改变第 1 个坐标。比如该布局作用于 `(3, 2)`，结果为坐标 `(3, 2)`；它用于表达维度对应关系。
 
-```cpp
-auto cta_v_tile =
-    make_identity_layout(shape(gtensor)).compose(cta_tiler);
-```
+### descriptor、AuxParams、Traits 和 Atom 如何生成
 
-它不是 SMEM layout，而是 **CTA tile 坐标到 GMEM 逻辑维度的映射**。`make_tma_copy_atom` 后面会沿着 SMEM 的连续向量反推 TMA box，再用 `cta_v_tile` 知道这些 box 维度应该落到 GMEM 的哪些 mode 上。
-
-`make_tma_atom` 完成后，host 侧得到的 `tmaA` / `tmaB` 已经带了 tensor map descriptor，但还没有进入具体 CTA tile，也没有绑定 mbarrier。后面要靠 `get_tma_tensor` 和 `tma_partition` 把它接回 kernel 内的 tensor。
-
-#### 先看 `tma_partition` 的原型
-
-教程源码马上会用：
+`detail::make_tma_copy_atom` 的构造主线如下。这里摘录普通 SM90 load 相关逻辑，省略同一实现中的 SM100 gather / scatter 分支与调试打印：
 
 ```cpp
-auto [tAgA, tAsA] = tma_partition(
-    tma_a,
-    Int<0>{},
-    Layout<_1>{},
-    group_modes<0,2>(sA),
-    group_modes<0,2>(gA));
+// 分离 shared layout 的 swizzle 和普通地址布局。
+auto smem_swizzle = get_swizzle_portion(slayout);
+auto smem_layout = get_nonswizzle_portion(slayout);
+
+// 按 shared 的连续存储顺序，建立 TMA box 维度到 global 维度的映射。
+auto tma_gbasis = detail::construct_tma_gbasis<TmaInternalType>(
+    gtensor, smem_layout, cta_v_map);
+
+// 编码硬件 descriptor，同时产生 global 坐标到 TMA 坐标的辅助映射。
+auto [tma_desc, aux_params] =
+    detail::make_tma_copy_desc<TmaInternalType>(
+        gtensor, tma_gbasis, smem_swizzle, num_multicast);
+
+// Traits 描述一次逻辑 TMA tile 的 bit 布局。
+// 本例单 CTA，一个逻辑 tile 对应一次硬件传输。
+constexpr int num_bits_per_tma =
+    size(tma_gbasis) * sizeof_bits_v<TmaInternalType>;
+
+using Traits =
+    Copy_Traits<CopyOp, cute::C<num_bits_per_tma>, decltype(aux_params)>;
+using Atom = Copy_Atom<Traits, typename GEngine::value_type>;
+
+Traits tma_traits{tma_desc, aux_params};
+return Atom{tma_traits};
 ```
 
-这个调用最容易让人卡住的是 `Int<0>{}, Layout<_1>{}`。它们不是数据 layout，而是 multicast 分工信息。先看原型：
+本例的 logical tile 为 `(8, 32)`，stride 为 `(32, 1)`。构造过程先沿 shared 的连续存储顺序寻找对应的 global 维度：连续的列维对应 global 第 1 维，行维对应 global 第 0 维。因此 `tma_gbasis` 的 shape 为 `(32, 8)`，stride 为 `(E<1>, E<0>)`，明确表达“TMA 第 0 维对应列、第 1 维对应行”。
+
+shared 行距为 32 个元素，global 行距为 128 个元素，构造过程保留两个 TMA 维度。最终传给 `cuTensorMapEncodeTiled` 的主要内容为：
+
+| descriptor 参数 | 本例内容 |
+| --- | --- |
+| global 基址 | `input_device`。 |
+| 数据类型、rank | FP32，二维。 |
+| `globalDim` | `{128, 64}`。 |
+| `globalStrides` | `{512}`，第二维行距为 `128 × sizeof(float)`；第一维步幅由硬件隐含。 |
+| `boxDim` | `{32, 8}`。 |
+| `elementStrides` | `{1, 1}`。 |
+| interleave、swizzle | 均为 NONE。 |
+| L2 promotion | 本实现选择 `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`。 |
+
+`AuxTmaParams` 的源码保存一个成员，并用两个类型别名保留构造信息：
 
 ```cpp
 /**
- * @brief 按 TMA atom 的单指令搬运形状，对 SMEM / GMEM tensor 做分区。
- *
- * @tparam Args `Copy_Atom` 内部 traits 参数。
- * @tparam CtaCoord 当前 CTA 在 multicast layout 中的坐标类型。
- * @tparam TShape `cta_layout` 的 shape 类型。
- * @tparam TStride `cta_layout` 的 stride 类型。
- * @tparam SEngine SMEM tensor engine 类型。
- * @tparam SLayout SMEM tensor layout 类型。
- * @tparam GTensors 一个或多个 GMEM tensor 类型。
- * @param copy_atom TMA copy atom，里面带 descriptor 和单指令搬运形状。
- * @param cta_coord 当前 CTA 在 multicast group 里的坐标。
- * @param cta_layout CTA 坐标到 logical multicast id 的 layout。
- * @param stensor grouped 后的 SMEM tensor，形状通常是 `(TMATile, Rest...)`。
- * @param gtensors grouped 后的 GMEM tensor，形状也通常是 `(TMATile, Rest...)`。
- * @return tuple，顺序是 `(gtensors..., stensor)`，方便后续 `copy(src, dst)`。
+ * @brief 保存 global 坐标到 TMA 坐标的映射，并保留 box / swizzle 类型。
+ * @tparam GmemTmaBasisStrides_ 原 global 各维对 TMA 坐标的贡献。
+ * @tparam TmaGmemBasis_ TMA box 各维对应的 global 维度映射。
+ * @tparam TmaSwizzle_ shared swizzle 的类型。
  */
-template <class... Args,
-          class CtaCoord,
-          class TShape, class TStride,
-          class SEngine, class SLayout,
-          class... GTensors>
-CUTE_DEVICE
-auto
-tma_partition(Copy_Atom<Args...>      const& copy_atom,
-              CtaCoord                const& cta_coord,
-              Layout<TShape,TStride>  const& cta_layout,
-              Tensor<SEngine,SLayout> const& stensor,
-              GTensors                const&... gtensors);
+template <class GmemTmaBasisStrides_,
+          class TmaGmemBasis_,
+          class TmaSwizzle_>
+struct AuxTmaParams {
+    using GmemStrides = GmemTmaBasisStrides_;
+    GmemStrides g_stride_;  // get_tma_tensor 使用的坐标步幅。
+
+    using TmaGmemBasis = TmaGmemBasis_;
+    using TmaSwizzle = TmaSwizzle_;
+    static_assert(is_static<TmaSwizzle>::value);
+};
 ```
 
-源码核心逻辑是：
+因此，本例的具体实例化可以写成以下别名。这里是依据静态输入和源码推导的类型展开：
+
+```cpp
+// E<0> = ScaledBasis<Int<1>, 0>，E<1> = ScaledBasis<Int<1>, 1>。
+// 输入的逻辑行维贡献给 TMA 第 1 坐标，逻辑列维贡献给 TMA 第 0 坐标。
+using ExampleGmemStrides = tuple<E<1>, E<0>>;
+
+using ExampleTmaGmemBasis =
+    Layout<Shape<_32, _8>, Stride<E<1>, E<0>>>;
+
+// 普通 Layout 的 get_swizzle_portion 返回此恒等 swizzle。
+using ExampleTmaSwizzle = Swizzle<0, 4, 3>;
+
+using ExampleAuxParams = AuxTmaParams<
+    ExampleGmemStrides, ExampleTmaGmemBasis, ExampleTmaSwizzle>;
+
+// 8 × 32 × 32 bit = 8192 bit。
+using ExampleLoadTraits =
+    Copy_Traits<SM90_TMA_LOAD, Int<8192>, ExampleAuxParams>;
+using ExampleLoadAtom = Copy_Atom<ExampleLoadTraits, float>;
+```
+
+| `ExampleAuxParams` 内部别名 / 成员 | 具体类型 | 含义 |
+| --- | --- | --- |
+| `GmemStrides` | `tuple<E<1>, E<0>>` | global 的行维贡献给 TMA 第 1 坐标，列维贡献给 TMA 第 0 坐标。 |
+| `g_stride_` | `GmemStrides` | 保存上述映射的对象；本例完全静态。 |
+| `TmaGmemBasis` | `Layout<Shape<_32, _8>, Stride<E<1>, E<0>>>` | TMA box 的连续维对应 global 第 1 维，下一维对应 global 第 0 维。 |
+| `TmaSwizzle` | `Swizzle<0, 4, 3>` | `B = 0`，地址不发生 swizzle。 |
+
+### Traits 保存什么，using 分别是什么
+
+构造得到的 `Copy_Traits<SM90_TMA_LOAD, ...>` 保存 descriptor 和 `AuxParams`。下面是成员与相关接口的源码节选，省略替换 descriptor 的重载：
+
+```cpp
+template <class NumBitsPerTMA, class AuxParams_>
+struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_> {
+    using ThrID = Layout<_1>;
+    using SrcLayout = Layout<Shape<_1, NumBitsPerTMA>>;
+    using DstLayout = Layout<Shape<_1, NumBitsPerTMA>>;
+    using RefLayout = SrcLayout;
+
+    TmaDescriptor tma_desc_;
+    using AuxParams = AuxParams_;
+    AuxParams aux_params_;
+
+    CUTE_HOST_DEVICE constexpr
+    TmaDescriptor const* get_tma_descriptor() const {
+        return &tma_desc_;
+    }
+
+    CUTE_HOST_DEVICE constexpr
+    Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
+    with(uint64_t& tma_mbar,
+         [[maybe_unused]] uint16_t const& multicast_mask = 0,
+         TMA::CacheHintSm90 const& cache_hint =
+             TMA::CacheHintSm90::EVICT_NORMAL) const {
+        // 普通 load 使用 descriptor、barrier 地址与 cache hint。
+        return {&tma_desc_, &tma_mbar, static_cast<uint64_t>(cache_hint)};
+    }
+
+    template <class GShape>
+    CUTE_HOST_DEVICE constexpr
+    auto get_tma_tensor(GShape const& g_shape) const {
+        static_assert(is_congruent<
+            decltype(g_shape), decltype(aux_params_.g_stride_)>::value);
+        return make_coord_tensor(make_layout(g_shape, aux_params_.g_stride_));
+    }
+
+    // 构造态 Traits 必须先通过 with(barrier) 得到执行态 Traits。
+    template <class TS, class SLayout, class TD, class DLayout>
+    CUTE_HOST_DEVICE friend constexpr void
+    copy_unpack(Copy_Traits const&, Tensor<TS, SLayout> const&,
+                Tensor<TD, DLayout>&) = delete;
+};
+```
+
+代入 `NumBitsPerTMA = Int<8192>` 后：
+
+| Traits 别名 / 成员 | 本例具体类型 | 含义 |
+| --- | --- | --- |
+| `ThrID` | `Layout<_1, _0>` | 一次 TMA 的一个逻辑发射者。 |
+| `SrcLayout` | `Layout<Shape<_1, Int<8192>>, Stride<_0, _1>>` | 一个逻辑参与者对应 8192 个源 bit。 |
+| `DstLayout` | 同 `SrcLayout` | 对应 8192 个目标 bit。 |
+| `RefLayout` | 同 `SrcLayout` | 源、目标共同使用的参考 bit 布局。 |
+| `AuxParams` | `ExampleAuxParams` | 坐标转换辅助信息。 |
+| `tma_desc_` | `TmaDescriptor`，本例 CUDA 13 非 RTC 环境中为 `CUtensorMap` | 按值持有编码后的 tensor map。 |
+| `aux_params_` | `ExampleAuxParams` | 按值持有坐标映射对象。 |
+
+默认紧凑布局将静态 size-1 维的 stride 设为 0，所以 `Layout<_1>` 展开为 `Layout<_1, _0>`，`Layout<Shape<_1, Int<8192>>>` 展开为 `(1, 8192):(0, 1)`。这里的 `ThrID` 表示一次 TMA 操作的逻辑参与者；负责等待或读取 shared 的 consumer 数由前面的 barrier / pipeline 协议决定。
+
+### Atom 把 bit 布局转换成 float 元素布局
+
+`Copy_Atom` 继承 Traits，并增加逻辑元素类型。相关源码如下：
+
+```cpp
+template <class... Args, class CopyInternalType>
+struct Copy_Atom<Copy_Traits<Args...>, CopyInternalType>
+    : Copy_Traits<Args...> {
+    using Traits = Copy_Traits<Args...>;
+
+    using ThrID = typename Traits::ThrID;
+    using BitLayoutSrc = typename Traits::SrcLayout;
+    using BitLayoutDst = typename Traits::DstLayout;
+    using BitLayoutRef = typename Traits::RefLayout;
+
+    using ValType = CopyInternalType;
+    using ValLayoutSrc =
+        decltype(recast_layout<uint1_t, ValType>(BitLayoutSrc{}));
+    using ValLayoutDst =
+        decltype(recast_layout<uint1_t, ValType>(BitLayoutDst{}));
+    using ValLayoutRef =
+        decltype(recast_layout<uint1_t, ValType>(BitLayoutRef{}));
+
+    static constexpr int NumValSrc = size<1>(ValLayoutSrc{});
+    static constexpr int NumValDst = size<1>(ValLayoutDst{});
+
+    template <class... TraitsArgs>
+    CUTE_HOST_DEVICE
+    auto with(TraitsArgs&&... args) const {
+        auto traits = Traits::with(static_cast<TraitsArgs&&>(args)...);
+        return Copy_Atom<decltype(traits), CopyInternalType>{traits};
+    }
+
+    // 省略 call 的参数检查与递归分派，后面展示实际执行路径。
+};
+```
+
+`float` 占 32 bit，因此 `recast_layout<uint1_t, float>` 将 8192 个 bit 转为 256 个元素。本例 Atom 中所有这些别名可以完全展开：
+
+| Atom 别名 / 常量 | 本例具体类型或值 |
+| --- | --- |
+| `Traits` | `Copy_Traits<SM90_TMA_LOAD, Int<8192>, ExampleAuxParams>`。 |
+| `ThrID` | `Layout<_1, _0>`。 |
+| `BitLayoutSrc`、`BitLayoutDst`、`BitLayoutRef` | `Layout<Shape<_1, Int<8192>>, Stride<_0, _1>>`。 |
+| `ValType` | `float`。 |
+| `ValLayoutSrc`、`ValLayoutDst`、`ValLayoutRef` | `Layout<Shape<_1, _256>, Stride<_0, _1>>`。 |
+| `NumValSrc`、`NumValDst` | `256`，类型为 `static constexpr int`。 |
+
+Atom 的元素数用于检查 / 划分 Tensor fragment。descriptor 中的 `boxDim` 决定硬件实际传输区域；本例单 CTA、无额外协作分块，两者都对应 256 个 `float`。
+
+### get_tma_tensor 产生坐标 Tensor
+
+device 端先调用：
+
+```cpp
+auto coordinate_tensor = tma_atom.get_tma_tensor(GlobalShape{});
+```
+
+它使用 `aux_params_.g_stride_` 构造布局。两个布局的具体类型如下：
+
+```cpp
+// 普通 global 数据 Tensor 的布局：返回 float 元素偏移。
+using GlobalDataLayout =
+    Layout<Shape<_64, _128>, Stride<_128, _1>>;
+
+// TMA 坐标 Tensor 的布局：返回 (coord0, coord1)。
+using GlobalCoordinateLayout =
+    Layout<Shape<_64, _128>, Stride<E<1>, E<0>>>;
+```
+
+两个 Tensor 都接收逻辑坐标 `(row, col)`。普通 global Tensor 在 `(16, 32)` 处读取 `input_device[16 * 128 + 32]`；坐标 Tensor 在同一逻辑位置产生 TMA 坐标 `(32, 16)`。这里 `E<1>` 将行值送入 TMA 第 1 坐标，`E<0>` 将列值送入 TMA 第 0 坐标。
+
+`make_coord_tensor` 用坐标迭代器保存坐标原点，后续按 `(row, col)` 切 tile 时继续累加对应的 TMA 坐标偏移。TMA 的 global 数据基址已经编码在 descriptor 中。
+
+这使下面的分工非常直接：**坐标 Tensor 指定从哪里开始，descriptor 指定该位置如何对应 global 存储，以及从那里搬多大的 box。**
+
+### tma_partition 的输入、返回顺序和实现
+
+`tma_partition` 接收的 Tensor 必须把本次 TMA 负责的 tile 放在第 0 个 mode：
+
+| 参数 | 含义 |
+| --- | --- |
+| `copy_atom` | 由 `make_tma_atom` 构造的 Atom，提供 `NumValSrc`。 |
+| `cta_coord` | 当前 CTA 在下面协作布局中的逻辑坐标。 |
+| `cta_layout` | 将 CTA 逻辑坐标映射为协作分块编号；单 CTA 编号为 0。 |
+| `stensor` | shared Tensor，第 0 个 mode 是 tile，其余 mode 可为 stage 等。 |
+| `gtensors...` | 一个或多个源 Tensor，第 0 个 mode 覆盖对应 tile。TMA load 使用坐标 Tensor。 |
+| 返回值 | 按 `gtensors...` 的顺序返回源分区，**shared 分区放在最后**。 |
+
+这里有两个重载：显式版本接收 CTA 坐标和协作布局，简便版本固定使用一个逻辑参与者。
+
+| 调用形式 | CTA 坐标 / 布局 | 源 Tensor 数 |
+| --- | --- | --- |
+| `tma_partition(atom, cta_coord, cta_layout, shared, globals...)` | 调用方显式传入。 | 一个或多个。 |
+| `tma_partition(atom, shared, global)` | 内部固定为 `Int<0>{}`、`Layout<_1, _0>{}`。 | 一个。 |
+
+device 示例使用的是三参数重载。它的源码如下，增加中文注释：
 
 ```cpp
 /**
- * @brief TMA partition 的核心流程。
- *
- * @details
- * `stensor` 的第 0 个 mode 是 TMA 要负责的整块 tile。
- * `tma_partition` 会根据 SMEM layout 找到最大连续向量，
- * 再把第 0 个 mode 切成 `(TMA, TMA_Iter)`，最后按 multicast 分工加偏移。
- */
-Layout inv_smem_layout =
-    right_inverse(get_nonswizzle_portion(layout<0>(stensor)));
-
-Layout layout_v =
-    tile_to_shape(make_layout(inv_smem_layout), size<0>(stensor));
-
-Layout tma_layout_v =
-    make_layout(Int<Copy_Atom<Args...>::NumValSrc>{});
-
-auto layout_V =
-    make_tile(logical_divide(layout_v, tma_layout_v));
-
-auto multicast_offset =
-    cta_layout(cta_coord) *
-    (size(tma_layout_v) / cosize(cta_layout));
-
-auto multicast_coord =
-    make_coord(make_coord(multicast_offset, Int<0>{}));
-
-return cute::transform(make_tuple(gtensors..., stensor),
-                       [&](auto&& tensor) {
-  auto R = rank(tensor);
-  CUTE_STATIC_ASSERT_V(size<0>(stensor) == size<0>(tensor));
-
-  auto tlayout_V = append<R>(layout_V, _);
-
-  Tensor tensor_v =
-      coalesce(tensor.compose(tlayout_V), Shape<Shape<_1,_1>>{});
-
-  auto coord = append<R>(multicast_coord, Int<0>{});
-  return domain_offset(coord, tensor_v);
-});
-```
-
-这里两个参数最关键。
-
-`Layout<TShape,TStride> const& cta_layout` 描述的是：
-
-```text
-当前 CTA 的 multicast 坐标 -> logical multicast id
-```
-
-它不是 A/B/C 的矩阵 layout，也不是 shared-memory swizzle layout。它只被用在这一行：
-
-```cpp
-auto multicast_offset =
-    cta_layout(cta_coord) *
-    (size(tma_layout_v) / cosize(cta_layout));
-```
-
-也就是说，`cta_layout` 决定当前 CTA 在 TMA mode 上从哪里开始搬。如果 multicast group 有 2 个 CTA，`cta_layout(0)=0`、`cta_layout(1)=1`，那么两个 CTA 可以分别从 TMA mode 的前半段和后半段开始。
-
-`Tensor<SEngine,SLayout> const& stensor` 描述的是：
-
-```text
-TMA 要写入的 shared-memory 目标 tensor
-```
-
-教程里传入的是：
-
-```cpp
-group_modes<0,2>(sA)
-```
-
-因为原始 `sA` 是：
-
-```text
-(BLK_M, BLK_K, PIPE)
-```
-
-而 TMA 把 `(BLK_M, BLK_K)` 当成一整块 tile 来搬，所以先 group 成：
-
-```text
-((BLK_M, BLK_K), PIPE)
-```
-
-于是 `stensor` 的第 0 个 mode 就是完整 TMA tile，后面的 mode 是剩余维度，比如 pipeline stage。源码里使用 `layout<0>(stensor)`，就是为了只拿这个 TMA tile mode 的 SMEM layout，去掉 swizzle 后求右逆，从而找到 TMA 能连续写入的向量形状。
-
-这也是为什么 `stensor` 必须和 `gtensors...` 的第 0 维大小一致：
-
-```cpp
-CUTE_STATIC_ASSERT_V(size<0>(stensor) == size<0>(tensor));
-```
-
-SMEM 第 0 维表示“我要写多少”，GMEM 第 0 维表示“我要读多少”，这两个 TMA tile mode 必须对得上。
-
-#### 为什么这里是 `Int<0>{}, Layout<_1>{}`
-
-教程注释里也写了：`Int<0>, Layout<_1>` 表示 TMA 不做 multicast。
-
-```cpp
-auto [tAgA, tAsA] = tma_partition(
-    tma_a,
-    Int<0>{},      // 当前 CTA 的 multicast 坐标。
-    Layout<_1>{},  // 只有一个 logical multicast id：0。
-    sA_tma,
-    gA_tma);
-```
-
-逐个看：
-
-- `Int<0>{}`：当前 CTA 在 multicast 分工坐标里就是 0 号。因为没有其他 CTA 一起分工，所以只能是 0。
-- `Layout<_1>{}`：这个 layout 的坐标域只有 1 个点，因此只能把 0 映射到 0。
-- `cosize(Layout<_1>{}) = 1`：multicast group 大小是 1。
-- `multicast_offset = 0 * (T / 1) = 0`：当前 CTA 不需要在 TMA mode 上额外偏移。
-
-源码还提供了一个非 multicast 默认重载：
-
-```cpp
-/**
- * @brief 非 multicast 场景的简化重载。
- *
- * @details
- * 等价于 `cta_coord = Int<0>{}`，
- * `cta_layout = Layout<_1,_0>{}`。
+ * @brief 用一个逻辑参与者对一个源 Tensor 和一个 shared Tensor 做分区。
+ * @tparam Args Atom 的模板参数。
+ * @tparam SEngine shared Tensor 的存储引擎类型。
+ * @tparam SLayout shared Tensor 的布局类型。
+ * @tparam GEngine 源 Tensor 的存储引擎类型；TMA load 示例为坐标引擎。
+ * @tparam GLayout 源 Tensor 的布局类型。
+ * @param copy_atom 已构造的 TMA Atom。
+ * @param stensor shared Tensor，第 0 个 mode 覆盖完整 tile。
+ * @param gtensor 源 Tensor，第 0 个 mode 覆盖对应 tile。
+ * @return (源分区, shared 分区)。
  */
 template <class... Args,
           class SEngine, class SLayout,
           class GEngine, class GLayout>
 CUTE_DEVICE
-auto
-tma_partition(Copy_Atom<Args...>      const& copy_atom,
-              Tensor<SEngine,SLayout> const& stensor,
-              Tensor<GEngine,GLayout> const& gtensor)
-{
-  return tma_partition(copy_atom,
-                       Int<0>{},
-                       Layout<_1,_0>{},
-                       stensor,
-                       gtensor);
+auto tma_partition(Copy_Atom<Args...> const& copy_atom,
+                   Tensor<SEngine, SLayout> const& stensor,
+                   Tensor<GEngine, GLayout> const& gtensor) {
+    // 固定逻辑参与者坐标为 0，参与者布局为 size 1、stride 0。
+    return tma_partition(
+        copy_atom, Int<0>{}, Layout<_1, _0>{}, stensor, gtensor);
 }
 ```
 
-对单点 layout 来说，`Layout<_1>{}` 和 `Layout<_1,_0>{}` 都只会把唯一坐标 0 映射到 0。教程显式写 `Int<0>{}, Layout<_1>{}`，是为了把“这里没有 multicast”这件事直接暴露在调用点。
-
-`make_tma_atom` 完成后，host 侧得到的 `tmaA` / `tmaB` 已经带了 tensor map descriptor，但还没有进入具体 CTA 的 tile，也没有绑定 mbarrier。因此它的使用分成三步：
-
-1. **生成 TMA 坐标 tensor**：`Tensor mA = tma_a.get_tma_tensor(make_shape(M,K))`。
-2. **切出当前 CTA tile**：`Tensor gA = local_tile(..., cta_coord, Step<...>{})`。
-3. **TMA 专用 partition**：`auto [tAgA, tAsA] = tma_partition(tma_a, ..., group_modes(...), group_modes(...))`。
-
-完整地串起来就是：
+因此示例中的两种写法等价：
 
 ```cpp
-/**
- * @brief `make_tma_atom` 路线从 descriptor 到可 copy tensor 的完整路径。
- */
-Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                  // (M,K)
-Tensor gA = local_tile(mA, cta_tiler, cta_coord,
-                       Step<_1, X,_1>{});                          // (BLK_M,BLK_K,k)
-Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()),
-                        SmemLayoutA{});                            // (BLK_M,BLK_K,PIPE)
-
-auto gA_tma = group_modes<0,2>(gA);                                 // ((BLK_M,BLK_K),k)
-auto sA_tma = group_modes<0,2>(sA);                                 // ((BLK_M,BLK_K),PIPE)
-
-auto [tAgA, tAsA] =
-    tma_partition(tma_a, Int<0>{}, Layout<_1>{},
-                  sA_tma, gA_tma);                                  // (TMA,k), (TMA,PIPE)
+// 三参数重载，内部补上单参与者的坐标与布局。
+auto [source_partition, shared_partition] =
+    tma_partition(tma, grouped_shared, grouped_global);
 ```
 
-这段里每个模板参数都可以从实参推导：
+展开后的显式形式为：
 
-| `tma_partition` 模板参数 | 示例实参 | 含义 |
-| --- | --- | --- |
-| `Args...` | `tma_a` 的 `Copy_Atom<Args...>` | 里面包含 descriptor、TMA 每条指令的元素数、aux stride 等。 |
-| `CtaCoord` | `Int<0>{}` | 当前 CTA 在 multicast 分工里的坐标。这里不 multicast，所以坐标固定是 0。 |
-| `TShape` / `TStride` | `Layout<_1>{}` | `cta_layout` 的类型。这里只有 1 个 logical TMA id，映射结果只能是 0。 |
-| `SEngine` / `SLayout` | `sA_tma` | grouped 后的 SMEM tensor，形状是 `((BLK_M,BLK_K), PIPE)`。第 0 维是 TMA tile mode。 |
-| `GTensors...` | `gA_tma` | grouped 后的 GMEM coordinate tensor，形状是 `((BLK_M,BLK_K), k)`。可以有多个 GMEM tensor。 |
+```cpp
+auto [source_partition, shared_partition] =
+    tma_partition(
+        tma, Int<0>{}, Layout<_1, _0>{}, grouped_shared, grouped_global);
+```
 
-这样看，`make_tma_atom` 不是“创建一个神秘对象”，而是把 **CUDA tensor map descriptor** 放进 CuTe copy atom，后续再通过 `get_tma_tensor` 和 `tma_partition` 接回 CuTe Tensor 代数。
+本例中 `Layout<_1>` 的默认 stride 为 `_0`，所以也可以写成你提到的 `Int<0>{}, Layout<_1>{}`。这个重载固定了分区协议中的逻辑参与者信息；它直接转发到显式版本。需要 CTA 协作分块或同时分区多个源 Tensor 时，使用显式版本传入相应参数。
 
-### GEMM 便捷封装
+下面是显式版本的完整分区逻辑，增加中文注释：
 
-`copy_traits_sm90_tma.hpp` 里还提供了 GEMM 语义更强的封装：
+```cpp
+template <class... Args,
+          class CtaCoord, class TShape, class TStride,
+          class SEngine, class SLayout,
+          class... GTensors,
+          __CUTE_REQUIRES(conjunction_v<is_tensor<GTensors>...>)>
+CUTE_DEVICE
+auto tma_partition(Copy_Atom<Args...> const& copy_atom,
+                   CtaCoord const& cta_coord,
+                   Layout<TShape, TStride> const& cta_layout,
+                   Tensor<SEngine, SLayout> const& stensor,
+                   GTensors const&... gtensors) {
+    // shared 连续存储顺序 -> tile 内逻辑索引。
+    Layout inv_smem_layout =
+        right_inverse(get_nonswizzle_portion(layout<0>(stensor)));
+    Layout layout_v =
+        tile_to_shape(make_layout(inv_smem_layout), size<0>(stensor));
 
-| API | 保留的 CTA tile mode | multicast 方向 | 典型用途 |
-| --- | --- | --- | --- |
-| `make_tma_copy_A_sm90` | 从 `MNK` 中移除 `N`，保留 `MK`。 | 沿 `N` 方向 multicast。 | A operand load。 |
-| `make_tma_copy_B_sm90` | 从 `MNK` 中移除 `M`，保留 `NK`。 | 沿 `M` 方向 multicast。 | B operand load。 |
-| `make_tma_copy_C_sm90` | 从 `MNK` 中移除 `K`，保留 `MN`。 | 不做 multicast。 | C / epilogue load-store。 |
+    // 将 tile 拆成 (Atom 元素, Atom 迭代)，其余 mode 保留。
+    Layout tma_layout_v =
+        make_layout(Int<Copy_Atom<Args...>::NumValSrc>{});
+    auto layout_V = make_tile(logical_divide(layout_v, tma_layout_v));
 
-例如 A operand：
+    // 协作 CTA 对应的源、目标起点偏移；本例为 0。
+    auto multicast_offset =
+        cta_layout(cta_coord) * (size(tma_layout_v) / cosize(cta_layout));
+    auto multicast_coord = make_coord(make_coord(multicast_offset, Int<0>{}));
+
+    // 源先返回，shared 最后返回，二者使用同一分区变换。
+    return cute::transform(make_tuple(gtensors..., stensor), [&](auto&& tensor) {
+        auto R = rank(tensor);
+        CUTE_STATIC_ASSERT_V(size<0>(stensor) == size<0>(tensor));
+
+        auto tlayout_V = append<R>(layout_V, _);
+        Tensor tensor_v =
+            coalesce(tensor.compose(tlayout_V), Shape<Shape<_1, _1>>{});
+
+        auto coord = append<R>(multicast_coord, Int<0>{});
+        return domain_offset(coord, tensor_v);
+    });
+}
+```
+
+本例 `inv_smem_layout` 为 `Layout<Shape<_32, _8>, Stride<_8, _1>>`。它沿 shared 的连续存储顺序遍历，并将该顺序转换为逻辑 `(row, col)` 布局的线性索引。例如 shared 元素偏移 1 是逻辑位置 `(0, 1)`，在 `(8, 32)` 逻辑 shape 的 CuTe 线性编号中为 8；shared 元素偏移 32 是逻辑位置 `(1, 0)`，逻辑线性编号为 1。
+
+`tma_layout_v` 为 `Layout<_256, _1>`，用于表达 Atom 的 256 个元素。一个 tile 恰好包含一个 Atom，Atom 迭代数为 1。
+
+最容易用错的是传入形状。shared 数据原来是 `(8, 32)`，先用 `group_modes<0, 2>` 变为 `((8, 32))`。这样第 0 个 mode 覆盖全部 256 个元素；源 tile 做相同分组。直接传入未分组的 `(8, 32)`，第 0 个 mode 就只有 8 个元素。
+
+### Atom 路径的 device 示例
+
+下面示例接收前面 host 工厂构造的 Atom，加载选定 tile 并写入连续的输出存储：
 
 ```cpp
 /**
- * @brief 为 GEMM A operand 构造 SM90 TMA copy。
+ * @brief 一个 CTA 用 Atom 路径读取行 16～23、列 32～63 的 tile。
+ * @tparam TmaAtom make_example_tma_atom 返回的 Atom 类型。
+ * @param tma 按值传入的 kernel 常量参数，包含有效的输入 descriptor。
+ * @param output_device device 输出指针，至少 256 个 float，布局为 8 行 × 32 列。
  *
- * @details
- * A 的逻辑 tile 是 `(M,K)`，所以从主循环的 `(M,N,K)` CTA tiler 中移除 N。
- * 如果 cluster 在 N 方向有多个 CTA，这些 CTA 可以共享同一个 A tile，
- * 因此 A load 可以沿 N 方向 multicast。
+ * grid 为一个 CTA，block 为 128 个线程；线程 0 发射 TMA，
+ * 全体线程等待 full，然后各自输出两个 shared 元素。
  */
+template <class TmaAtom>
+__global__ void copyTmaTileAtomKernel(
+    CUTE_GRID_CONSTANT TmaAtom const tma,
+    float* __restrict__ output_device) {
+    __shared__ TmaTileStorage storage;
+    const int thread_id = static_cast<int>(threadIdx.x);
+
+    auto shared_tensor =
+        make_tensor(make_smem_ptr(storage.values), TileLayout{});
+    auto coordinate_tensor = tma.get_tma_tensor(GlobalShape{});
+    auto global_tile =
+        local_tile(coordinate_tensor, TileShape{}, make_coord(_2{}, _1{}));
+
+    // tma_partition 的第 0 个 mode 必须包含完整 tile。
+    auto grouped_shared = group_modes<0, 2>(shared_tensor);
+    auto grouped_global = group_modes<0, 2>(global_tile);
+    auto [source_partition, shared_partition] =
+        tma_partition(tma, grouped_shared, grouped_global);
+
+    if (thread_id == 0) {
+        initialize_barrier(storage.full_barrier, 1);
+    }
+    cutlass::arch::fence_barrier_init();
+    __syncthreads();  // 全体线程使用初始化后的 barrier。
+
+    if (thread_id == 0) {
+        set_barrier_transaction_bytes(storage.full_barrier, 1024);
+        copy(tma.with(storage.full_barrier),
+             source_partition, shared_partition);
+    }
+
+    // 当前只使用一轮：等待初始化 phase 0 完成。
+    wait_barrier(storage.full_barrier, 0);
+    for (int idx = thread_id; idx < 256; idx += 128) {
+        output_device[idx] = storage.values[idx];
+    }
+}
+```
+
+`source_partition` 和 `shared_partition` 的第 0 个 mode 都有 256 个逻辑元素，并保留“一次 Atom、一个 Atom 迭代”的分组。分区将逻辑行、列重排为 shared 的连续存储顺序：每段 32 个连续列元素，共 8 行。源分区可保留该分组，目标的连续元素布局可合并成 256。Atom 的检查使用元素总数，实际解包读取源的第一个 TMA 坐标和目标的起始指针。
+
+沿 shared 的连续存储顺序，两侧的对应关系为：
+
+| fragment 线性索引 | global 逻辑坐标 `(row, col)` | 源 TMA 坐标 `(coord0, coord1)` | shared 元素偏移 |
+| --- | --- | --- | --- |
+| 0 | `(16, 32)` | `(32, 16)` | 0 |
+| 1 | `(16, 33)` | `(33, 16)` | 1 |
+| 31 | `(16, 63)` | `(63, 16)` | 31 |
+| 32 | `(17, 32)` | `(32, 17)` | 32 |
+| 255 | `(23, 63)` | `(63, 23)` | 255 |
+
+分区表达了完整 tile 的对应关系；发射线程只取起始坐标 `(32, 16)` 和 shared 起始地址，硬件根据 descriptor 搬完这 256 个元素。
+
+### with(barrier) 后的具体类型
+
+调用 `tma.with(storage.full_barrier)` 时先执行 Traits 的 `with`，再由 Atom 的 `with` 包成一个新的 Atom：
+
+```cpp
+using ExampleExecutableTraits =
+    Copy_Traits<SM90_TMA_LOAD_OP, Int<8192>>;
+using ExampleExecutableAtom =
+    Copy_Atom<ExampleExecutableTraits, float>;
+```
+
+执行态 Traits 的源码如下：
+
+```cpp
+template <class NumBitsPerTMA>
+struct Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
+    : TMA_LOAD_Unpack<SM90_TMA_LOAD_OP, NumBitsPerTMA> {
+    using ThrID = Layout<_1>;
+    using SrcLayout = Layout<Shape<_1, NumBitsPerTMA>>;
+    using DstLayout = Layout<Shape<_1, NumBitsPerTMA>>;
+    using RefLayout = SrcLayout;
+
+    // 执行态借用 descriptor 和 shared barrier。
+    tuple<TmaDescriptor const*, uint64_t*, uint64_t> const opargs_;
+
+    CUTE_HOST_DEVICE
+    Copy_Traits(TmaDescriptor const* desc, uint64_t* mbar, uint64_t cache)
+        : opargs_(desc, mbar, cache) {}
+
+    CUTE_HOST_DEVICE constexpr
+    TmaDescriptor const* get_tma_descriptor() const {
+        return get<0>(opargs_);
+    }
+};
+```
+
+| 执行态对象内容 | 本例具体内容 |
+| --- | --- |
+| `ThrID`、`SrcLayout`、`DstLayout`、`RefLayout` | 与构造态 Traits 相同，仍为 1 个逻辑参与者和 8192 bit。 |
+| Atom 的 `Traits` | 改为 `ExampleExecutableTraits`。 |
+| Atom 的 `ValType`、`ValLayoutSrc/Dst/Ref`、`NumValSrc/Dst` | 仍为 `float`、`(1, 256):(0, 1)` 和 256。 |
+| `opargs_` 的第 0 项 | 指向原对象 `tma_desc_` 的 `TmaDescriptor const*`。 |
+| `opargs_` 的第 1 项 | 指向 `storage.full_barrier` 的 `uint64_t*`。 |
+| `opargs_` 的第 2 项 | `uint64_t` cache hint，默认 `EVICT_NORMAL`。 |
+
+构造态 Traits 持有 descriptor 和坐标辅助信息；执行态 Traits 保存调用所需的指针与 cache hint。原 `tma` 的 descriptor 必须在指令读取它时保持有效。示例用 `CUTE_GRID_CONSTANT` 标注 const kernel 参数，让它的地址指向 kernel 参数存储，避免取址时生成线程局部副本。
+
+普通 `SM90_TMA_LOAD` 的 `with` 接受一个默认值为 0 的 `multicast_mask` 参数，目的是统一接口形式；这个普通 load 特化只将 descriptor、barrier 和 cache hint 放入 `opargs_`。使用 multicast 操作时，Traits 选择 `SM90_TMA_LOAD_MULTICAST`，其执行态才会将 mask 作为指令参数保存。
+
+### copy 如何落回熟悉的 PTX
+
+`copy` 对 rank-1 分区调用 `Copy_Atom::call`。当 fragment 的元素数匹配 `NumValSrc/Dst` 时，Atom 执行：
+
+```cpp
+copy_unpack(static_cast<Traits const&>(*this), src, dst);
+```
+
+执行态 Traits 继承的 `TMA_LOAD_Unpack` 提供这个解包函数。其关键源码如下：
+
+```cpp
+template <class CopyOp, class... Args>
+struct TMA_LOAD_Unpack {
+    template <class TS, class SLayout, class TD, class DLayout>
+    CUTE_HOST_DEVICE friend constexpr void
+    copy_unpack(Copy_Traits<CopyOp, Args...> const& traits,
+                Tensor<TS, SLayout> const& src,
+                Tensor<TD, DLayout>& dst) {
+        static_assert(is_smem<TD>::value,
+                      "SM90_TMA_LOAD requires the destination be shared memory.");
+
+        auto src_coord = src(Int<0>{});  // 本次 box 的起始 TMA 坐标。
+        void* dst_ptr = cute::raw_pointer_cast(dst.data());
+
+        // 依次展开固定操作参数、shared 地址和各维坐标。
+        return detail::explode_tuple(
+            detail::CallCOPY<CopyOp>{},
+            traits.opargs_, tuple_seq<decltype(traits.opargs_)>{},
+            make_tuple(dst_ptr), seq<0>{},
+            src_coord, tuple_seq<decltype(src_coord)>{});
+    }
+};
+```
+
+本例展开后等价于调用：
+
+```cpp
+SM90_TMA_LOAD_2D::copy(
+    tma.get_tma_descriptor(),
+    &storage.full_barrier,
+    static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_NORMAL),
+    storage.values,
+    32, 16);
+```
+
+| PTX 操作数 | CuTe 提供它的位置 |
+| --- | --- |
+| `tensor_map` | 原 Traits 的 `tma_desc_`，执行态保存其地址。 |
+| `coord0, coord1` | `source_partition(0)`，本例为 `(32, 16)`。 |
+| `dst_smem` | `shared_partition.data()`，本例为 `storage.values` 起点。 |
+| `mbar` | `.with(storage.full_barrier)`。 |
+| `cache_policy` | `.with` 的 cache hint 参数。 |
+
+`.with` 只构造执行参数，`copy` 发射 TMA。barrier 的初始化、arrival + expect-tx 和等待由调用方完成，示例中的三个相关调用分别对应前面已讲过的 PTX。
+
+## make_tma_copy：构造 TiledCopy，再取逻辑参与者的分区
+
+### host 端构造与重载
+
+第二条路径使用相同的输入：
+
+```cpp
+/**
+ * @brief 为同一二维矩阵构造包含 tile 映射的 TiledCopy。
+ * @param input_device device 指针，借用只读输入矩阵，包含 64 × 128 个 float。
+ * @return 按值包含 TMA Atom 和静态 tile 映射类型的 TiledCopy。
+ */
+auto make_example_tma_copy(float const* input_device) {
+    auto global_tensor =
+        make_tensor(make_gmem_ptr(input_device), GlobalLayout{});
+
+    return make_tma_copy(
+        SM90_TMA_LOAD{}, global_tensor, TileLayout{}, TileShape{}, Int<1>{});
+}
+```
+
+相关重载如下：
+
+| 调用参数 | CTA tile 的来源 | 协作 CTA 数 |
+| --- | --- | --- |
+| `(op, gtensor, slayout)` | `product_each(shape(slayout))`。 | `Int<1>{}`。 |
+| `(op, gtensor, slayout, cluster_size)` | `product_each(shape(slayout))`。 | 显式参数。 |
+| `(op, gtensor, slayout, cta_tiler, cluster_size)` | 显式参数。 | 显式参数。 |
+
+所以四参数重载中的最后一项是 `cluster_size`。需要显式传 `cta_tiler` 时，使用五参数形式。
+
+普通 SM90 load 的工厂分支源码如下，省略 im2col 分支：
+
+```cpp
 template <class TmaInternalType = void,
           class CopyOp,
           class GEngine, class GLayout,
@@ -2509,1890 +3145,390 @@ template <class TmaInternalType = void,
           class CTA_Tiler,
           class Cluster_Size>
 CUTE_HOST_RTC
-auto make_tma_copy_A_sm90(CopyOp const& copy_op,
-                          Tensor<GEngine,GLayout> const& gtensor,
-                          SLayout const& slayout,
-                          CTA_Tiler const& cta_tiler,
-                          Cluster_Size const& cluster_size) {
-    auto cta_tiler_mk = remove<1>(cta_tiler);
-    auto cluster_size_n = size<1>(cluster_size);
-    auto cta_v_tile = make_identity_layout(shape(gtensor)).compose(cta_tiler_mk);
-    auto cta_t_tile = make_layout(cluster_size_n);
-    using TmaType = conditional_t<is_same<void, TmaInternalType>::value,
-                                  typename GEngine::value_type,
-                                  TmaInternalType>;
+auto make_tma_copy(CopyOp const& copy_op,
+                   Tensor<GEngine, GLayout> const& gtensor,
+                   SLayout const& slayout,
+                   CTA_Tiler const& cta_tiler,
+                   Cluster_Size const& cluster_size) {
+    auto cta_v_tile =
+        make_identity_layout(shape(gtensor)).compose(cta_tiler);
+    auto cta_t_tile = make_layout(cluster_size);
+
+    using TmaType = conditional_t<
+        is_same<void, TmaInternalType>::value,
+        typename GEngine::value_type, TmaInternalType>;
+
     return detail::make_tma_copy_tiled<TmaType>(
         copy_op, gtensor, slayout, cta_t_tile, cta_v_tile);
 }
 ```
 
-## multicast layout
+`cta_v_tile` 与前一条路径相同。新增的 `cta_t_tile` 是 `Layout<_1, _0>`：它把唯一的逻辑参与者映射到编号 0。
 
-前面已经把 `tma_partition` 原型里的 `cta_layout` 定位成 multicast 分工 layout。这里再展开一点，尤其是 2 个 CTA 共同发起 multicast TMA load 时它到底怎么用。
+### make_tma_copy_tiled 如何增加布局
 
-这个名字很容易误导人，因为它不是 A/B/C 矩阵的元素 layout，也不是 shared memory 的 swizzle layout。它描述的是 **cluster 内 CTA 到 TMA multicast 逻辑编号的映射**。
-
-可以把它写成一个很小的函数：
-
-$$
-\text{cta\_layout}: \text{cta\_coord} \rightarrow \text{logical\_tma\_tid}
-$$
-
-这里：
-
-- `cta_coord` 是当前 CTA 在 multicast group 里的坐标。例如沿 N 方向有两个 CTA 共享同一块 A tile，那么 `cta_coord` 可以是 `0` 或 `1`。
-- `logical_tma_tid` 是 CuTe 给 TMA partition 用的逻辑编号。它决定当前 CTA 在一个 TMA tile 里负责哪一段。
-- `cosize(cta_layout)` 是 multicast group 的大小，也就是这次 TMA tile 要被拆给几个 CTA 一起发起。
-
-源码里的注释说得很直接：
+下面摘录 [`make_tma_copy_tiled`](https://github.com/NVIDIA/cutlass/blob/e406c186f510a15091cce01f782020ceb7ba8eb5/include/cute/atom/copy_traits_sm90_tma.hpp#L1208) 的主体，保留布局构造：
 
 ```cpp
-// The "logical TMA tid" is a map from the CTA rank to its logical id
-// within the instruction. It works like a mask or ordering on the CTAs.
-// For non-multicast TMA, all CTAs should map to 0. For multicast TMA
-// of size 4, CTAs will be mapped to {0,1,2,3}.
+Copy_Atom atom = make_tma_copy_atom<TmaInternalType>(
+    copy_op, gtensor, slayout, cosize(cta_t_map), cta_v_map);
+
+// 整个 tile 的逻辑形状。
+auto cta_tiler = product_each(shape(cta_v_map));
+
+// Traits 的 RefLayout 以 bit 计数，这里转换成 global 元素数。
+auto num_elems_per_tma =
+    size<1>(typename decltype(atom)::RefLayout{}) /
+    static_value<sizeof_bits<typename GEngine::value_type>>();
+
+// shared 元素存储顺序 -> tile 的线性逻辑索引。
+auto inv_smem_layout = right_inverse(get_nonswizzle_portion(slayout));
+
+// 一个 Atom 的元素映射，并扩展到整个 tile。
+auto layout_v = composition(inv_smem_layout, num_elems_per_tma);
+auto layout_V = tile_to_shape(make_layout(layout_v), size(cta_v_map));
+
+// 逻辑参与者编号 -> 它在 tile 中的起点。
+auto layout_t =
+    make_layout(cosize(cta_t_map),
+                safe_div(num_elems_per_tma, cosize(cta_t_map)));
+auto layout_T =
+    composition(inv_smem_layout, composition(layout_t, cta_t_map));
+
+// 合成 (逻辑参与者, 元素) -> tile 线性逻辑索引。
+auto layout_TV = make_layout(layout_T, layout_V);
+
+return TiledCopy<
+    decltype(atom), decltype(layout_TV), decltype(cta_tiler)>{atom};
 ```
 
-翻译成 CuTe 视角就是：`multicast layout` 不是为了算元素地址，而是为了告诉 `tma_partition`：**当前 CTA 是 multicast group 里的第几号 TMA producer**。
+本例沿这些语句得到：
 
-### 它和 multicast mask 的区别
+| 中间对象 | 本例结果 |
+| --- | --- |
+| `atom` | 前面的 `ExampleLoadAtom`。 |
+| `cta_tiler` | `Shape<_8, _32>`，逻辑行、列形状。 |
+| `num_elems_per_tma` | `Int<256>`。 |
+| `inv_smem_layout` | `Layout<Shape<_32, _8>, Stride<_8, _1>>`。 |
+| `layout_v` | `Layout<Shape<_32, _8>, Stride<_8, _1>>`。 |
+| `layout_V` | shape 为 `(((32, 8), 1))`，stride 为 `(((8, 1), 0))`。 |
+| `layout_t` | `Layout<_1, _256>`；只有编号 0。 |
+| `layout_T` | `Layout<_1, _0>`；编号 0 对应 tile 起点。 |
+| `layout_TV` | shape 为 `(1, (((32, 8), 1)))`，stride 为 `(0, (((8, 1), 0)))`。 |
 
-TMA multicast 里有两个问题，经常被混在一起：
+`layout_v` 将连续存储顺序转换为逻辑 tile 索引：它的第一个子维枚举连续的 32 列，每步逻辑索引增加 8；第二个子维枚举 8 行，每步逻辑索引增加 1。`make_layout(layout_v)` 将它包成一个 mode，`tile_to_shape` 再保留 block / repeat 分组。`layout_V` 的总元素数为 256，repeat 数为 1。
 
-| 问题 | CuTe 里对应什么 | 回答的语义 |
+把类型写全：
+
+```cpp
+// 一个 Atom 按连续存储顺序枚举 tile，返回逻辑 tile 的线性索引。
+using ExampleAtomValueMap =
+    Layout<Shape<_32, _8>, Stride<_8, _1>>;
+
+// layout_V：外层一个 mode，内部为 (Atom 元素分组, repeat)。
+using ExampleLayoutV =
+    Layout<Shape<Shape<Shape<_32, _8>, _1>>,
+           Stride<Stride<Stride<_8, _1>, _0>>>;
+
+// layout_TV：第 0 个 mode 是参与者，第 1 个 mode 是元素分组。
+using ExampleLayoutTV =
+    Layout<Shape<_1, Shape<Shape<Shape<_32, _8>, _1>>>,
+           Stride<_0, Stride<Stride<Stride<_8, _1>, _0>>>>;
+
+using ExampleTiledCopy =
+    TiledCopy<ExampleLoadAtom, ExampleLayoutTV, Shape<_8, _32>>;
+```
+
+例如参与者 0 的连续元素编号 0、1、32，经这个映射分别得到逻辑 tile 索引 0、8、1，对应 tile 内逻辑坐标 `(0, 0)`、`(0, 1)`、`(1, 0)`。再作用于 `TileLayout = (8, 32):(32, 1)`，得到 shared 元素偏移 0、1、32。`ExampleLayoutTV` 表达的是这个重排；Atom 自身的元素布局仍为 `(1, 256):(0, 1)`。
+
+### TiledCopy 的 using 展开
+
+`TiledCopy` 继承 Atom，相关定义为：
+
+```cpp
+template <class Copy_Atom,
+          class LayoutCopy_TV,
+          class ShapeTiler_MN>
+struct TiledCopy : Copy_Atom {
+    using AtomThrID = typename Copy_Atom::ThrID;
+    using AtomLayoutSrc = typename Copy_Atom::ValLayoutSrc;
+    using AtomLayoutDst = typename Copy_Atom::ValLayoutDst;
+    using AtomLayoutRef = typename Copy_Atom::ValLayoutRef;
+
+    using AtomNumThr = decltype(size<0>(AtomLayoutRef{}));
+    using AtomNumVal = decltype(size<1>(AtomLayoutRef{}));
+
+    using Tiler_MN = ShapeTiler_MN;
+    using TiledLayout_TV = LayoutCopy_TV;
+    using TiledNumThr = decltype(size<0>(TiledLayout_TV{}));
+    using TiledNumVal = decltype(size<1>(TiledLayout_TV{}));
+
+    // 省略布局分区、retile 和静态检查，下面展示 slice 分区接口。
+};
+```
+
+| TiledCopy 的别名 | 本例具体类型 | 含义 |
 | --- | --- | --- |
-| 当前 CTA 负责发起哪一片 TMA copy？ | `cta_layout(cta_coord)` | TMA tile 在 TMA mode 上怎么分片。 |
-| 这条 TMA 指令写到哪些 CTA 的 shared memory？ | `multicast_mask` | cluster 中哪些 CTA 接收这次 copy。 |
+| `AtomThrID` | `Layout<_1, _0>` | Atom 的一个逻辑参与者。 |
+| `AtomLayoutSrc`、`AtomLayoutDst`、`AtomLayoutRef` | `Layout<Shape<_1, _256>, Stride<_0, _1>>` | Atom 的元素布局。 |
+| `AtomNumThr` | `Int<1>` | 每个 Atom 的逻辑参与者数。 |
+| `AtomNumVal` | `Int<256>` | 每个 Atom 的元素数。 |
+| `Tiler_MN` | `Shape<_8, _32>` | 整个 copy tile 的行、列形状。 |
+| `TiledLayout_TV` | `ExampleLayoutTV` | 逻辑参与者 / 元素到 tile 的映射。 |
+| `TiledNumThr` | `Int<1>` | 整个 tile 的逻辑参与者数。 |
+| `TiledNumVal` | `Int<256>` | 每个参与者在 tile 中的逻辑元素数。 |
+| 继承的 `Traits` | `ExampleLoadTraits` | 与 Atom 路径相同的 TMA Traits。 |
+| 继承的 `ValType`、`NumValSrc/Dst` | `float`、256 | 与 Atom 路径相同。 |
 
-也就是说：
+`AtomNumThr` 等是**类型别名**，例如可以写 `AtomNumThr{}` 取得编译期常量对象。前面的 `Copy_Atom::NumValSrc` 则是 `static constexpr int` 数值成员。
 
-- **multicast layout 管分工**：CTA 0 搬第 0 片，CTA 1 搬第 1 片，依此类推。
-- **multicast mask 管广播目标**：当前这条 `cp.async.bulk.tensor...multicast::cluster` 要写到哪些 CTA 的 SMEM。
+### get_slice(0) 表示什么，ThrCopy 保存什么
 
-如果有 2 个 CTA 沿 N 方向共享同一块 A tile，一个常见协议是：
-
-1. CTA 0 根据 `cta_layout(0) = 0`，发起 A tile 的前半片 TMA load。
-2. CTA 1 根据 `cta_layout(1) = 1`，发起 A tile 的后半片 TMA load。
-3. 两条 TMA 指令都带同一个 `multicast_mask = 0b0011`，表示 CTA 0 和 CTA 1 都接收。
-4. 两条 TMA 都完成后，CTA 0 和 CTA 1 的 shared memory 里都有完整的 A tile。
-
-所以，**multicast 并不只是“一个 CTA 把整块数据广播给别人”**。在 CuTe 的 TMA partition 模型里，更常见的理解是：多个 CTA 把一个逻辑 TMA tile 分片发起，每个分片再 multicast 给同一组接收 CTA。
-
-### 非 multicast 的最小例子
-
-教程源码里写的是：
+本例一个 CTA 发射一个逻辑 TMA，所以 device 端选择编号 0：
 
 ```cpp
-auto [tAgA, tAsA] = tma_partition(
-    tma_a,
-    Int<0>{},      // 当前 CTA 的 multicast 坐标。
-    Layout<_1>{},  // 只有 1 个 logical TMA tid：0。
-    sA_tma,
-    gA_tma);
+auto cta_copy = tma.get_slice(Int<0>{});
 ```
 
-这个 `Layout<_1>{}` 可以理解成：
+TMA 工厂生成的参与者映射用于 CTA 协作分区。本例的 slice 0 对应整个 tile，随后仍由一个选定线程实际发射指令。CTA 中的 128 个线程是发射、等待和消费协议的参与者。
 
-$$
-\text{cta\_layout}(0) = 0
-$$
-
-因此：
-
-- `cosize(cta_layout) = 1`，TMA tile 不需要拆给多个 CTA。
-- `cta_layout(Int<0>{}) = 0`，当前 CTA 的 logical TMA id 是 0。
-- `multicast_offset = 0`，`tma_partition` 不会给 TMA mode 加额外偏移。
-
-这就是不做 multicast 的含义。源码里的默认重载也走同样逻辑，只是默认 layout 写成 `Layout<_1,_0>{}`：
+`get_slice` 与 `ThrCopy` 的相关源码为：
 
 ```cpp
-return tma_partition(copy_atom, Int<0>{}, Layout<_1,_0>{}, stensor, gtensor);
-```
-
-对单元素 layout 来说，`Layout<_1>{}` 和 `Layout<_1,_0>{}` 都只会把唯一坐标 0 映射到 0，所以教程里直接写 `Layout<_1>{}`。
-
-### 2 个 CTA multicast 的例子
-
-假设一个 cluster 在 N 方向有 2 个 CTA，它们计算不同的 C tile：
-
-```cpp
-// CTA 0: 负责 C 的 (m, n0) tile
-// CTA 1: 负责 C 的 (m, n1) tile
-```
-
-这两个 CTA 的 A operand 都是同一块 `(BLK_M, BLK_K)`，因为 A 不依赖 N。因此 A load 可以沿 N 方向 multicast。
-
-在这个场景里，可以用一个一维 multicast layout：
-
-```cpp
-using CtaLayoutN = Layout<Shape<_2>, Stride<_1>>;
-
-CtaLayoutN cta_layout_n{};
-
-// cta_layout_n(0) = 0
-// cta_layout_n(1) = 1
-```
-
-它的含义是：
-
-| `cta_coord` | `cta_layout_n(cta_coord)` | 当前 CTA 负责的 TMA 片段 |
-| --- | --- | --- |
-| `0` | `0` | 第 0 片。 |
-| `1` | `1` | 第 1 片。 |
-
-如果 TMA mode 上一次 logical tile 有 $T$ 个元素，multicast group 大小是 $G = \text{cosize}(\text{cta\_layout}) = 2$，那么每个 CTA 负责：
-
-$$
-\text{local\_span} = \frac{T}{G}
-$$
-
-当前 CTA 的偏移是：
-
-$$
-\text{multicast\_offset}
-= \text{cta\_layout}(\text{cta\_coord}) \times \frac{T}{G}
-$$
-
-这正对应 `tma_partition` 源码里的计算：
-
-```cpp
-auto multicast_offset =
-    cta_layout(cta_coord) * (size(tma_layout_v) / cosize(cta_layout));
-```
-
-所以：
-
-- CTA 0 的 `multicast_offset = 0 * T/2`，从 TMA mode 的前半段开始。
-- CTA 1 的 `multicast_offset = 1 * T/2`，从 TMA mode 的后半段开始。
-
-下面给一个真正把 `make_tma_atom` 和 `tma_partition` 串起来的 multicast 版本。为了让 A 可以沿 N 方向 multicast，先把 cluster 形状改成：
-
-```cpp
-/**
- * @brief 让一个 cluster 里的 2 个 CTA 沿 N 方向排列。
- *
- * @details
- * CTA 0 和 CTA 1 计算相同 M tile、不同 N tile，因此它们共享同一块 A tile。
- */
-dim3 dimCluster(1, 2, 1);
-```
-
-Host 侧构造 A 的 TMA atom 时，要同时改两个地方：
-
-```cpp
-/**
- * @brief 构造 A 的 multicast TMA atom。
- *
- * @details
- * `SM90_TMA_LOAD_MULTICAST{}` 选择 multicast load 指令族。
- * `Int<2>{}` 告诉 descriptor：这次 A tile 会被 2 个 CTA 共同参与。
- */
-Copy_Atom tmaA = make_tma_atom(
-    SM90_TMA_LOAD_MULTICAST{},
-    mA,
-    sA(_,_,0),
-    make_shape(bM,bK),
-    Int<2>{});
-
-/**
- * @brief B 不沿 N 方向共享，所以这里仍然使用普通 TMA load。
- */
-Copy_Atom tmaB = make_tma_atom(
-    SM90_TMA_LOAD{},
-    mB,
-    sB(_,_,0),
-    make_shape(bN,bK));
-```
-
-kernel 侧则要把当前 CTA 在 N 方向 multicast group 里的坐标传给 `tma_partition`：
-
-```cpp
-/**
- * @brief 2 个 CTA 沿 N 方向共同发起 A 的 multicast TMA load。
- *
- * @details
- * 这个片段只展示 A。B 可以继续按普通 TMA load 处理。
- * 对 `dimCluster(1,2,1)` 来说，cluster 内 rank 0/1 正好对应 N 方向坐标 0/1。
- */
-uint32_t cta_rank_in_cluster = cute::block_rank_in_cluster();
-int cta_coord_n = int(cta_rank_in_cluster);  // 取值 0 或 1。
-
-auto cta_layout_n = make_layout(Int<2>{});
-
-Tensor mA = tma_a.get_tma_tensor(make_shape(M,K));                  // (M,K)
-Tensor gA = local_tile(mA, cta_tiler, cta_coord,
-                       Step<_1, X,_1>{});                          // (BLK_M,BLK_K,k)
-Tensor sA = make_tensor(make_smem_ptr(smem.A.begin()),
-                        SmemLayoutA{});                            // (BLK_M,BLK_K,PIPE)
-
-auto gA_tma = group_modes<0,2>(gA);                                 // ((BLK_M,BLK_K),k)
-auto sA_tma = group_modes<0,2>(sA);                                 // ((BLK_M,BLK_K),PIPE)
-
-auto [tAgA, tAsA] = tma_partition(
-    tma_a,
-    cta_coord_n,
-    cta_layout_n,
-    sA_tma,
-    gA_tma);
-
-// 这个最小例子里 cluster 只有 rank 0 和 rank 1 两个 CTA，所以 mask 是 0b0011。
-// 更通用的 GEMM mainloop 通常用 create_tma_multicast_mask(...) 生成这个 mask。
-uint16_t a_multicast_mask = 0b0011;
-
-if (cute::elect_one_sync()) {
-  copy(tma_a.with(producer_mbar[pipe], a_multicast_mask),
-       tAgA(_, k_tile),
-       tAsA(_, pipe));
+// TiledCopy 的静态成员函数。
+template <class ThrIdx,
+          __CUTE_REQUIRES(is_integral<ThrIdx>::value)>
+CUTE_HOST_DEVICE static
+auto get_slice(ThrIdx const& thr_idx) {
+    return ThrCopy<TiledCopy, ThrIdx>(thr_idx);
 }
+
+template <class TiledCopy, class ThrIdx>
+struct ThrCopy {
+    ThrIdx thr_idx_;  // 保存逻辑参与者编号。
+
+    CUTE_HOST_DEVICE
+    ThrCopy(ThrIdx const& thr_idx) : thr_idx_(thr_idx) {}
+
+    template <class STensor>
+    CUTE_HOST_DEVICE
+    auto partition_S(STensor&& stensor) const {
+        auto thr_tensor = make_tensor(
+            static_cast<STensor&&>(stensor).data(),
+            TiledCopy::tidfrg_S(stensor.layout()));
+        return thr_tensor(thr_idx_, _, repeat<rank_v<STensor>>(_));
+    }
+
+    template <class DTensor>
+    CUTE_HOST_DEVICE
+    auto partition_D(DTensor&& dtensor) const {
+        auto thr_tensor = make_tensor(
+            static_cast<DTensor&&>(dtensor).data(),
+            TiledCopy::tidfrg_D(dtensor.layout()));
+        return thr_tensor(thr_idx_, _, repeat<rank_v<DTensor>>(_));
+    }
+};
 ```
 
-这段代码里三处 `2` 必须互相一致：
+本例具体实例化为：
 
-| 位置 | 代码 | 含义 |
+```cpp
+using ExampleCtaCopy = ThrCopy<ExampleTiledCopy, Int<0>>;
+```
+
+它的成员 `thr_idx_` 类型为 `Int<0>`，编号完全静态。如果写 `tma.get_slice(0)`，传入的是运行期整数类型，返回 `ThrCopy<ExampleTiledCopy, int>`，成员 `thr_idx_` 保存数值 0。
+
+`ThrCopy` 保存 slice 编号，`TiledCopy` 的静态类型提供布局；这里分区时使用输入 Tensor 的存储引擎生成视图。输入的数据或坐标原点继续由各自的 Tensor 提供。
+
+### partition_S/D 怎样转换二维 tile
+
+本例的输入按 `(row, col)` 表示，`global_tile` 和 `shared_tensor` 的 shape 都是 `(8, 32)`。沿当前源码的布局运算展开，**两个 partition 的 shape 都是 `(((32, 8), 1), 1, 1)`**：
+
+```cpp
+// 输入 shape：(8, 32)，即 8 行、32 列。
+auto source_partition = cta_copy.partition_S(global_tile);
+auto shared_partition = cta_copy.partition_D(shared_tensor);
+
+// 两者的 shape：(((32, 8), 1), 1, 1)。
+// 第 0 个 mode 是 ((32, 8), 1)，大小为 256。
+// 第 1、2 个 mode 分别是行、列方向的剩余 tile 数，本例都是 1。
+auto source_fragment = source_partition(_, _0{}, _0{});
+auto shared_fragment = shared_partition(_, _0{}, _0{});
+
+// 两个 fragment 的 shape：(((32, 8), 1))。
+// 最外层只有一个 mode，内部仍保留 ((32, 8), 1) 的层次。
+```
+
+**先读懂这几层括号。** 源码把 partition 的结构组织为 `((FrgV, FrgX), RestRow, RestCol)`。在本例中：
+
+| 层次 | 本例 shape | 含义 |
 | --- | --- | --- |
-| cluster launch | `dimCluster(1, 2, 1)` | cluster 里沿 N 方向有 2 个 CTA。 |
-| descriptor 构造 | `make_tma_atom(..., Int<2>{})` | A 的 TMA descriptor 按 2-CTA multicast 规模构造。 |
-| partition 分工 | `make_layout(Int<2>{})` | `tma_partition` 把 TMA mode 分给 2 个 logical TMA id。 |
+| `FrgV` | `(32, 8)` | 一个 Atom 内的 256 个元素。按 shared 存储顺序，先遍历一行的 32 列，再遍历 8 行。 |
+| `FrgX` | `1` | 当前 copy tile 中的 Atom 数。本例一个 Atom 覆盖整个 tile。 |
+| 第 0 个 mode：`(FrgV, FrgX)` | `((32, 8), 1)` | 该逻辑参与者负责的全部 Atom 元素。 |
+| 第 1 个 mode：`RestRow` | `1` | 输入有多少个沿行方向排列的 copy tile，即 `8 / 8 = 1`。 |
+| 第 2 个 mode：`RestCol` | `1` | 输入有多少个沿列方向排列的 copy tile，即 `32 / 32 = 1`。 |
 
-`tma_partition` 只解决“当前 CTA 发哪一片”：
+输入矩阵的维度约定始终是 `(row, col)`。这里 `FrgV` 的 `(32, 8)` 是 Copy 内部的元素组织：shared 的列连续，因此这个内部 mode 的两个子维度依次对应列、行。它来自前面 `ExampleAtomValueMap` 的映射。
 
-```cpp
-cta_coord_n = 0 -> 搬 TMA mode 的前半片
-cta_coord_n = 1 -> 搬 TMA mode 的后半片
-```
-
-`a_multicast_mask` 解决“每一片写给谁”：
+shape 的编译期类型可直接写成：
 
 ```cpp
-a_multicast_mask = 0b0011 -> 每条 TMA 指令都写给 rank 0 和 rank 1
+// 第 0 个 mode：FrgV = (32, 8)，FrgX = 1。
+using ExampleFragmentMode = Shape<Shape<_32, _8>, _1>;
+
+// partition 的三个顶层 mode。
+using ExamplePartitionShape = Shape<ExampleFragmentMode, _1, _1>;
+
+// (_, 0, 0) 保留整个第 0 个 mode，得到 rank 为 1 的 Tensor。
+using ExampleFragmentShape = Shape<ExampleFragmentMode>;
 ```
 
-所以这个 2-CTA A multicast 的完整语义是：
+`source_partition(_, 0, 0)` 中，`_` 保留第 0 个 mode 的全部嵌套结构，两个 `0` 固定行、列 tile 编号。因此取出后的 fragment 含有 256 个元素，shape 为 `(((32, 8), 1))`。
 
-1. CTA 0 发起 A tile 的前半片 TMA load，并 multicast 给 CTA 0 / CTA 1。
-2. CTA 1 发起 A tile 的后半片 TMA load，并 multicast 给 CTA 0 / CTA 1。
-3. 两条 TMA 都完成后，两个 CTA 的 shared memory 里都有完整 A tile。
+**shape 相同，两个视图提供的内容各有用途。** `source_partition` 继承坐标 Tensor 的引擎，为元素生成 TMA 坐标；`shared_partition` 继承 shared Tensor 的引擎，为同一个元素提供 shared 地址。
 
-注意这里 `tma_partition` 只解决“当前 CTA 发哪一片”。`multicast_mask` 仍然要在 `.with(...)` 里传给 executable TMA traits，底层指令才知道这片数据要写到哪些 CTA 的 shared memory。
+本例源 tile 的逻辑起点为 `(row, col) = (16, 32)`，对应 TMA 坐标起点 `(32, 16)`。第 0 个 mode 的索引写成 `((col_in_tile, row_in_tile), atom_idx)`，后两个 mode 固定为 `0, 0`：
 
-### 和 GEMM A/B multicast 方向的关系
-
-GEMM 里判断 multicast 方向时，可以先看 operand 是否依赖某个 CTA tile 维度：
-
-| operand | 逻辑 tile | 不依赖的 CTA 维度 | 可以 multicast 的方向 |
+| 第 0 个 mode 的索引 | tile 内逻辑位置 `(row, col)` | 源 TMA 坐标 `(coord0, coord1)` | shared 元素偏移 |
 | --- | --- | --- | --- |
-| A | `(M,K)` | `N` | cluster 内多个 N tile 可以共享 A。 |
-| B | `(N,K)` | `M` | cluster 内多个 M tile 可以共享 B。 |
-| C | `(M,N)` | 通常不共享 | 一般不做 multicast。 |
+| `((0, 0), 0)` | `(0, 0)` | `(32, 16)` | `0` |
+| `((1, 0), 0)` | `(0, 1)` | `(33, 16)` | `1` |
+| `((0, 1), 0)` | `(1, 0)` | `(32, 17)` | `32` |
+| `((3, 2), 0)` | `(2, 3)` | `(35, 18)` | `67` |
 
-这也是 `make_tma_copy_A_sm90` 和 `make_tma_copy_B_sm90` 的源码逻辑：
+例如 `((3, 2), 0)` 选中了 tile 内第 2 行、第 3 列。源视图将它映射到全局第 18 行、第 35 列；目标视图将它映射到 `storage.values[67]`。两边由同一个 fragment 索引对应起来。
 
-```cpp
-// A: Keep only MK modes from MNK, mcast along N mode for this M load.
-auto cta_tiler_mk = remove<1>(cta_tiler);
-auto cluster_size_n = size<1>(cluster_size);
-auto cta_t_tile = make_layout(cluster_size_n);
+**再对应到源码中的变换。** `tidfrg_S/D` 先按 `Tiler_MN = (8, 32)` 切分 Tensor，`tile2thrfrg` 随后把一个 tile 的行列坐标映射为参与者和 Atom 元素坐标；`ThrCopy` 最后选定参与者 0，并展开剩余 tile 的行、列 mode。
 
-// B: Keep only NK modes from MNK, mcast along M mode for this N load.
-auto cta_tiler_nk = remove<0>(cta_tiler);
-auto cluster_size_m = size<0>(cluster_size);
-auto cta_t_tile = make_layout(cluster_size_m);
-```
-
-所以 `multicast layout` 的核心不是“数据怎么排”，而是“cluster 中几个 CTA 如何合作发起同一份 operand 的 TMA load”。
-
-## `tma_partition` 的返回顺序
-
-`tma_partition` 的原型和核心源码前面已经提前讲过，这里只补一个容易疑惑的点：为什么函数参数里 `stensor` 在前，返回 tuple 时却是 `(gtensors..., stensor)`？
-
-原因是 CuTe copy 的调用习惯是：
-
-```cpp
-copy(copy_atom_or_traits, src, dst);
-```
-
-所以对于一个 GMEM tensor 和一个 SMEM tensor，写成：
-
-```cpp
-auto [tAgA, tAsA] = tma_partition(..., sA, gA);
-copy(tma_a.with(mbar), tAgA(_,k_tile), tAsA(_,pipe));
-```
-
-`tAgA` 是 source，`tAsA` 是 destination。虽然函数参数里 `stensor` 先传入，但返回时 `stensor` 被放到最后，正好符合 `copy(src, dst)`。
-
-## multicast mask
-
-前面的 `multicast layout` 解决“当前 CTA 负责发起哪一片 TMA copy”。这里的 `multicast_mask` 解决另一个问题：**这条 TMA multicast 指令写到哪些 CTA 的 shared memory**。
-
-TMA multicast 的底层指令需要一个 `uint16_t multicast_mask`。每一位表示 cluster 里的一个 CTA 是否接收这次 TMA load。
-
-CuTe 提供：
-
-```cpp
-/**
- * @brief 根据 CTA layout 和当前 CTA 坐标生成 TMA multicast mask。
- *
- * @param cta_layout_vmnk CTA cluster layout，常按 `(V,M,N,K)` 或类似逻辑组织。
- * @param cta_coord_vmnk 当前 CTA 的逻辑坐标。
- * @return 16 比特 mask，每一位对应 cluster 中一个 CTA rank。
- */
-template <class CtaLayout, class CtaCoord>
-CUTE_HOST_DEVICE constexpr
-uint16_t create_tma_multicast_mask(CtaLayout const& cta_layout_vmnk,
-                                   CtaCoord  const& cta_coord_vmnk);
-```
-
-还有投影版本：
-
-```cpp
-/**
- * @brief 在指定 mode 上做 projection 后生成 multicast mask。
- *
- * @details
- * 例如 A operand 常沿 N 方向 multicast，可以把 M/K 固定，只展开 N 方向 CTA。
- */
-template <int Mode, int... Modes, class CtaLayout, class CtaCoord>
-CUTE_HOST_DEVICE constexpr
-uint16_t create_tma_multicast_mask(CtaLayout const& cta_layout_vmnk,
-                                   CtaCoord  const& cta_coord_vmnk);
-```
-
-直观理解：
-
-- 如果不 multicast，mask 就是 `0b0001`。
-- 如果 cluster 中 rank 0 和 rank 1 都要接收，mask 可能是 `0b0011`。
-- 如果当前 elected CTA 不是 rank 0，CuTe 会根据 `elected_cta` 对 mask 做 shift。
-
-## `Copy_Traits` 和 `.with(...)`
-
-这一节从最终执行链路往回看：
-
-```cpp
-copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-```
-
-这行代码最后会一路展开成：
-
-```text
-Copy_Atom::with(...)
-  -> Copy_Traits<SM90_TMA_LOAD>::with(...)
-  -> Copy_Atom<Copy_Traits<SM90_TMA_LOAD_OP, ...>>
-  -> copy_unpack(...)
-  -> SM90_TMA_LOAD::copy(desc, mbar, cache_hint, smem_ptr, crd0, crd1, ...)
-  -> SM90_TMA_LOAD_2D::copy(...)
-  -> cp.async.bulk.tensor.2d...
-```
-
-所以要理解 `.with(...)`，必须先把最底层的 `SM90_TMA_LOAD` 看清楚。
-
-### 先看 arch-level `SM90_TMA_LOAD`
-
-`cute/arch/copy_sm90_tma.hpp` 里的 `SM90_TMA_LOAD` 是 **arch-level 指令封装**。它自己不保存 descriptor，也不保存 mbarrier；它只是提供一组静态 `copy` 函数，最后发出 PTX TMA 指令。
-
-先看 2D load 的形态。下面是带中文 Doxygen 注释的源码骨架：
-
-```cpp
-/**
- * @brief 发起 2D TMA load：从 global tensor map 搬到 shared memory。
- *
- * @param desc_ptr TMA descriptor / CUtensorMap 指针。
- * @param mbar_ptr shared memory 中的 mbarrier 指针。
- * @param cache_hint L2 cache hint。
- * @param smem_ptr shared memory 目的地址。
- * @param crd0 TMA 第 0 维坐标。
- * @param crd1 TMA 第 1 维坐标。
- */
-struct SM90_TMA_LOAD_2D
-{
-  CUTE_HOST_DEVICE static void
-  copy(void const* desc_ptr,
-       uint64_t* mbar_ptr,
-       uint64_t cache_hint,
-       void* smem_ptr,
-       int32_t const& crd0,
-       int32_t const& crd1)
-  {
-    uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
-    uint32_t smem_int_mbar = cast_smem_ptr_to_uint(mbar_ptr);
-    uint32_t smem_int_ptr  = cast_smem_ptr_to_uint(smem_ptr);
-
-    asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cluster.global"
-      ".mbarrier::complete_tx::bytes.L2::cache_hint"
-      " [%0], [%1, {%3, %4}], [%2], %5;"
-      :
-      : "r"(smem_int_ptr), "l"(gmem_int_desc), "r"(smem_int_mbar),
-        "r"(crd0), "r"(crd1), "l"(cache_hint)
-      : "memory");
-  }
-
-  /**
-   * @brief 只预取 tensor map 对应的 global 数据到 L2，不写 shared memory。
-   *
-   * @details
-   * prefetch 不需要 shared-memory 目的地址，也不需要 mbarrier。
-   */
-  struct PREFETCH
-  {
-    CUTE_HOST_DEVICE static void
-    copy(void const* desc_ptr,
-         int32_t const& crd0,
-         int32_t const& crd1)
-    {
-      uint64_t gmem_int_desc = reinterpret_cast<uint64_t>(desc_ptr);
-
-      asm volatile(
-        "cp.async.bulk.prefetch.tensor.2d.L2.global"
-        " [%0, {%1, %2}];"
-        :
-        : "l"(gmem_int_desc), "r"(crd0), "r"(crd1)
-        : "memory");
-    }
-  };
-};
-```
-
-`SM90_TMA_LOAD` 本身是一个 1D 到 5D 的转发 wrapper：
-
-```cpp
-/**
- * @brief 根据坐标参数个数转发到 1D / 2D / 3D / 4D / 5D TMA load。
- *
- * @details
- * `SM90_TMA_LOAD` 是 CuTe traits 使用的统一操作类型。
- * 真正的 PTX 维度由传入多少个 TMA 坐标决定。
- */
-struct SM90_TMA_LOAD
-{
-  CUTE_HOST_DEVICE static void
-  copy(void const* desc_ptr, uint64_t* mbar_ptr, uint64_t cache_hint,
-       void* smem_ptr,
-       int32_t const& crd0,
-       int32_t const& crd1)
-  {
-    return SM90_TMA_LOAD_2D::copy(desc_ptr, mbar_ptr, cache_hint,
-                                  smem_ptr, crd0, crd1);
-  }
-
-  struct PREFETCH
-  {
-    CUTE_HOST_DEVICE static void
-    copy(void const* desc_ptr,
-         int32_t const& crd0,
-         int32_t const& crd1)
-    {
-      return SM90_TMA_LOAD_2D::PREFETCH::copy(desc_ptr, crd0, crd1);
-    }
-  };
-};
-```
-
-这里可以先记住一点：**arch-level `SM90_TMA_LOAD::copy` 需要 descriptor、mbarrier、cache hint、SMEM 目的地址和 TMA 坐标**。但是 host 侧这行代码：
-
-```cpp
-Copy_Atom tmaA = make_tma_atom(SM90_TMA_LOAD{}, mA, sA(_,_,0),
-                               make_shape(bM,bK));
-```
-
-只传了 `SM90_TMA_LOAD{}`、GMEM tensor、SMEM layout 和 CTA tile。它还没有 `mbarrier`，也没有某个具体 pipeline stage 的 SMEM 地址。因此它不能直接发出 `SM90_TMA_LOAD::copy`。
-
-### `make_tma_atom` 得到的是 non-executable atom
-
-`make_tma_atom(SM90_TMA_LOAD{}, ...)` 做的是：用 `SM90_TMA_LOAD{}` 这个操作类型，加上 `mA` / `sA(_,_,0)` / `make_shape(bM,bK)` 推导出 TMA descriptor，然后封装成一个 `Copy_Atom`。
-
-概念上，它得到的是：
-
-```cpp
-/**
- * @brief host 侧构造出的 non-executable TMA load atom 的概念形态。
- *
- * @details
- * 真实类型里的 `NumBitsPerTMA` 和 `AuxParams` 由 descriptor 构造过程推导。
- * 重点是：它保存了 descriptor 和 TMA 坐标 stride，但还没有 mbarrier。
- */
-Copy_Atom<
-    Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams>,
-    TmaInternalType>
-```
-
-对应的 `Copy_Traits<SM90_TMA_LOAD, ...>` 是这样的：
-
-```cpp
-/**
- * @brief non-executable TMA load traits：有 descriptor，但没有 mbarrier。
- *
- * @tparam NumBitsPerTMA 一条 TMA 指令涉及的位数布局。
- * @tparam AuxParams_ descriptor 之外的辅助参数，例如 TMA 坐标 stride。
- *
- * @details
- * 这个 traits 可以生成 TMA coordinate tensor，也可以通过 `.with(...)`
- * 绑定 mbarrier，变成 executable traits。
- */
-template <class NumBitsPerTMA, class AuxParams_>
-struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
-{
-  using ThrID     = Layout<_1>;
-  using SrcLayout = Layout<Shape<_1,NumBitsPerTMA>>;
-  using DstLayout = Layout<Shape<_1,NumBitsPerTMA>>;
-  using RefLayout = SrcLayout;
-
-  // host 侧编码好的 TMA descriptor。
-  TmaDescriptor tma_desc_;
-
-  // TMA 坐标 stride、swizzle 等辅助信息。
-  using AuxParams = AuxParams_;
-  AuxParams aux_params_;
-
-  /**
-   * @brief 返回当前 traits 持有的 TMA descriptor。
-   */
-  CUTE_HOST_DEVICE constexpr
-  TmaDescriptor const*
-  get_tma_descriptor() const {
-    return &tma_desc_;
-  }
-
-  /**
-   * @brief 生成 TMA coordinate tensor。
-   *
-   * @tparam GShape 完整 GMEM tensor 的 shape 类型。
-   * @param g_shape 完整 GMEM tensor 的 shape。
-   * @return 坐标 tensor，不是直接访问 GMEM 数据的 tensor。
-   */
-  template <class GShape>
-  CUTE_HOST_DEVICE constexpr
-  auto
-  get_tma_tensor(GShape const& g_shape) const {
-    return make_coord_tensor(make_layout(g_shape, aux_params_.g_stride_));
-  }
-
-  /**
-   * @brief 绑定 mbarrier，构造 executable TMA load traits。
-   *
-   * @param tma_mbar shared memory 中的 transaction barrier。
-   * @param multicast_mask 普通 load 会忽略该参数，保留它是为了和 multicast API 对齐。
-   * @param cache_hint L2 cache hint。
-   * @return `SM90_TMA_LOAD_OP` traits，里面有 descriptor 指针和 mbarrier 指针。
-   */
-  CUTE_HOST_DEVICE constexpr
-  Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-  with(uint64_t& tma_mbar,
-       uint16_t const& multicast_mask = 0,
-       TMA::CacheHintSm90 const& cache_hint =
-           TMA::CacheHintSm90::EVICT_NORMAL) const {
-    return {&tma_desc_, &tma_mbar, static_cast<uint64_t>(cache_hint)};
-  }
-
-  /**
-   * @brief 禁止在没有 `.with(...)` 绑定 mbarrier 的情况下执行 copy。
-   */
-  template <class TS, class SLayout,
-            class TD, class DLayout>
-  CUTE_HOST_DEVICE friend constexpr void
-  copy_unpack(Copy_Traits        const& traits,
-              Tensor<TS,SLayout> const& src,
-              Tensor<TD,DLayout>      & dst) = delete;
-};
-```
-
-这里的 `copy_unpack = delete` 是关键。它直接回答了这个问题：
-
-```cpp
-copy(tmaA, tAgA(_,k_tile), tAsA(_,pipe));  // 为什么不能这么写？
-```
-
-因为 `tmaA` 继承的是 `Copy_Traits<SM90_TMA_LOAD, ...>`，这个 traits 的执行入口被删除了。它只有 descriptor，没有 mbarrier，而 TMA load 的 PTX 需要 `mbarrier::complete_tx::bytes` 参数。
-
-这里容易误解成：“`SM90_TMA_LOAD_OP` 继承了 `SM90_TMA_LOAD`，所以它就能执行”。其实不是。
-
-真正起作用的是 **模板特化切换**：
-
-```cpp
-/**
- * @brief non-executable traits：有 descriptor，没有 mbarrier。
- *
- * @details
- * 这个特化明确删除 `copy_unpack`，所以不能执行。
- */
-template <class NumBitsPerTMA, class AuxParams_>
-struct Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams_>
-{
-  template <class TS, class SLayout,
-            class TD, class DLayout>
-  CUTE_HOST_DEVICE friend constexpr void
-  copy_unpack(Copy_Traits        const& traits,
-              Tensor<TS,SLayout> const& src,
-              Tensor<TD,DLayout>      & dst) = delete;
-};
-
-/**
- * @brief executable traits：已经绑定 mbarrier。
- *
- * @details
- * 这个特化继承 `TMA_LOAD_Unpack`，因此拥有可用的 `copy_unpack`。
- */
-template <class NumBitsPerTMA>
-struct Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-    : TMA_LOAD_Unpack<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-{};
-```
-
-`SM90_TMA_LOAD_OP` 这个空壳标签的作用，是让类型从：
-
-```cpp
-Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams>
-```
-
-变成：
-
-```cpp
-Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-```
-
-于是 C++ 选择的就不再是“删除了 `copy_unpack` 的那个特化”，而是“继承了 `TMA_LOAD_Unpack` 的那个特化”。
-
-`SM90_TMA_LOAD_OP : SM90_TMA_LOAD` 的继承关系只负责最后一步：当 `TMA_LOAD_Unpack` 调用 `CopyOp::copy(...)` 时，`SM90_TMA_LOAD_OP` 可以复用父类 `SM90_TMA_LOAD` 的静态 `copy` 转发函数。
-
-也就是说：
-
-```text
-能不能进入 copy_unpack？
-  由 Copy_Traits<...> 特化决定。
-
-copy_unpack 进去后最终调用哪个 arch-level copy？
-  由 CopyOp::copy(...) 决定。
-
-SM90_TMA_LOAD_OP 继承 SM90_TMA_LOAD 的作用？
-  让 SM90_TMA_LOAD_OP::copy(...) 复用 SM90_TMA_LOAD::copy(...)。
-```
-
-### `Copy_Atom` 只是把 traits 变成 CuTe copy atom
-
-再看 `cute/atom/copy_atom.hpp`。`Copy_Atom` 本身不是 TMA 专用，它是所有 copy 操作共用的包装层：
-
-下面的源码骨架省略了 `ValLayoutSrc` / `ValLayoutDst` 的静态检查，以及 `call(...)` 里 shape 不匹配时递归拆分 tensor mode 的分支，只保留和 `.with(...)` / `copy_unpack(...)` 相关的主线。
-
-```cpp
-/**
- * @brief 如果用户直接传 copy operation，就先转成对应的 `Copy_Traits`。
- *
- * @tparam CopyOperation copy 操作类型，例如 `SM90_TMA_LOAD`。
- * @tparam CopyInternalType copy 内部使用的元素类型。
- */
-template <class CopyOperation, class CopyInternalType>
-struct Copy_Atom<CopyOperation, CopyInternalType>
-    : Copy_Atom<Copy_Traits<CopyOperation>, CopyInternalType>
-{};
-
-/**
- * @brief CuTe copy atom：继承具体 `Copy_Traits`，并补上 tensor 调用接口。
- *
- * @tparam Args `Copy_Traits<Args...>` 里的参数。
- * @tparam CopyInternalType copy 内部值类型。
- *
- * @details
- * 对 TMA 来说，`Copy_Traits` 负责保存 descriptor / mbarrier 等操作参数；
- * `Copy_Atom` 负责让它能参与 CuTe 的 `copy(atom, src, dst)` 调度。
- */
-template <class... Args, class CopyInternalType>
-struct Copy_Atom<Copy_Traits<Args...>, CopyInternalType>
-    : Copy_Traits<Args...>
-{
-  using Traits = Copy_Traits<Args...>;
-
-  using ThrID        = typename Traits::ThrID;
-  using BitLayoutSrc = typename Traits::SrcLayout;
-  using BitLayoutDst = typename Traits::DstLayout;
-  using BitLayoutRef = typename Traits::RefLayout;
-
-  using ValType = CopyInternalType;
-
-  /**
-   * @brief 额外绑定 traits 参数，并重新包装成新的 `Copy_Atom`。
-   *
-   * @details
-   * 对 TMA load 来说，这一步会把 non-executable
-   * `SM90_TMA_LOAD` traits 变成 executable `SM90_TMA_LOAD_OP` traits。
-   */
-  template <class... TraitsArgs>
-  CUTE_HOST_DEVICE
-  auto
-  with(TraitsArgs&&... args) const {
-    auto traits = Traits::with(static_cast<TraitsArgs&&>(args)...);
-    return Copy_Atom<decltype(traits), CopyInternalType>{traits};
-  }
-
-  /**
-   * @brief 执行 rank-1 src/dst tensor 的 copy。
-   *
-   * @details
-   * 如果 src/dst 已经匹配单条指令的形状，就调用 `copy_unpack`；
-   * 对 TMA load，这会进入 `TMA_LOAD_Unpack`。
-   */
-  template <class SEngine, class SLayout,
-            class DEngine, class DLayout>
-  CUTE_HOST_DEVICE
-  void
-  call(Tensor<SEngine,SLayout> const& src,
-       Tensor<DEngine,DLayout>      & dst) const {
-    return copy_unpack(static_cast<Traits const&>(*this), src, dst);
-  }
-};
-```
-
-所以 `.with(...)` 不是“给原对象改个字段”，而是生成一个新的 atom：
-
-```cpp
-// before: non-executable，有 descriptor / aux_params，没有 mbarrier。
-Copy_Atom<Copy_Traits<SM90_TMA_LOAD, NumBitsPerTMA, AuxParams>, T>
-
-// after: executable，有 descriptor 指针 / mbarrier 指针 / cache hint。
-Copy_Atom<Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>, T>
-```
-
-`SM90_TMA_LOAD_OP` 是一个小标签：
-
-```cpp
-/**
- * @brief executable TMA load 操作标签。
- *
- * @details
- * 它继承 `SM90_TMA_LOAD`，所以最终仍然复用 arch-level
- * `SM90_TMA_LOAD::copy` 转发逻辑。
- */
-struct SM90_TMA_LOAD_OP : SM90_TMA_LOAD {};
-```
-
-executable traits 持有的是调用 arch-level copy 所需的运行时参数：
-
-```cpp
-/**
- * @brief executable TMA load traits：已经绑定 mbarrier。
- *
- * @tparam NumBitsPerTMA 一条 TMA 指令涉及的位数布局。
- */
-template <class NumBitsPerTMA>
-struct Copy_Traits<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-    : TMA_LOAD_Unpack<SM90_TMA_LOAD_OP, NumBitsPerTMA>
-{
-  using ThrID     = Layout<_1>;
-  using SrcLayout = Layout<Shape<_1,NumBitsPerTMA>>;
-  using DstLayout = Layout<Shape<_1,NumBitsPerTMA>>;
-  using RefLayout = SrcLayout;
-
-  /**
-   * @brief arch-level `SM90_TMA_LOAD::copy` 需要的固定参数。
-   *
-   * @details
-   * 之后 `copy_unpack` 会再追加 SMEM 目的地址和 TMA 坐标。
-   */
-  tuple<
-    TmaDescriptor const*,
-    uint64_t*,  // shared-memory mbarrier
-    uint64_t    // cache hint
-  > const opargs_;
-};
-```
-
-`TMA_LOAD_Unpack` 再把 tensor 里的信息补齐：
-
-```cpp
-/**
- * @brief 把 executable traits、src tensor、dst tensor 拆成 arch-level copy 参数。
- *
- * @details
- * `src(Int<0>{})` 给出 TMA 坐标，`dst.data()` 给出 shared-memory 目的地址。
- * `traits.opargs_` 里已有 descriptor、mbarrier 和 cache hint。
- */
-template <class CopyOp, class... Args>
-struct TMA_LOAD_Unpack
-{
-  template <class TS, class SLayout,
-            class TD, class DLayout>
-  CUTE_HOST_DEVICE friend constexpr void
-  copy_unpack(Copy_Traits<CopyOp, Args...> const& traits,
-              Tensor<TS,SLayout>           const& src,
-              Tensor<TD,DLayout>                & dst)
-  {
-    static_assert(is_smem<TD>::value,
-                  "SM90_TMA_LOAD requires the destination be shared memory.");
-
-    auto src_coord = src(Int<0>{});
-    void* dst_ptr = cute::raw_pointer_cast(dst.data());
-
-    return detail::explode_tuple(
-        detail::CallCOPY<CopyOp>{},
-        traits.opargs_,
-        tuple_seq<decltype(traits.opargs_)>{},
-        make_tuple(dst_ptr),
-        seq<0>{},
-        src_coord,
-        tuple_seq<decltype(src_coord)>{});
-  }
-};
-```
-
-这就是为什么教程里必须写：
-
-```cpp
-copy(tma_a.with(producer_mbar[pipe]),
-     tAgA(_,k_tile),
-     tAsA(_,pipe));
-```
-
-而不是：
-
-```cpp
-copy(tma_a,
-     tAgA(_,k_tile),
-     tAsA(_,pipe));
-```
-
-前者已经补齐了 TMA load 指令需要的 mbarrier；后者只有 descriptor，没有 completion object，源码层面直接禁止执行。
-
-multicast load 的逻辑一样，只是 `.with(...)` 还必须绑定 `multicast_mask`：
-
-```cpp
-/**
- * @brief 绑定 mbarrier 和 multicast mask，构造 executable multicast TMA load traits。
- *
- * @param tma_load_mbar shared memory 中的 mbarrier。
- * @param multicast_mask cluster 中接收本次 TMA load 的 CTA bitmask。
- * @param cache_hint L2 cache hint。
- * @return 可以执行 multicast TMA load 的 traits。
- */
-CUTE_HOST_DEVICE constexpr
-Copy_Traits<SM90_TMA_LOAD_MULTICAST_OP, NumBitsPerTMA>
-with(uint64_t& tma_load_mbar,
-     uint16_t const& multicast_mask,
-     TMA::CacheHintSm90 const& cache_hint =
-         TMA::CacheHintSm90::EVICT_NORMAL) const;
-```
-
-store 不需要 mbarrier 作为 completion object，因为 TMA store 走的是 bulk async group：
-
-```cpp
-copy(tma_store, tCsC, tCgC);
-tma_store_arrive();
-tma_store_wait<0>();
-```
-
-也就是说：
-
-- **TMA load**：常见完成信号是 `mbarrier::complete_tx::bytes`，等待 `ClusterTransactionBarrier`。
-- **TMA store / reduce**：常见完成信号是 `cp.async.bulk.commit_group` / `wait_group`。
-
-## 其他 SM90 TMA arch API 补充
-
-前面已经沿着 `SM90_TMA_LOAD -> Copy_Traits -> Copy_Atom -> .with(...)` 看过普通 load。这里再补几个同族 arch-level API，方便后面对照。
-
-系列整理：
-
-| API | 维度 | 方向 | 是否需要 mbarrier | 说明 |
-| --- | --- | --- | --- | --- |
-| `SM90_TMA_LOAD_1D` 到 `SM90_TMA_LOAD_5D` | 1D 到 5D | GMEM -> SMEM | 需要 | 发起 TMA load。 |
-| `SM90_TMA_LOAD` | 1D 到 5D overload wrapper | GMEM -> SMEM | 需要 | 根据参数个数转发到对应维度。 |
-| `SM90_TMA_LOAD::PREFETCH` | 1D 到 5D | GMEM descriptor / L2 prefetch | 不需要 | 预取 TMA 相关 global 数据到 L2。 |
-
-### multicast load
-
-multicast 版本多一个 `uint16_t multicast_mask`：
-
-```cpp
-/**
- * @brief 发起 multicast TMA load，把同一份 GMEM tile 送到多个 CTA 的 SMEM。
- *
- * @param desc_ptr TMA descriptor。
- * @param mbar_ptr 当前 CTA 或目标 CTA 的 mbarrier。
- * @param multicast_mask cluster 内接收数据的 CTA bitmask。
- * @param cache_hint L2 cache hint。
- * @param smem_ptr shared memory 目的地址。
- * @param crd0 TMA 第 0 维坐标。
- * @param crd1 TMA 第 1 维坐标。
- */
-struct SM90_TMA_LOAD_MULTICAST_2D {
-    CUTE_HOST_DEVICE static void
-    copy(void const* desc_ptr,
-         uint64_t* mbar_ptr,
-         uint16_t multicast_mask,
-         uint64_t cache_hint,
-         void* smem_ptr,
-         int32_t const& crd0,
-         int32_t const& crd1);
-};
-```
-
-系列整理：
-
-| API | 维度 | 方向 | 额外参数 | 说明 |
-| --- | --- | --- | --- | --- |
-| `SM90_TMA_LOAD_MULTICAST_1D` 到 `SM90_TMA_LOAD_MULTICAST_5D` | 1D 到 5D | GMEM -> 多个 CTA 的 SMEM | `multicast_mask` | cluster multicast load。 |
-| `SM90_TMA_LOAD_MULTICAST` | 1D 到 5D overload wrapper | GMEM -> 多 CTA SMEM | `multicast_mask` | 根据坐标参数个数转发。 |
-| `SM90_TMA_LOAD_MULTICAST::PREFETCH` | 1D 到 5D | L2 prefetch | 无 mask | 复用 `SM90_TMA_LOAD::PREFETCH`。 |
-
-### im2col load
-
-卷积场景下，TMA 可以用 im2col mode 做带 offset 的 tensor load。CuTe 封装了：
-
-| API | 维度 | 方向 | 说明 |
-| --- | --- | --- | --- |
-| `SM90_TMA_LOAD_IM2COL_3D` | 3D | GMEM -> SMEM | 坐标通常类似 `(c, w, n)`，带 `w_offset`。 |
-| `SM90_TMA_LOAD_IM2COL_4D` | 4D | GMEM -> SMEM | 坐标类似 `(c, w, h, n)`，带 `w/h` offset。 |
-| `SM90_TMA_LOAD_IM2COL_5D` | 5D | GMEM -> SMEM | 坐标类似 `(c, w, h, d, n)`，带 `w/h/d` offset。 |
-| `SM90_TMA_LOAD_IM2COL` | 3D 到 5D wrapper | GMEM -> SMEM | 根据参数个数转发。 |
-| `SM90_TMA_LOAD_IM2COL_MULTICAST_3D` 到 `5D` | 3D 到 5D | GMEM -> 多 CTA SMEM | im2col + multicast。 |
-| `SM90_TMA_LOAD_IM2COL_MULTICAST` | 3D 到 5D wrapper | GMEM -> 多 CTA SMEM | 根据参数个数转发。 |
-
-一般 GEMM 不需要 im2col。卷积 lowering 或隐式 GEMM kernel 才会碰到它。
-
-### store / reduce / bulk copy
-
-TMA store 从 SMEM 写回 GMEM：
-
-```cpp
-/**
- * @brief 发起 2D TMA store，从 shared memory 写回 global tensor map。
- *
- * @param desc_ptr TMA descriptor。
- * @param smem_ptr shared memory 源地址。
- * @param crd0 TMA 第 0 维坐标。
- * @param crd1 TMA 第 1 维坐标。
- */
-struct SM90_TMA_STORE_2D {
-    CUTE_HOST_DEVICE static void
-    copy(void const* desc_ptr,
-         void const* smem_ptr,
-         int32_t const& crd0,
-         int32_t const& crd1);
-};
-```
-
-系列整理：
-
-| API | 维度 | 方向 | 说明 |
-| --- | --- | --- | --- |
-| `SM90_TMA_STORE_1D` 到 `SM90_TMA_STORE_5D` | 1D 到 5D | SMEM -> GMEM | 发起 TMA store。 |
-| `SM90_TMA_STORE` | 1D 到 5D wrapper | SMEM -> GMEM | 根据坐标参数个数转发。 |
-| `SM90_TMA_STORE_IM2COL_3D` 到 `5D` | 3D 到 5D | SMEM -> GMEM | im2col store。 |
-| `SM90_TMA_STORE_IM2COL` | 3D 到 5D wrapper | SMEM -> GMEM | 根据参数个数转发。 |
-| `SM90_TMA_REDUCE_ADD_1D` 到 `5D` | 1D 到 5D | SMEM reduce-add 到 GMEM | 发起 `cp.reduce.async.bulk.tensor.*.add`。 |
-| `SM90_TMA_REDUCE_ADD` | 1D 到 5D wrapper | SMEM reduce-add 到 GMEM | 根据坐标参数个数转发。 |
-
-TMA store 还有几个同步辅助函数：
-
-```cpp
-/**
- * @brief 在后续 TMA store 之前，为 shared memory store 建立 async proxy 可见性。
- */
-CUTE_HOST_DEVICE static void tma_store_fence();
-
-/**
- * @brief 提交当前 warp 发出的 TMA store bulk async group。
- */
-CUTE_HOST_DEVICE static void tma_store_arrive();
-
-/**
- * @brief 等待直到最多还有 Count 个已提交 TMA store group 未完成。
- */
-template <int Count>
-CUTE_HOST_DEVICE static void tma_store_wait();
-```
-
-还有非 tensor map 的 bulk copy：
-
-| API | 方向 | PTX 形态 | 说明 |
-| --- | --- | --- | --- |
-| `SM90_BULK_COPY_G2S` | GMEM -> SMEM | `cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes` | 按字节数拷贝，不使用多维 tensor map。 |
-| `SM90_BULK_COPY_G2S::PREFETCH` | GMEM -> L2 | `cp.async.bulk.prefetch.L2.global` | bulk prefetch。 |
-| `SM90_BULK_COPY_S2G` | SMEM -> GMEM | `cp.async.bulk.global.shared::cta.bulk_group` | 按字节数写回。 |
-| `SM90_BULK_COPY_AUTO` | 由 traits 选择 | 无直接 copy 函数 | 用于 higher-level traits 自动选择路径。 |
-
-## Cluster launch 和 cluster API
-
-SM90 cluster 是一组 CTA 的集合。TMA multicast、cluster barrier、remote shared memory address mapping 都建立在 cluster 上。
-
-### `cutlass::ClusterLaunchParams`
-
-```cpp
-/**
- * @brief CUTLASS host 侧 cluster kernel launch 参数。
- *
- * @param grid_dims grid 维度，通常已经按 cluster 维度 round up。
- * @param block_dims block 维度。
- * @param cluster_dims 每个 cluster 中 CTA 的三维形状。
- * @param smem_size_in_bytes kernel 动态 shared memory 字节数。
- * @param cuda_stream CUDA stream。
- */
-struct ClusterLaunchParams {
-    dim3 grid_dims{1, 1, 1};
-    dim3 block_dims{1, 1, 1};
-    dim3 cluster_dims{1, 1, 1};
-    int smem_size_in_bytes = 0;
-    cudaStream_t cuda_stream = nullptr;
-};
-```
-
-### `cutlass::launch_kernel_on_cluster`
-
-```cpp
-/**
- * @brief 用 CUDA cluster launch 启动 kernel。
- *
- * @tparam Args kernel 参数类型。
- * @param params cluster launch 参数。
- * @param kernel_ptr kernel 函数指针。
- * @param args kernel 参数。
- * @return `cutlass::Status::kSuccess` 表示启动成功。
- */
-template<class... Args>
-CUTLASS_HOST cutlass::Status
-launch_kernel_on_cluster(const ClusterLaunchParams& params,
-                         void const* kernel_ptr,
-                         Args&&... args);
-```
-
-它内部会把参数地址组装成 `void* kernel_params[]`，再走 CUTLASS 的 cluster launcher，底层对应 CUDA 的 `cudaLaunchKernelExC`。
-
-### kernel 内的 cluster API
-
-`cute/arch/cluster_sm90.hpp` 提供了一组很薄的 PTX 封装：
-
-| API | PTX / 作用 | 说明 |
+| 操作 | 本例的 shape | 含义 |
 | --- | --- | --- |
-| `cute::cluster_arrive_relaxed()` | `barrier.cluster.arrive.relaxed.aligned` | 到达 cluster barrier，但 relaxed。 |
-| `cute::cluster_arrive()` | `barrier.cluster.arrive.aligned` | 到达 cluster barrier。 |
-| `cute::cluster_wait()` | `barrier.cluster.wait.aligned` | 等待 cluster barrier。 |
-| `cute::cluster_sync()` | `cluster_arrive(); cluster_wait();` | cluster 范围同步。 |
-| `cute::cluster_grid_dims()` | 读 `%nclusterid.{x,y,z}` | 返回 grid 中 cluster 数量。 |
-| `cute::cluster_id_in_grid()` | 读 `%clusterid.{x,y,z}` | 当前 cluster 在 grid 中的坐标。 |
-| `cute::block_id_in_cluster()` | 读 `%cluster_ctaid.{x,y,z}` | 当前 CTA 在 cluster 内的三维坐标。 |
-| `cute::cluster_shape()` | 读 `%cluster_nctaid.{x,y,z}` | cluster 形状。 |
-| `cute::block_rank_in_cluster()` | 读 `%cluster_ctarank` | 当前 CTA 在 cluster 内的一维 rank。 |
-| `cute::set_block_rank(smemAddr, rank)` | `mapa.shared::cluster.u32` | 把 shared memory 地址映射到 cluster 内某个 CTA。 |
-| `cute::elect_one_sync()` | `elect.sync` | 每个 warp 选出一个 lane，常用于只让一个 lane 发 TMA。 |
+| 输入二维 tile | `(8, 32)` | 行、列。 |
+| `zipped_divide(input, Tiler_MN{})` | `((8, 32), (1, 1))` | 一个 copy tile 的行列，以及剩余 tile 的行列。 |
+| `tile2thrfrg` 返回，即 `tidfrg_S/D` 的结果 | `(1, ((32, 8), 1), (1, 1))` | 参与者、`(FrgV, FrgX)`、剩余 tile 的行列。 |
+| `ThrCopy::partition_S/D` 返回 | `(((32, 8), 1), 1, 1)` | 固定参与者 0，保留 fragment，展开剩余行、列 tile。 |
+| `partition(_, 0, 0)` | `(((32, 8), 1))` | 选定一个 tile，保留整个 fragment mode。 |
 
-示例里初始化 barrier 后立刻：
+其中前面摘录的 `ThrCopy` 源码里，这一行完成最后的参与者选择和剩余 mode 展开：
 
 ```cpp
-cluster_sync();
+// thr_tensor 的 shape：(1, ((32, 8), 1), (1, 1))。
+// thr_idx_ 为 0；中间的 _ 保留整个 fragment mode。
+// 输入 rank 为 2，因此 repeat<rank_v<STensor>>(_) 得到 (_, _)：
+// 它分别保留 RestRow 和 RestCol，将两者展开为顶层 mode。
+return thr_tensor(thr_idx_, _, repeat<rank_v<STensor>>(_));
 ```
 
-这是因为 barrier 初始化只由一个 elected lane 做，其他 CTA / warp 必须等初始化对 cluster 可见后才能使用这些 mbarrier。
-
-## kernel 内部的 barrier 和 pipeline 协议
-
-教程示例里用了两类 barrier：
+如果对整个 `(64, 128)` 坐标 Tensor 做 `partition_S`，相同的 copy tile 会在行方向重复 8 次、列方向重复 4 次：
 
 ```cpp
-using ProducerBarType = cutlass::arch::ClusterTransactionBarrier;  // TMA
-using ConsumerBarType = cutlass::arch::ClusterBarrier;             // MMA
+auto whole_source_partition = cta_copy.partition_S(coordinate_tensor);
+// shape：(((32, 8), 1), 8, 4)。
+//                         ↑  ↑
+//                      行 tile、列 tile
+
+auto source_fragment = whole_source_partition(_, _2{}, _1{});
+// shape：(((32, 8), 1))。
+// 选择行 tile 2、列 tile 1，逻辑起点为 (row, col) = (16, 32)。
 ```
 
-这两个名字非常准确：
+前面的 `local_tile` 已先选定这个位置，所以对 `global_tile` 分区后只剩一个 tile，使用 `(_, 0, 0)` 就能取出同一组源坐标。
 
-- producer 是 TMA，它往 shared memory 生产数据，需要 transaction bytes。
-- consumer 是 GMMA/WGMMA，它消耗 shared memory 数据，只需要普通 arrive / wait。
+### TiledCopy 路径的 device 示例
 
-### `canonical_warp_idx_sync` 和 `elect_one_sync`
+第二条路径的完整示例只改变分区步骤，barrier 和指令完成协议与前面的示例相同：
 
 ```cpp
 /**
- * @brief 返回 warp 内一致的 warp index。
+ * @brief 一个 CTA 用 TiledCopy 路径读取与 Atom 示例相同的 tile。
+ * @tparam TmaCopy make_example_tma_copy 返回的 TiledCopy 类型。
+ * @param tma 按值传入的 kernel 常量参数，包含有效的输入 descriptor。
+ * @param output_device device 输出指针，至少 256 个 float，布局为 8 行 × 32 列。
  *
- * @details
- * 使用 `__shfl_sync` 从 lane 0 广播 `threadIdx.x / 32`。
- * 调用时要求 warp 内线程收敛。
+ * grid 为一个 CTA，block 为 128 个线程；线程 0 发射 TMA，
+ * 全体线程等待 full，然后各自输出两个 shared 元素。
  */
-CUTLASS_DEVICE
-int canonical_warp_idx_sync() {
-    return __shfl_sync(0xffffffff, threadIdx.x / NumThreadsPerWarp, 0);
+template <class TmaCopy>
+__global__ void copyTmaTileTiledKernel(
+    CUTE_GRID_CONSTANT TmaCopy const tma,
+    float* __restrict__ output_device) {
+    __shared__ TmaTileStorage storage;
+    const int thread_id = static_cast<int>(threadIdx.x);
+
+    auto shared_tensor =
+        make_tensor(make_smem_ptr(storage.values), TileLayout{});
+    auto coordinate_tensor = tma.get_tma_tensor(GlobalShape{});
+    auto global_tile =
+        local_tile(coordinate_tensor, TileShape{}, make_coord(_2{}, _1{}));
+
+    // TiledCopy 对二维 tile 做分区，再选出逻辑参与者 0 的视图。
+    auto cta_copy = tma.get_slice(Int<0>{});
+    auto source_partition = cta_copy.partition_S(global_tile);
+    auto shared_partition = cta_copy.partition_D(shared_tensor);
+    auto source_fragment = source_partition(_, _0{}, _0{});
+    auto shared_fragment = shared_partition(_, _0{}, _0{});
+
+    if (thread_id == 0) {
+        initialize_barrier(storage.full_barrier, 1);
+    }
+    cutlass::arch::fence_barrier_init();
+    __syncthreads();  // 全体线程使用初始化后的 barrier。
+
+    if (thread_id == 0) {
+        set_barrier_transaction_bytes(storage.full_barrier, 1024);
+        copy(tma.with(storage.full_barrier), source_fragment, shared_fragment);
+    }
+
+    wait_barrier(storage.full_barrier, 0);
+    for (int idx = thread_id; idx < 256; idx += 128) {
+        output_device[idx] = storage.values[idx];
+    }
 }
 ```
 
-`cute::elect_one_sync()` 在 SM90 上用 `elect.sync`，否则退化成 lane 0：
+### TiledCopy 调用 with 后也返回执行态 Atom
 
-```cpp
-/**
- * @brief 从当前 warp 选出一个 lane。
- *
- * @return 被选中的 lane 返回 true，其他 lane 返回 false。
- */
-CUTE_HOST_DEVICE uint32_t elect_one_sync();
-```
+这里的 `TiledCopy` 继承 `Copy_Atom`，使用的是前面已摘录的 `Copy_Atom::with`。因此两条路径的类型变化分别为：
 
-TMA 指令通常只需要一个线程发起，所以常见判断是：
-
-```cpp
-int warp_idx = cutlass::canonical_warp_idx_sync();
-int lane_predicate = cute::elect_one_sync();
-
-if ((warp_idx == 0) && lane_predicate) {
-    // 只有第 0 个 warp 里的一个 elected lane 负责发 TMA。
-}
-```
-
-### `ClusterBarrier`：先分清本 CTA barrier 和远端 CTA barrier
-
-`ClusterBarrier` 不是一个“整个 cluster 只有一份的 barrier”。每个 CTA 都在**自己的 shared memory** 中放一份 64 位 `mbarrier` 对象；它之所以叫 cluster barrier，是因为一个 CTA 可以对 cluster 内另一个 CTA 的那一份 barrier 执行 `arrive`。但是 `wait` 只能等待本 CTA 自己 shared memory 里的 barrier。
-
-下面是 `cutlass/arch/barrier.h` 的关键接口，补上了参数的实际语义：
-
-```cpp
-/**
- * @brief 允许 remote arrive 的 shared-memory mbarrier 封装。
- *
- * @details
- * barrier 对象实际位于调用 CTA 的 shared memory。`wait` 只等待本地对象；
- * 带 `cta_id` 的 `arrive` 会把同一个 shared-memory 偏移映射到 cluster 中
- * 指定 CTA 的 shared memory，再对远端对象执行 arrive。
- */
-struct ClusterBarrier {
-  using ValueType = uint64_t;
-
-  /**
-   * @brief 初始化本 CTA 的 barrier。
-   *
-   * @param smem_ptr 本 CTA shared memory 中 8 字节对齐的 mbarrier 地址。
-   * @param arrive_count 每一个 phase 需要多少次 arrive 才能完成。
-   */
-  static void init(ValueType const* smem_ptr, uint32_t arrive_count);
-
-  /**
-   * @brief 阻塞等待指定 parity 的那一代 barrier 完成。
-   *
-   * @param phase 只能是 0 或 1，等于目标 mbarrier phase 的奇偶性，而不是 pipe 下标。
-   */
-  static void wait(ValueType const* smem_ptr, uint32_t phase);
-
-  /**
-   * @brief 非阻塞地检查指定 parity 的 phase 是否完成。
-   *
-   * @param pred 为真才执行实际的 test-wait 探测；它不改变 barrier 的 arrival count。
-   *             教程不使用此接口，通常传 true。
-   */
-  static bool test_wait(ValueType const* smem_ptr,
-                        uint32_t phase,
-                        uint32_t pred = true);
-
-  /**
-   * @brief 等待指定 parity 的 phase；底层可短暂挂起并重试。
-   */
-  static bool try_wait(ValueType const* smem_ptr, uint32_t phase);
-
-  /**
-   * @brief 对本 CTA 的 barrier arrive 一次。
-   */
-  static void arrive(ValueType const* smem_ptr);
-
-  /**
-   * @brief 有条件地对 cluster 内另一个 CTA 的同偏移 barrier arrive 一次。
-   *
-   * @param cta_id cluster 内的线性 CTA rank，不是全局 `blockIdx.x`。
-   * @param pred 为真才真的执行 arrive；为假时没有副作用，也不会计入 arrival count。
-   */
-  static void arrive(ValueType const* smem_ptr,
-                     uint32_t cta_id,
-                     uint32_t pred = true);
-};
-```
-
-#### `phase`：不是 pipe 下标，而是同一个 barrier 的第几代
-
-PTX 的 `mbarrier` 初始化后从第 0 代开始：`pending arrival count = arrive_count`。当这一代的 pending arrival 减到 0（transaction barrier 还要求 `tx-count` 也归零）时，barrier 自动进入下一代，并把 pending count 恢复成 `arrive_count`。因此同一个 `consumer_mbar[0]` 可以循环用于 `K0`、`K_PIPE_MAX`、`2 * K_PIPE_MAX` 等多次 tile 消费。
-
-`ClusterBarrier::wait` 的底层指令是：
-
-```cpp
-/**
- * @brief CUTLASS 的 wait 最终使用 mbarrier parity wait。
- *
- * @details
- * `phase` 不是完整的代次编号，只传入代次的奇偶性：偶数代为 0，奇数代为 1。
- */
-mbarrier.try_wait.parity.shared::cta.b64 P1, [smem_addr], phase, ticks;
-```
-
-所以 API 参数虽然叫 `phase`，在这份 CUTLASS 封装里实际只能是 `0` 或 `1`：
-
-| 要等的完整 mbarrier 代次 | 传给 `wait` 的 `phase` | 意义 |
-| ---: | ---: | --- |
-| 0 | 0 | 等第 0 代完成。 |
-| 1 | 1 | 等第 1 代完成。 |
-| 2 | 0 | 同一物理 barrier 被再次复用，等第 2 代完成。 |
-| 3 | 1 | 再下一次复用。 |
-
-换句话说，`wait(&consumer_mbar[0], 0)` 并不是“等 pipe 0”，而是“我已经通过数组下标选中 pipe 0；现在等它的偶数代使用完成”。数组下标选哪块 shared memory，`phase` 区分同一块 shared memory 的旧一代和新一代。PTX 文档把 phase 定义为 mbarrier 被使用的次数，并规定 parity wait 只接受该代次的奇偶性。[PTX ISA 的 mbarrier phase 说明](https://docs.nvidia.com/cuda/archive/12.1.1/parallel-thread-execution/index.html)
-
-#### 为什么 `cuda::barrier` 看起来没有 `phase` 参数？
-
-`phase` 没有消失，只是被高层 API 藏进了 `arrival_token`。普通 `cuda::barrier` 的使用者不必自己保存 `0/1`：
-
-```cpp
-// 高层 cuda::barrier：token 绑定本次 arrive 所在的那一代。
-auto token = bar.arrive();
-do_independent_work();
-bar.wait(cuda::std::move(token));
-```
-
-而 CUTLASS 的 `ClusterBarrier` 更接近 PTX 的 `mbarrier` 原语。它的 `wait` 直接对应 `mbarrier.try_wait.parity`，因此调用者必须明确给出目标代次的 parity：
-
-```cpp
-// CUTLASS：TMA pipeline 用 PipelineState 保存并传递 parity。
-uint32_t phase = consumer_state.phase();  // 只会是 0 或 1
-ClusterBarrier::wait(&consumer_mbar[read_pipe], phase);
-```
-
-这两段代码问的是同一件事：“我要等哪一代 barrier？”区别仅在于谁保存答案：前者是库返回的 opaque token，后者是调用者维护的 `PipelineState::phase()`。因此本节的 `phase` 与前一篇 `cuda::barrier` 笔记中的 `arrival_token` 是一一对应的概念，不是 TMA 额外创造的一套状态。
-
-| 对比项 | `cuda::barrier` 高层接口 | CUTLASS `ClusterBarrier` |
+| 路径 | `.with(barrier)` 前 | `.with(barrier)` 后 |
 | --- | --- | --- |
-| 目标代次怎么传递 | `arrive()` 返回的 `arrival_token` 隐式绑定该代 | 调用者显式传入 `phase` parity（`0` 或 `1`） |
-| 等待形式 | `bar.wait(std::move(token))` | `ClusterBarrier::wait(ptr, phase)` |
-| 贴近的层次 | C++ 对象和 block-scope 同步协议 | shared-memory `mbarrier` 的轻量封装 |
-| cluster 能力 | 常规接口没有“向指定 CTA 远端 arrive”的参数 | `arrive(ptr, cta_id, pred)` 可向 cluster 内另一 CTA 的同偏移 barrier 到达 |
-| TMA 事务计数 | 普通 `arrive()` / `wait()` 不显式管理字节事务 | 派生的 `ClusterTransactionBarrier` 提供 `arrive_and_expect_tx(bytes)`，把 TMA 完成计入同一代 |
+| Atom 路径 | `ExampleLoadAtom` | `ExampleExecutableAtom`。 |
+| TiledCopy 路径 | `ExampleTiledCopy` | `ExampleExecutableAtom`。 |
 
-所以更准确的对应关系是：`ClusterBarrier` 对应上一节文章里的**显式 phase tracking / PTX mbarrier**；`cuda::barrier` 则是在其上提供了 token 式的、更不容易手动传错代次的接口。二者不是两种无关的硬件 barrier。
-
-#### `pred`：是否让当前线程产生这次操作
-
-`pred` 不是 phase，也不是“有多少线程参与 barrier”。它只是当前调用的条件开关：
-
-- `arrive(smem_ptr, cta_id, pred)`：`pred == false` 时，这个线程**不**对远端 barrier 执行 arrive；arrival count 不变。它常用于 128 个 consumer thread 中只挑一个 signaling thread，避免 128 次重复 remote arrive。
-- `arrive_and_expect_tx(bytes, cta_id, pred)`：同理，`pred == false` 时既不远端 arrive，也不增加该远端 barrier 的 expected transaction bytes。
-- `test_wait(smem_ptr, phase, pred)`：`pred` 只控制是否发出非阻塞 test-wait 探测；教程没有用它，读这份教程时可以先把它当作 `true`。
-
-教程的本地 consumer barrier 不需要这个参数：
+两者得到相同的执行态 Traits：
 
 ```cpp
-// 128 个 WGMMA consumer thread 都执行一次本地 arrive。
-// 刚好凑齐 init(..., 128) 设定的第 0 代 arrival count。
-ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
+Copy_Traits<SM90_TMA_LOAD_OP, Int<8192>>
 ```
 
-而较完整的 cluster / multicast pipeline 经常写成：
+TiledCopy 的布局已经用于生成源、目标分区。实际发射时，执行态 Atom 从这些分区取得坐标和 shared 指针，再交给 arch 层。**先用构造态对象完成坐标与分区准备，最后调用 `.with(barrier)` 绑定本轮执行参数。**
+
+## 两条 Copy 路径如何接回 PipelineTmaAsync
+
+示例中的 `set_barrier_transaction_bytes` 同时执行 arrival 和 expect-tx。接回前面的 `PipelineTmaAsync` 后，这两项由 leader 的 `producer_acquire` 完成，发射点可以写为：
 
 ```cpp
-// 所有 consumer 都走到这里，但只有被选中的一个线程向 producer CTA 的
-// empty barrier 发送 remote arrive；dst_cta_id 是 cluster 内的线性 rank。
-empty_barrier[stage].arrive(dst_cta_id, is_signaling_thread);
-```
+// 两条 Copy 路径都提前准备好本 tile 的源分区和各 stage 的 shared 分区。
+pipeline.producer_acquire(write_state);
+if (is_leader) {
+    auto* full_barrier = pipeline.producer_get_barrier(write_state.index());
 
-#### `cta_id`：远端 CTA 的 cluster 内线性 rank
-
-带 `cta_id` 的重载在源码中先执行 `mapa.shared::cluster.u32`，把本 CTA 的 `smem_ptr` 所表示的**相同 shared-memory 偏移**映射到目标 CTA；随后发出 `mbarrier.arrive.shared::cluster`：
-
-```cpp
-/**
- * @brief 对目标 CTA 的同偏移 mbarrier 执行远端 arrive。
- *
- * @param smem_addr 本 CTA 中 barrier 的 shared-memory 地址偏移。
- * @param cta_id cluster 内目标 CTA 的线性 rank。
- * @param pred 为真才发出远端 arrive。
- */
-if (pred) {
-  asm volatile(
-      "{\n\t"
-      ".reg .b32 remAddr32;\n\t"
-      "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-      "mbarrier.arrive.shared::cluster.b64 _, [remAddr32];\n\t"
-      "}"
-      :
-      : "r"(smem_addr), "r"(cta_id)
-      : "memory");
+    // 选中的 shared_fragment 指向 write_state.index() 对应的存储。
+    copy(tma.with(*full_barrier), source_fragment, shared_fragment);
 }
+++write_state;
 ```
 
-因此 `cta_id` 应来自 `cute::block_rank_in_cluster()` 或根据 cluster layout 算出的同一套 rank；不能把全局的 `blockIdx.x` 直接传进去。并且没有 `wait(cta_id, phase)` 重载：**远端 CTA 可以替本 CTA 的 barrier arrive，但真正等待该 barrier 的仍是本 CTA 的线程。**
-
-教程里只使用：
-
-```cpp
-ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe], bytes);
-ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
-```
-
-它们都是本 CTA 的本地操作；`cta_id` / `pred` 的 cluster 特性在这个 non-multicast 教程中没有被用到。
-
-### `ClusterTransactionBarrier`
-
-TMA load 需要 `ClusterTransactionBarrier`，因为它不仅要等“生产者 arrive”，还要等异步内存事务完成。
-
-```cpp
-/**
- * @brief 支持 transaction bytes 的 SM90 cluster mbarrier。
- *
- * @details
- * 和普通 barrier 不同，它还维护 expected transaction count。
- * `arrive_and_expect_tx` 会同时执行 arrive，并增加 expected transaction bytes。
- * TMA load 完成时，硬件按完成字节数扣减 transaction count。
- */
-struct ClusterTransactionBarrier : public ClusterBarrier {
-    static void arrive_and_expect_tx(ValueType const* smem_ptr,
-                                     uint32_t transaction_bytes);
-    static void arrive_and_expect_tx(ValueType const* smem_ptr,
-                                     uint32_t transaction_bytes,
-                                     uint32_t cta_id,
-                                     uint32_t pred);
-    static void expect_transaction(ValueType const* smem_ptr,
-                                   uint32_t transaction_bytes);
-    static void complete_transaction(ValueType const* smem_ptr,
-                                     uint32_t dst_cta_id,
-                                     uint32_t transaction_bytes,
-                                     uint32_t pred);
-};
-```
-
-普通 `arrive` 的逻辑是：
-
-```text
-arrival_count -= 1
-```
-
-`arrive_and_expect_tx(bytes)` 的逻辑是：
-
-```text
-arrival_count -= 1
-expected_transaction_count += bytes
-```
-
-TMA load 指令完成时，硬件再做：
-
-```text
-expected_transaction_count -= completed_bytes
-```
-
-所以 `ProducerBarType::wait(&producer_mbar[pipe], phase)` 通过的条件是：
-
-```text
-arrival_count == 0 && expected_transaction_count == 0
-```
-
-这和普通 barrier 的差别非常关键。普通 barrier 只能说明“某个线程已经发话了”，transaction barrier 还能说明“它发出去的异步内存操作真的完成了”。
-
-### barrier 初始化
-
-示例中每个 pipeline stage 都有一对 barrier：
-
-```cpp
-/**
- * @brief 初始化每个 pipeline stage 的 producer / consumer barrier。
- *
- * @details
- * producer barrier 只等一个 elected TMA issuing lane arrive。
- * consumer barrier 等一个 128-thread warpgroup 消费完成。
- */
-CUTE_UNROLL
-for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
-    if ((warp_idx == 0) && lane_predicate) {
-        ProducerBarType::init(&producer_mbar[pipe], 1);
-        ConsumerBarType::init(&consumer_mbar[pipe], 128);
-    }
-}
-
-cluster_sync();
-```
-
-这里 `cluster_sync()` 不是可有可无。mbarrier 在 shared memory 里，初始化由一个 lane 执行，其他 CTA / warp 后续会读这些 barrier 状态，必须先保证初始化可见。
-
-### `PipelineState`
-
-`PipelineState` 不是 barrier，也不保存“TMA 是否已经完成”。它只是 producer 或 consumer 私自持有的一个**环形游标**：每次操作前，用它选中一个 stage，并带上这块 stage 当前该等待的 mbarrier parity。
-
-它不负责同步；真正的同步仍由 `full_barrier_[index]` 或 `empty_barrier_[index]` 完成。因此可以把一次 pipeline 操作拆开看：
-
-```text
-PipelineState = 选哪一个 stage、wait 时传哪个 parity
-mbarrier      = 这一个 stage 此刻是否真的 full / empty
-```
-
-源码位于 `cutlass/pipeline/sm90_pipeline.hpp`。以下保留原来的控制流，并补上每个成员与接口的中文注释：
-
-```cpp
-/**
- * @brief 记录循环缓冲区当前位置，以及该位置对应的 mbarrier parity。
- *
- * @tparam Stages_ 循环缓冲区中 stage 的数量；例如 3 表示 stage 0、1、2。
- *
- * @details
- * 本类型只是一份由调用者推进的轻量状态，不包含任何 shared-memory barrier，
- * 也不具备多线程共同修改时的同步语义。producer 与 consumer 分别保存自己的
- * `PipelineState`，并在完成各自对当前 stage 的协议后显式执行 `++state`。
- */
-template <uint32_t Stages_>
-struct PipelineState {
-  /** @brief 编译期 stage 数，供 `PipelineTmaAsync<Stages>` 等类型读取。 */
-  static constexpr uint32_t Stages = Stages_;
-
-  /**
-   * @brief 当前要访问的 stage 下标，正常范围为 `[0, Stages)`。
-   *
-   * `index_` 只负责选择 `full_barrier_[index_]`、`empty_barrier_[index_]`
-   * 或相应的 shared-memory tile；它本身不表示 barrier 已经完成。
-   */
-  int index_ = 0;
-
-  /**
-   * @brief 当前 stage 的 wait parity，值只会在 0 和 1 之间切换。
-   *
-   * 这个值会传给 `mbarrier.try_wait.parity`。它表示“等待当前观察到的
-   * parity 翻转”，而不是数组下标，也不是独立的全局循环编号。
-   */
-  uint32_t phase_ = 0;
-
-  /**
-   * @brief 从该 state 建立以来累计前进的 stage 数。
-   *
-   * `count_` 主要供需要按迭代次数定位 pipeline 的代码使用；普通的
-   * `PipelineTmaAsync` acquire / wait 只读取 `index_` 和 `phase_`。
-   */
-  uint32_t count_ = 0;
-
-  /**
-   * @brief 构造默认游标 `(index=0, phase=0, count=0)`。
-   *
-   * 这是 consumer 常用的初始状态；producer 的标准初始状态见
-   * `make_producer_start_state()`，它故意使用不同的 phase。
-   */
-  CUTLASS_DEVICE
-  PipelineState() : index_{}, phase_{}, count_{} {}
-
-  /**
-   * @brief 用调用者给定的三个分量构造游标。
-   *
-   * @param index 当前 stage 下标。
-   * @param phase 当前 stage 的 wait parity。
-   * @param count 已前进的累计次数。
-   *
-   * @warning 构造函数不检查 `index < Stages`，也不验证三者是否满足默认
-   *          状态的递推关系；这种显式构造只应由理解 barrier 协议的代码使用。
-   */
-  CUTLASS_DEVICE
-  PipelineState(int index, uint32_t phase, uint32_t count)
-      : index_(index), phase_(phase), count_(count) {}
-
-  /** @brief 返回当前要访问的 stage 下标。 */
-  CUTLASS_DEVICE
-  int index() const { return index_; }
-
-  /** @brief 返回当前操作需要传给 parity wait 的 0/1 值。 */
-  CUTLASS_DEVICE
-  uint32_t phase() const { return phase_; }
-
-  /** @brief 返回累计前进次数，不代表当前 mbarrier 的硬件状态。 */
-  CUTLASS_DEVICE
-  uint32_t count() const { return count_; }
-
-  /**
-   * @brief 前进一个 stage；仅在跨越环形数组尾部时翻转 parity。
-   *
-   * 例如 `Stages == 3` 时：`(2, 0)` 递增后变成 `(0, 1)`。
-   * `phase_ ^= 1` 不是因为 stage 0 有特殊含义，而是同一块 stage 0 的
-   * mbarrier 即将被第二次复用，wait 必须等待另一代。
-   */
-  CUTLASS_DEVICE
-  void operator++() {
-    if constexpr (Stages > 0) {
-      ++index_;
-      ++count_;
-      if (index_ == Stages) {
-        index_ = 0;
-        phase_ ^= 1;
-      }
-    }
-  }
-
-  /**
-   * @brief 原地前进多个 stage，是 `advance()` 的语法糖。
-   *
-   * @param num_iterations 要跳过的 stage 数。
-   * @return 当前 state 的引用，便于连续调用。
-   */
-  CUTLASS_DEVICE
-  PipelineState& operator+=(uint32_t num_iterations) {
-    return advance(num_iterations);
-  }
-
-  /**
-   * @brief 逐字段复制另一个 pipeline state。
-   *
-   * @param other 被复制的状态快照。
-   * @return 当前 state 的引用。
-   */
-  CUTLASS_DEVICE
-  PipelineState& operator=(PipelineState const& other) {
-    index_ = other.index();
-    phase_ = other.phase();
-    count_ = other.count();
-    return *this;
-  }
-
-  /**
-   * @brief 原地跳过多个 stage，并只根据跨越环边界的次数更新 parity。
-   *
-   * @param num_iterations 要前进的 stage 数。
-   * @return 当前 state 的引用。
-   *
-   * @details
-   * 当跳过次数小于 `Stages` 时，最多跨越一次边界，源码以
-   * `index_ + num_iterations >= Stages` 判断是否翻转。跳过次数不少于
-   * `Stages` 时，跨越边界次数为 `(index_ + num_iterations) / Stages`；
-   * 只有这个数为奇数时才翻转，因为跨越偶数次会翻转两次后回到原 parity。
-   */
-  CUTLASS_DEVICE
-  PipelineState& advance(uint32_t num_iterations) {
-    if constexpr (Stages > 0) {
-      if ((num_iterations < Stages) &&
-          (index_ + num_iterations) >= Stages) {
-        phase_ ^= 1;
-      }
-      if ((num_iterations >= Stages) &&
-          (((index_ + num_iterations) / Stages) % 2) == 1) {
-        phase_ ^= 1;
-      }
-      index_ = (index_ + num_iterations) % Stages;
-      count_ += num_iterations;
-    }
-    return *this;
-  }
-
-  /**
-   * @brief 从起始 state 推导前进多个 stage 后的新 state。
-   *
-   * @param start_state 输入状态；按值传递，因此调用后它本身不变。
-   * @param num_iterations 要前进的 stage 数。
-   * @return `start_state` 前进后的新状态。
-   */
-  CUTLASS_DEVICE
-  static PipelineState make_pipeline_state(PipelineState start_state,
-                                           uint32_t num_iterations) {
-    return start_state.advance(num_iterations);
-  }
-};
-```
-
-#### 三个成员分别解决什么问题
-
-| 成员 | 它回答的问题 | 不能回答的问题 |
-| --- | --- | --- |
-| `index_` | “本轮访问 `smem` / barrier 数组的哪一个槽位？” | 这个槽位的数据是否已写好或已读完。 |
-| `phase_` | “对同一槽位执行 parity wait 时，应该等旧的 0 还是旧的 1 翻转？” | 这是 producer 还是 consumer，也不表示 stage 下标。 |
-| `count_` | “这个游标从起点一共前进了几步？” | mbarrier 的 arrival count 或 transaction bytes。 |
-
-`Stages == 0` 时，上面的 `if constexpr (Stages > 0)` 会让 `++` 与 `advance()` 成为无操作。这是 CUTLASS 为“没有 pipeline stage”的模板特化保留的合法状态。此时不能使用下面含 `/ Stages` 的公式，也不应拿它访问 stage 数组。
-
-对**默认构造**的 `(index=0, phase=0, count=0)`，并且只用 `++` / `advance()` 推进时，状态满足：
-
-$$
-\text{index} = \text{count} \bmod \text{Stages}, \qquad
-\text{phase} = \left\lfloor \frac{\text{count}}{\text{Stages}} \right\rfloor \bmod 2
-$$
-
-这个式子不适用于人为指定非默认起点的情况；特别是下面的 `make_producer_start_state()` 故意构造了 `(0, 1, 0)`，它正是为了表达 producer 的初始化协议。
-
-以 `K_PIPE_MAX = 3` 为例，默认 state 的演化如下：
-
-| `count` | `index()` | `phase()` | 本轮访问的含义 |
-| ---: | ---: | ---: | --- |
-| 0 | 0 | 0 | 首次访问 pipe 0，等待其初始 parity 0 翻转。 |
-| 1 | 1 | 0 | 首次访问 pipe 1，等待其初始 parity 0 翻转。 |
-| 2 | 2 | 0 | 首次访问 pipe 2，等待其初始 parity 0 翻转。 |
-| 3 | 0 | 1 | 再次访问 pipe 0，必须等待 parity 1 翻转，不能再沿用 0。 |
-| 4 | 1 | 1 | 再次访问 pipe 1。 |
-| 6 | 0 | 0 | 第三次访问 pipe 0；parity 又回到 0。 |
-
-`advance()` 的存在不是为了另造一套状态规则，而是为了快速跳过多个 stage。例如从 `(index=2, phase=0, count=2)` 执行 `advance(5)`，跨越环尾两次：`2 -> 0 -> 0`，翻转两次后 parity 仍为 0，结果是 `(index=1, phase=0, count=7)`。
-
-#### 它怎样接到 `PipelineTmaAsync` 的四个接口
-
-`PipelineTmaAsync` 的接口都把 `PipelineState` **按值**接收。这意味着 pipeline 对象只读取这份状态快照；真正的 `++state` 由调用者在本轮协议结束后执行，库不会悄悄替你推进游标。
-
-| 调用 | 读取 state 的哪些分量 | 实际访问的 barrier | 这一步的含义 |
-| --- | --- | --- | --- |
-| `producer_acquire(state)` | `index()`、`phase()` | `empty_barrier_[index]` | 等待 consumer 释放该槽位；随后 elected producer 对 `full_barrier_[index]` 执行 `arrive_and_expect_tx`，准备登记本次 TMA。 |
-| `producer_get_barrier(state)` | `index()` | `full_barrier_[index]` | 取出要绑给 `.with(mbarrier)` 的 full / transaction barrier。 |
-| `consumer_wait(state)` | `index()`、`phase()` | `full_barrier_[index]` | 等待 TMA 写入及其 transaction bytes 都完成。 |
-| `consumer_release(state)` | `index()` | `empty_barrier_[index]` | consumer 在 WGMMA 已不再读取该 stage 后 arrive，通知 producer 以后可重用它。 |
-
-因此，状态本身不带“读”或“写”的身份；身份来自**它被传给哪个接口**。同一份 `(index=0, phase=0)` 传给 `consumer_wait` 时是“等 pipe 0 变 full”，传给 `producer_acquire` 时则是“等 pipe 0 变 empty”。
-
-教程中的手写版本也有两个 state：
-
-```cpp
-auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // TMA 重用 / 写入视角
-auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // WGMMA 读取视角
-```
-
-- `read_state` 选择要读取的 `read_pipe`，并传给 `ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase())`。它的问题是：“该 pipe 的 TMA full barrier 是否已从本轮 parity 翻转？”
-- `write_state` 选择将要覆盖写入的 pipe，并传给 `ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase())`。它的问题是：“该 pipe 的上一轮 WGMMA 是否已经 release，使 empty barrier 翻转？”
-- 两个 state 虽然数值上常常同步前进，却等待**不同的 barrier 数组**。它们不是同一个计数器的两个名字；将来 producer、consumer 的进度不同时，二者也可以不同。
-
-#### `make_producer_start_state()`：为何 producer 从 `(0, 1, 0)` 开始
-
-源码中的 helper 只有三行，但它解决了完整 CUTLASS pipeline 的第一次 `producer_acquire()`：
-
-```cpp
-/**
- * @brief 构造标准 TMA producer 的起始游标。
- *
- * @tparam Pipeline 提供编译期 `Pipeline::Stages` 的 pipeline 类型。
- * @return `{index=0, phase=1, count=0}`。
- *
- * @details
- * `empty_barrier[stage]` 初始化后，stage 在逻辑上已经可写；但还没有任何
- * consumer 对它执行 release arrive。将 producer 的首次 wait parity 设为 1，
- * 即与 mbarrier 初始化的 parity 0 相反，可把“初始化为空”视为已经满足的
- * 一次 empty 条件，第一次 acquire 因而不会等待一个不存在的 consumer release。
- */
-template <class Pipeline>
-CUTLASS_DEVICE
-PipelineState<Pipeline::Stages> make_producer_start_state() {
-  constexpr int InitialProducerStage = 0;
-  constexpr uint32_t InitialProducerPhase = 1;
-  constexpr uint32_t InitialProducerCount = 0;
-  return {InitialProducerStage, InitialProducerPhase, InitialProducerCount};
-}
-```
-
-要注意 mbarrier parity wait 的方向：传入的值表示“我目前观察到的旧 parity”；当 barrier 翻转为另一值时，wait 才通过。初始化后 barrier 的 parity 为 0：
-
-```text
-full_barrier[0]：初始为 0，尚无 TMA 完成
-  consumer 以 phase=0 wait：必须等 TMA 让它从 0 翻到 1
-
-empty_barrier[0]：初始为 0，但逻辑上本来就空闲
-  producer 以 phase=1 wait：当前已经是“不同于 1”的 0，立即通过
-```
-
-所以 `{0, 1, 0}` 的意思不是“producer 已经做完了第 1 轮”，更不是 `count=0` 却错误地配了 `phase=1`。它是为**empty barrier 的第一次虚拟 release**建立的初值约定。之后 producer 每走完全部 `Stages` 个槽位，`++state` 才把它从 phase 1 翻到 0；这时再回到 stage 0，就会正确等待 consumer 对初始 parity 0 的真实 release。
-
-完整 `PipelineTmaAsync` 的常见使用思想如下：
-
-```cpp
-using MainloopPipeline = cutlass::PipelineTmaAsync<K_PIPE_MAX>;
-
-// producer：首次 acquire 不应等待，因为所有 stage 初始化后都为空。
-auto producer_state = cutlass::make_producer_start_state<MainloopPipeline>();
-
-// consumer：首次要等 TMA 真的把 full_barrier 从初始 parity 0 翻转。
-auto consumer_state = cutlass::PipelineState<K_PIPE_MAX>{};
-
-for (...) {
-  pipeline.producer_acquire(producer_state);
-  auto* full_barrier = pipeline.producer_get_barrier(producer_state);
-  copy(tma_atom.with(*full_barrier), gmem_tile, smem_tile);
-  ++producer_state;
-
-  pipeline.consumer_wait(consumer_state);
-  run_wgmma_on(smem_tile);
-  pipeline.consumer_release(consumer_state);
-  ++consumer_state;
-}
-```
-
-这里 `producer_acquire()` 已由 elected producer 对 full transaction barrier 做了 `arrive_and_expect_tx`；TMA 指令完成后才会扣完 transaction bytes。真实 TMA 路径中的 `producer_commit()` 是空操作，源码只在单元测试没有 TMA 硬件时用它模拟 transaction completion。
-
-#### 为什么本教程的两个 state 都从 `(0, 0)` 开始
-
-本教程没有通过 `PipelineTmaAsync::producer_acquire()` 做初始填充，而是在 prologue 中直接操作 barrier 并提交所有初始 TMA：
-
-```cpp
-// 直接把 pipe 0、1、2 的第 0 代 full barrier 置为“等待 TMA 字节完成”。
-// 这里没有先等 empty barrier，因为所有 stage 在初始化后已知为空。
-for (int pipe = 0; pipe < K_PIPE_MAX; ++pipe) {
-  ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                        tma_transaction_bytes);
-  copy(tma_a.with(producer_mbar[pipe]), tAgA(_, k_tile), tAsA(_, pipe));
-  copy(tma_b.with(producer_mbar[pipe]), tBgB(_, k_tile), tBsB(_, pipe));
-  ++k_tile;
-}
-
-// 后续第一个 consumer wait 和第一个“重用前的 empty wait”都针对初始 parity 0。
-auto write_state = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
-auto read_state  = cutlass::PipelineState<K_PIPE_MAX>();  // (0, 0)
-```
-
-此时：
-
-- `read_state = (0, 0)` 正确：消费者下一步等待 `producer_mbar[0]` 从初始 parity 0 翻转，随后消费 `K0`。
-- `write_state = (0, 0)` 也正确：producer 的下一次操作不是首次填充，而是**重用** pipe 0；它必须等待 consumer 对 `consumer_mbar[0]` 的真实 release，使初始 parity 0 翻转。
-
-因此不要把 `make_producer_start_state()` 机械搬到此处：它服务的是“第一次填充前调用 `producer_acquire()`”的通用 CUTLASS 协议；本教程已经手写并跳过了那次首次 acquire，后续第一次 wait 必须等待真实的 phase 0 release。
-
-### 主循环的时序
-
-主循环可以拆成这几步。这里最容易误读的是两个 `phase()`：它们分别描述当前 `read_pipe` 的 full barrier 代次，和当前 `write pipe` 的 empty barrier 代次。
-
-```cpp
-while (k_tile_count > -K_PIPE_MAX) {
-    int read_pipe = read_state.index();
-
-    // 1. consumer 等 TMA producer 完成 read_pipe 的 read_state.phase() 这一代写入。
-    ProducerBarType::wait(&producer_mbar[read_pipe], read_state.phase());
-
-    // 2. GMMA / WGMMA 消费该 pipe。
-    warpgroup_arrive();
-    gemm(mma, tCrA(_,_,_,read_pipe), tCrB(_,_,_,read_pipe), tCrC);
-    warpgroup_commit_batch();
-    warpgroup_wait<0>();
-
-    // 3. 128 个 WGMMA consumer 都到达 consumer barrier。
-    //    这使 read_pipe 的这一代 empty barrier 完成，producer 以后可以重用这个 pipe。
-    ConsumerBarType::arrive(&consumer_mbar[read_pipe]);
-    ++read_state;
-
-    // 4. producer 如果还有新 tile，就等 write_state.phase() 这一代消费结束，
-    //    才能覆盖写入 pipe。
-    if ((warp_idx == 0) && lane_predicate && (k_tile_count > 0)) {
-        int pipe = write_state.index();
-        ConsumerBarType::wait(&consumer_mbar[pipe], write_state.phase());
-
-        // 此时 producer_mbar[pipe] 已进入下一代；为该下一代登记 TMA bytes。
-        ProducerBarType::arrive_and_expect_tx(&producer_mbar[pipe],
-                                              tma_transaction_bytes);
-        copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-        copy(tma_b.with(producer_mbar[pipe]), tBgB(_,k_tile), tBsB(_,pipe));
-
-        ++write_state;
-    }
-
-    --k_tile_count;
-    ++k_tile;
-}
-```
-
-#### 用 `K_PIPE_MAX = 3` 逐轮跟一次 `index` 和 `phase`
-
-假设 K 方向足够长，下面只写一份 A/B tile 对应的 K 编号。`F0` 表示 `producer_mbar[0]`，`E0` 表示 `consumer_mbar[0]`。
-
-| 时刻 | WGMMA 消费 | TMA 提交 | `read_state` / 等待 | `write_state` / 等待 | pipe 0 的代次变化 |
-| --- | --- | --- | --- | --- | --- |
-| prologue | 尚未开始 | `K0 -> pipe0`、`K1 -> pipe1`、`K2 -> pipe2` | 新建后为 `(0,0)` | 新建后为 `(0,0)` | `F0` 正在完成第 0 代 TMA。 |
-| loop 0 | 等 `F0` phase 0，计算 `K0` | 等 `E0` phase 0，提交 `K3 -> pipe0` | 结束后 `(1,0)` | 结束后 `(1,0)` | WGMMA 的 128 次 arrive 完成 `E0` 第 0 代；新 TMA 开始 `F0` 第 1 代。 |
-| loop 1 | 等 `F1` phase 0，计算 `K1` | 提交 `K4 -> pipe1` | 结束后 `(2,0)` | 结束后 `(2,0)` | pipe 1 进入第 1 代。 |
-| loop 2 | 等 `F2` phase 0，计算 `K2` | 提交 `K5 -> pipe2` | 结束后 `(0,1)` | 结束后 `(0,1)` | 两个游标都绕回 pipe 0，所以 parity 从 0 翻成 1。 |
-| loop 3 | 等 `F0` phase 1，计算 `K3` | 等 `E0` phase 1，提交 `K6 -> pipe0` | 结束后 `(1,1)` | 结束后 `(1,1)` | 这次等待 / 重用的是 pipe 0 的第 1 代，而不是旧的第 0 代。 |
-
-这张表也解释了为什么少传或错传 phase 会出错：如果 loop 3 还传 `phase=0`，wait 看到的是 pipe 0 很早以前已经完成的第 0 代，于是可能让 WGMMA 读到尚未写好的 `K3`，或者让 TMA 过早覆盖数据。
-
-#### TMA 是不是完整领先 WGMMA `K_PIPE_MAX` 个 K tile？
-
-**不是“已经完整搬完 K_PIPE_MAX 个 tile”**。更准确地说：
-
-- prologue 会先**提交**最多 `K_PIPE_MAX` 个 TMA load；以 3 stage 为例，是 `K0`、`K1`、`K2`。它们全是异步的，代码没有在 prologue 等待 `K0/K1/K2` 全部完成。
-- WGMMA 一开始只等 `K0` 所在 pipe 的 full barrier。`K1` / `K2` 此时可能已经完成，也可能仍在 TMA 飞行中；它们会在后续轮次各自被 wait。
-- 从“buffer 中已经被 producer 占用、尚未被 consumer 消费的 stage 数”看，稳态最多是 `K_PIPE_MAX` 个；从“相对当前正在消费的 K tile 还领先多少个未来 tile”看，是 `K_PIPE_MAX - 1` 个。例如 WGMMA 正在算 `K0` 时，`K1`、`K2` 是两个未来 tile。
-- WGMMA 消费一个 stage 后，producer 才能重用这个 stage 提交下一个 tile。因此这是一个容量为 `K_PIPE_MAX` 的有界环形队列，而不是 TMA 可以无限制地跑在 WGMMA 前面。
-
-这个教程没有做 warp specialization：发 TMA 的 warp 0 也会参与同一个 WGMMA warpgroup。它的重叠来自“**TMA 已提交后在硬件中异步运行**”，而不是另有一组常驻 producer warp 在 WGMMA 执行期间持续发指令。更复杂的 CUTLASS mainloop 才会用专门的 producer warpgroup 和 `PipelineTmaAsync` 把这件事进一步重叠。
-
-这个协议里有两个方向的依赖：
-
-```text
-TMA producer -> ProducerBarType -> GMMA consumer
-GMMA consumer -> ConsumerBarType -> TMA producer
-```
-
-第一条保证 consumer 不会读还没搬完的 shared memory。
-
-第二条保证 producer 不会覆盖还没被消费完的 shared memory stage。
-
-## 一张总流程图
-
-把 host 和 device 合起来看，CuTe TMA 的完整路径是：
-
-```text
-host:
-  GMEM pointer + GMEM layout
-      |
-      v
-  make_tensor(...)
-      |
-      v
-  make_tma_atom(copy_op, gtensor, smem_layout_for_one_stage, cta_tile)
-      |
-      v
-  TMA descriptor / Copy_Atom
-      |
-      v
-  launch_kernel_on_cluster(..., tma_atom, ...)
-
-device:
-  tma_atom.get_tma_tensor(full_shape)
-      |
-      v
-  local_tile(..., cta_coord)
-      |
-      v
-  tma_partition(tma_atom, ..., stensor, gtensor)
-      |
-      v
-  ProducerBarType::arrive_and_expect_tx(bytes)
-      |
-      v
-  copy(tma_atom.with(mbarrier), tma_src, tma_dst)
-      |
-      v
-  ProducerBarType::wait(phase)
-      |
-      v
-  GMMA / WGMMA consume SMEM
-      |
-      v
-  ConsumerBarType::arrive(...)
-```
-
-## 常见坑
-
-### 把 `make_tma_atom` 当成发起拷贝
-
-`make_tma_atom` 是 host 侧 descriptor / atom 构造，不会搬数据。真正发起 TMA 的是 device 侧：
-
-```cpp
-copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-```
-
-### 忘记 `.with(mbarrier)`
-
-`SM90_TMA_LOAD` traits 没有 mbarrier 时是 non-executable。TMA load 必须有 completion mbarrier，否则 consumer 没法知道数据什么时候真的写完。
-
-### transaction bytes 算错
-
-`arrive_and_expect_tx(bytes)` 里的 `bytes` 必须覆盖同一个 barrier phase 中所有 TMA load 写入的字节数。示例里 A/B 两次 load 共用同一个 `producer_mbar[pipe]`，所以 bytes 是 A stage 加 B stage。
-
-### phase 没跟着环形 pipe 翻转
-
-mbarrier wait 用的是 parity phase。`PipelineState` 每绕过 `K_PIPE_MAX` 一圈会 `phase_ ^= 1`。如果手写 pipeline，很容易只更新 pipe index，忘了 phase。
-
-### swizzle 只想着 GMMA，忘了 TMA descriptor
-
-SMEM swizzle 不只是 GMMA descriptor 的事。TMA descriptor 里也要填 `CUtensorMapSwizzle`，否则 TMA 写入和 GMMA 读取会对不上。
-
-### cluster launch 和普通 launch 混用
-
-如果 kernel 内用了 cluster API、multicast、cluster barrier，就需要用 cluster launch 路径。CUTLASS 示例通过 `ClusterLaunchParams` 和 `launch_kernel_on_cluster` 处理。
-
-## 小结
-
-CuTe TMA 的抽象层次可以记成三层：
-
-1. **descriptor 层**：`make_tma_copy` / `make_tma_atom` 根据 GMEM tensor、SMEM layout、CTA tile 生成 TMA descriptor。
-2. **partition 层**：`tma_partition` 把 GMEM / SMEM tensor 重排成 `copy(...)` 能接受的 TMA source / destination。
-3. **execution 层**：`.with(mbarrier)` 绑定 completion barrier，`copy(...)` 发出 `cp.async.bulk.tensor`，再用 `ClusterTransactionBarrier` 和 `PipelineState` 管理异步完成与 stage 复用。
-
-如果只看一行代码：
-
-```cpp
-copy(tma_a.with(producer_mbar[pipe]), tAgA(_,k_tile), tAsA(_,pipe));
-```
-
-它背后其实已经包含了：
-
-- CUDA tensor map descriptor。
-- GMEM 多维坐标到地址的映射。
-- SMEM swizzle 和 TMA box。
-- cluster / multicast 信息。
-- mbarrier transaction bytes 完成信号。
-- CuTe layout partition 后的 source / destination tensor。
-
-这也是 CuTe TMA 最有价值的地方：把 Hopper TMA 很硬件化的一组约束，折叠进了 `Tensor`、`Layout`、`Copy_Atom` 和 `PipelineState` 这几类对象里。
+`producer_get_barrier` 返回指针，`.with` 接收 `uint64_t&`，因此这里传入 `*full_barrier`。实际发射前已经登记好该 full barrier 本轮预期的事务字节。
+
+| 对象 / 调用 | 负责的内容 |
+| --- | --- |
+| `make_tma_atom / make_tma_copy` | 在 host 端编码 descriptor，并构造坐标 / copy 布局信息。 |
+| `get_tma_tensor` | 将 global 逻辑坐标表示成 TMA 坐标。 |
+| `tma_partition` 或 `get_slice + partition_S/D` | 将 tile 与 shared stage 转成 Atom 可接收的分区。 |
+| `producer_acquire` | 等待 stage 可写，leader 登记 full arrival 和预期事务字节。 |
+| `.with(*full_barrier)` | 为本次执行绑定 full barrier 和可选的指令参数。 |
+| `copy` | 从分区解包坐标与 shared 地址，发射 TMA。 |
+| `consumer_wait / consumer_release` | 等待本 stage 数据就绪，消费完成后释放它。 |
+
+构造时的 `cluster_size` 还参与 descriptor box 的协作分块，以及不同 CTA 的源 / 目标偏移；执行时的 `multicast_mask` 指定本次 multicast 指令的接收 CTA。两者要与实际分区和前面的 cluster barrier 协议一致。本节的具体类型、字节数与发射次数都采用 `cluster_size = 1`，因此一个 tile 恰好由一次 TMA load 完成。
