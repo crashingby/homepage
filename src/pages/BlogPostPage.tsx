@@ -11,6 +11,7 @@ import {
 } from '../lib/blog'
 import { getMarkdownHeadings } from '../lib/markdown'
 import { useReadingProgress } from '../lib/useReadingProgress'
+import { getLegacyInterviewPath } from '../lib/interview'
 
 function Article({ post }: { post: BlogPost }) {
     const location = useLocation()
@@ -178,7 +179,12 @@ function Article({ post }: { post: BlogPost }) {
 
 export function BlogPostPage() {
     const { slug, topicSlug } = useParams()
+    const { search, hash } = useLocation()
     const post = slug ? getBlogPost(topicSlug, slug) : undefined
+    const legacyPath = !topicSlug && slug ? getLegacyInterviewPath(slug) : undefined
+    if (!post && legacyPath) {
+        return <Navigate to={{ pathname: legacyPath, search, hash }} replace />
+    }
     return post ? (
         <Article post={post} key={post.path} />
     ) : (

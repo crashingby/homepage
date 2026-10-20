@@ -120,7 +120,7 @@
         font-size: 21px;
     }
     .nav-links {
-        gap: 18px;
+        gap: 14px;
     }
     .nav-links > a {
         font-size: 12px;
@@ -144,5 +144,13 @@
         max-width: 75px;
         line-height: 1.8;
         text-align: right;
+    }
+}
+@media (max-width: 420px) {
+    .site-mark > span:last-child {
+        display: none;
+    }
+    .nav-links {
+        gap: 16px;
     }
 }

@@ -14,6 +14,14 @@ export function HomePage() {
     return (
         <div className="home-page">
             <Hero />
+            <Link to="/interview" className="home-interview-entry">
+                <div>
+                    <p className="eyebrow">THE INTERVIEW HANDBOOK</p>
+                    <h2>面试指南</h2>
+                    <p>C++ 手撕题与 AI Infra 面试问题，按专题集中复习。</p>
+                </div>
+                <span>进入面试指南 <Icon name="arrow" size={19} /></span>
+            </Link>
             <section className="section recent-notes">
                 <div className="section-heading">
                     <div>

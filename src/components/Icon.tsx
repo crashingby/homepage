@@ -1,6 +1,9 @@
 import type { CSSProperties } from 'react'
 
 const paths = {
+    book: 'M12 5v15M3 3h5a4 4 0 0 1 4 2 4 4 0 0 1 4-2h5v16h-5a4 4 0 0 0-4 2 4 4 0 0 0-4-2H3Z',
+    code: 'm8 7-5 5 5 5m8-10 5 5-5 5M14 4l-4 16',
+    layers: 'm12 3 10 5-10 5L2 8Zm-10 9 10 5 10-5M2 16l10 5 10-5',
     arrow: 'M5 12h14m-6-6 6 6-6 6',
     upRight: 'M7 17 17 7M7 7h10v10',
     back: 'M19 12H5m6-6-6 6 6 6',

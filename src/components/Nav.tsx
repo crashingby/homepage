@@ -22,6 +22,7 @@ export function Nav() {
                         首页
                     </NavLink>
                     <NavLink to="/blog">笔记</NavLink>
+                    <NavLink to="/interview">面试指南</NavLink>
                     <a
                         href="https://github.com/crashingby"
                         target="_blank"
