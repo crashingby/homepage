@@ -3,6 +3,8 @@ title: FlashAttention-2 源码学习笔记（三）：前向计算与 Online Sof
 date: 2026-08-10
 tags: [FlashAttention, CUDA, C++, CUTLASS, CuTe, GPU 编程, Attention]
 summary: 从 compute_attn_1rowblock 出发，先聚焦一个 Q tile 如何扫描全部 K/V tile，并推导 online softmax 中行最大值、稳定分母、输出分子与最终输出 O 的状态变化；CuTe、warp 与线程映射留到实现篇。
+series: flash-attention-2
+seriesOrder: 3
 ---
 
 # FlashAttention-2 源码学习笔记（三）：前向计算与 Online Softmax

@@ -46,6 +46,10 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
+    max-height: calc(100svh - 260px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
 }
 .topic-nav a {
     display: flex;
@@ -72,6 +76,23 @@
 }
 .topic-nav a.active > span {
     color: var(--accent);
+}
+.topic-nav a.is-parent-active {
+    color: var(--accent);
+    font-weight: 550;
+}
+.topic-subnav {
+    margin: 4px 0 8px 12px;
+    padding-left: 8px;
+    border-left: 1px solid var(--border-strong);
+}
+.topic-subnav a {
+    padding: 9px 8px;
+    font-size: 11px;
+    line-height: 1.6;
+}
+.topic-subnav a > span {
+    font-size: 9px;
 }
 .sidebar-note {
     padding: 26px 12px 0;
@@ -141,6 +162,104 @@
 .results-order {
     margin-left: 8px;
 }
+.category-navigation {
+    margin-top: 26px;
+}
+.category-navigation-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 12px;
+    color: var(--text-soft);
+    font-size: 11px;
+}
+.category-navigation-header a {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--accent);
+}
+.category-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+.category-card {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: var(--surface-solid);
+}
+.category-card:hover,
+.category-card.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+.category-card-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 10px;
+    color: var(--text-main);
+    font-size: 13px;
+    font-weight: 550;
+    line-height: 1.6;
+}
+.category-card-title > span {
+    color: var(--accent);
+    font: 11px var(--mono);
+}
+.category-card-description {
+    display: block;
+    margin-top: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.8;
+}
+.category-description {
+    color: var(--text-muted);
+    font-size: 12px;
+    line-height: 1.9;
+    margin: 16px 0 0;
+}
+.category-section {
+    margin-top: 28px;
+}
+.category-section + .category-section {
+    padding-top: 28px;
+    border-top: 1px solid var(--border);
+}
+.category-section-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+}
+.category-section-header h3 {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 550;
+    line-height: 1.6;
+}
+.category-section-header h3 a:hover {
+    color: var(--accent);
+}
+.category-section-header p {
+    margin: 7px 0 0;
+    color: var(--text-soft);
+    font-size: 11px;
+    line-height: 1.8;
+}
+.category-section-count {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    padding-top: 5px;
+    color: var(--accent);
+    font-size: 11px;
+}
 .post-row {
     display: flex;
     align-items: flex-start;
@@ -171,7 +290,7 @@
     font-family: var(--mono);
     font-size: 10px;
 }
-.post-row h2 {
+.post-row-title {
     margin: 9px 0 8px;
     font-size: 20px;
     font-weight: 550;
@@ -179,7 +298,7 @@
     letter-spacing: 0;
     overflow-wrap: anywhere;
 }
-.post-row h2 a:hover {
+.post-row-title a:hover {
     color: var(--accent);
 }
 .post-row p {
@@ -249,6 +368,7 @@
 }
 .article-breadcrumb {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 12px;
     margin: 0 0 40px;
@@ -522,6 +642,68 @@
     border-color: var(--accent);
     color: var(--accent);
 }
+.article-series {
+    margin: 20px 0 36px;
+    padding-top: 28px;
+    border-top: 1px solid var(--border);
+}
+.series-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 18px;
+}
+.series-header .eyebrow {
+    margin-bottom: 8px;
+    font-size: 10px;
+    letter-spacing: 0;
+}
+.series-header h2 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 550;
+    line-height: 1.6;
+}
+.series-header > .text-link {
+    flex-shrink: 0;
+    color: var(--accent);
+    font-size: 11px;
+}
+.series-pagination {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
+.series-pagination > a {
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--surface-solid);
+}
+.series-pagination > a:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+.series-pagination a > span {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    color: var(--accent);
+    font-size: 11px;
+}
+.series-pagination strong {
+    display: block;
+    color: var(--text-main);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 1.9;
+    overflow-wrap: anywhere;
+}
+.series-next {
+    grid-column: 2;
+}
 @media (max-width: 1100px) {
     .article-layout {
         gap: 40px;
@@ -622,6 +804,14 @@
         padding: 0 0 16px;
         margin-bottom: 8px;
         scrollbar-width: thin;
+        max-height: none;
+        overflow-y: hidden;
+    }
+    .topic-nav-group {
+        flex-shrink: 0;
+    }
+    .topic-subnav {
+        display: none;
     }
     .topic-nav a {
         flex-shrink: 0;
@@ -642,7 +832,7 @@
         gap: 14px;
         padding: 24px 0;
     }
-    .post-row h2 {
+    .post-row-title {
         font-size: 17px;
     }
     .post-row p {
@@ -688,5 +878,32 @@
     .related-notes > div {
         grid-template-columns: 1fr;
         gap: 10px;
+    }
+    .category-card {
+        padding: 12px;
+    }
+    .category-card-title {
+        font-size: 12px;
+    }
+    .category-card-description {
+        display: none;
+    }
+    .category-section-header {
+        gap: 12px;
+    }
+    .category-section-header h3 {
+        font-size: 15px;
+    }
+    .series-header {
+        align-items: flex-start;
+    }
+    .series-header h2 {
+        font-size: 16px;
+    }
+    .series-pagination {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    .series-next {
+        grid-column: 1;
     }
 }

@@ -3,6 +3,8 @@ title: FlashAttention-2 源码学习笔记一：接口一览
 date: 2026-08-01
 tags: [FlashAttention, CUDA, PyTorch, GPU 编程, Attention]
 summary: 从 flash_attn/flash_attn_interface.py 的前向入口开始，逐步追踪 FlashAttention-2 从 Python API、C++ dispatch 到 CUDA kernel 的源码路径。
+series: flash-attention-2
+seriesOrder: 1
 ---
 
 # FlashAttention-2 源码学习笔记

@@ -495,6 +495,8 @@ function MarkdownLink({
 }: ComponentPropsWithoutRef<'a'>) {
     if (href?.startsWith('#/'))
         return <Link to={href.slice(1)}>{children}</Link>
+    if (href === '/blog' || href?.startsWith('/blog/'))
+        return <Link to={href}>{children}</Link>
     if (href?.startsWith('#'))
         return <Link to={{ hash: href }}>{children}</Link>
     return (

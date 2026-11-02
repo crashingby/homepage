@@ -3,9 +3,11 @@ import { Link, Navigate, useLocation, useParams } from 'react-router-dom'
 import { MarkdownPost } from '../components/MarkdownPost'
 import { ArticleTOC } from '../components/ArticleTOC'
 import { Icon } from '../components/Icon'
+import { BlogSeriesNav } from '../components/BlogSeriesNav'
 import {
+    getBlogCategoryPath,
     getBlogPost,
-    getBlogPostsByTopic,
+    getRelatedBlogPosts,
     resolveWikiLinks,
     type BlogPost,
 } from '../lib/blog'
@@ -33,9 +35,8 @@ function Article({ post }: { post: BlogPost }) {
         [allHeadings, duplicateTitle?.id],
     )
     const { activeId, progress } = useReadingProgress(headings)
-    const related = getBlogPostsByTopic(post.topic.slug)
-        .filter((item) => item.path !== post.path)
-        .slice(0, 2)
+    const related = getRelatedBlogPosts(post)
+    const categoryPath = getBlogCategoryPath(post.topic.slug, post.category?.slug)
 
     useEffect(() => {
         document.title = `${post.title} — Crashing By`
@@ -73,6 +74,12 @@ function Article({ post }: { post: BlogPost }) {
                 <Link to={`/blog/topic/${post.topic.slug}`}>
                     {post.topic.label}
                 </Link>
+                {post.category && (
+                    <>
+                        <Icon name="chevron" size={13} />
+                        <Link to={categoryPath}>{post.category.label}</Link>
+                    </>
+                )}
                 <span className="breadcrumb-end">/ 阅读</span>
             </div>
             <div className="article-layout">
@@ -143,13 +150,14 @@ function Article({ post }: { post: BlogPost }) {
                         <span className="end-mark">∎</span>
                         <p>读到这里，谢谢你的时间。</p>
                         <Link
-                            to={`/blog/topic/${post.topic.slug}`}
+                            to={categoryPath}
                             className="text-link"
                         >
                             <Icon name="back" size={16} /> 回到
-                            {post.topic.label}
+                            {post.category?.label ?? post.topic.label}
                         </Link>
                     </footer>
+                    <BlogSeriesNav post={post} />
                     {related.length > 0 && (
                         <section className="related-notes">
                             <p className="eyebrow">KEEP EXPLORING</p>

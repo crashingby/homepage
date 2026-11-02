@@ -3,6 +3,8 @@ title: FlashAttention-2 源码学习笔记（四）：Forward Kernel 的专用�
 date: 2026-08-12
 tags: [FlashAttention, CUDA, C++, CUTLASS, CuTe, GPU 编程, Attention]
 summary: 先整理 forward kernel 使用的专用状态对象和 device 接口，再完整追踪 compute_attn_1rowblock 如何对一个 Q tile 遍历全部可见 K/V tile，完成 online softmax、PV 累加、O 与 LSE 写回。
+series: flash-attention-2
+seriesOrder: 4
 ---
 
 # FlashAttention-2 源码学习笔记（四）：Forward Kernel 的专用接口与主计算循环

@@ -3,6 +3,8 @@ title: FlashAttention-2 源码学习笔记（二）：C++ 前向接口与调度
 date: 2026-08-04
 tags: [FlashAttention, CUDA, C++, Libtorch, GPU 编程, Attention]
 summary: 从 flash_api.cpp 的 PyBind11 前向入口出发，理解 Libtorch tensor 封装、Flash_fwd_params、split-KV 与 CUDA 模板分发。
+series: flash-attention-2
+seriesOrder: 2
 ---
 
 # FlashAttention-2 源码学习笔记（二）：C++ 前向接口与调度
