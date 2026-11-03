@@ -122,6 +122,11 @@ const categoryConfig: Record<string, BlogCategory[]> = {
             label: '性能分析与优化',
             description: '性能模型、瓶颈判断与 Nsight Compute 指标。',
         },
+        {
+            slug: 'nvshmem',
+            label: 'NVSHMEM',
+            description: 'NVSHMEM 编程模型、通信接口与实践。',
+        },
     ],
 }
 
